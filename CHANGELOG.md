@@ -22,6 +22,10 @@ All notable changes are tracked here (git-cliff style, kept manually).
   OpenCode `opencode.json`, Pi `mcp.json`, plus step-by-step READMEs for the
   settings-panel harnesses Antigravity / Codex App / Factory Droid / Kimi Code),
   linked from each README installation section.
+- README installation sections reworked Superpowers-style: every harness now
+  starts with a short one-command install (`claude mcp add`, `copilot mcp add`,
+  `pi install npm:pi-mcp-adapter`, config copies, settings panels), then a
+  verify step and a link to the ready-made config file.
 
 ## [0.2.1] — 2026-08-05
 
