@@ -1,0 +1,25 @@
+{
+  "id": "did_c669d892e559c5e0946152cf5085587e",
+  "parentId": null,
+  "author": {
+    "type": "AGENT",
+    "identifier": "Drift Demo",
+    "model": "claude-3-5-sonnet"
+  },
+  "prompt": "Add TokenPayload interface for JWT validation",
+  "astDelta": [
+    {
+      "filePath": "src/auth.ts",
+      "type": "MOVED",
+      "nodeIds": [
+        "src/auth.ts::function::verifyToken",
+        "src/auth.ts::function::verifyToken"
+      ],
+      "summary": "function \"verifyToken\" moved from line 1 to 6"
+    }
+  ],
+  "verifyCmd": "npm test",
+  "timestamp": 1785919847123,
+  "gitCommitSha": "",
+  "signature": "i2mSwqxYflZRgx3ufoubQnOePmdPdfqYr8NzLaGmt8swH/UOOJw+MZo+0mYniC3eo/H5Ipf/OkGJwRzOZCjTCg=="
+}

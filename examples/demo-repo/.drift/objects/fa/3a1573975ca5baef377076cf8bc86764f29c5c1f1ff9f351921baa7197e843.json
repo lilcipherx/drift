@@ -1,0 +1,22 @@
+{
+  "id": "did_22bfeca8b0575caca9da488a6c44d9c5",
+  "parentId": "did_00e3f93f400c324ca13f754a036f1670",
+  "author": {
+    "type": "HUMAN",
+    "identifier": "Drift Demo"
+  },
+  "prompt": "Add clearRefreshCache for tests",
+  "astDelta": [
+    {
+      "filePath": "src/auth.ts",
+      "type": "ADDED",
+      "nodeIds": [
+        "src/auth.ts::function::clearRefreshCache"
+      ],
+      "summary": "function \"clearRefreshCache\" added (line 18)"
+    }
+  ],
+  "timestamp": 1785919848884,
+  "gitCommitSha": "",
+  "signature": "AhvJSWes1V38PvnDHEsg++iXIZFCM0XhLMDFDUlG0HUqvYNYn2T/antYWsaj+USMgh6w1e27d1cM85vAzGWZBw=="
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@drift/mcp",
+  "version": "0.1.0",
+  "description": "Drift MCP server — gives AI agents intent-driven versioning tools (PRD §14.2).",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "drift-mcp": "dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@drift/core": "0.1.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.23.8"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "drift-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Drift — Intent-Driven Versioning System. Git tracks what changed. Drift tracks why it changed and who (or what) decided.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false",
+    "test": "npm run build && node --test \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\" \"tests/mcp/*.test.mjs\"",
+    "test:unit": "node --test \"tests/unit/*.test.mjs\"",
+    "test:integration": "node --test \"tests/integration/*.test.mjs\"",
+    "test:mcp": "node --test \"tests/mcp/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}

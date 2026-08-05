@@ -1,0 +1,27 @@
+name: "Drift Intent Check"
+description: "Validate and summarize Drift intents on this pull request (PRD §14.4)."
+author: "Drift"
+inputs:
+  command:
+    description: "drift subcommand to run against the repo (log | doctor | verify <intent-id>)"
+    default: "log"
+  version:
+    description: "Drift CLI version to use"
+    default: "0.1.0"
+runs:
+  using: "composite"
+  steps:
+    - name: "Run drift ${{ inputs.command }}"
+      shell: bash
+      run: |
+        set +e
+        DRIFT_OUTPUT="$(npx -y @drift/cli@$DRIFT_VERSION $DRIFT_COMMAND --json 2>&1)"
+        DRIFT_EXIT=$?
+        echo "::group::drift output"
+        echo "$DRIFT_OUTPUT"
+        echo "::endgroup::"
+        echo "drift_exit=$DRIFT_EXIT" >> "$GITHUB_ENV"
+        exit $DRIFT_EXIT
+      env:
+        DRIFT_COMMAND: ${{ inputs.command }}
+        DRIFT_VERSION: ${{ inputs.version }}

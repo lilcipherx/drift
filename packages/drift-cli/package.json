@@ -1,0 +1,19 @@
+{
+  "name": "@drift/cli",
+  "version": "0.1.0",
+  "description": "Drift CLI — intent-driven versioning. Git tracks what changed; Drift tracks why.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "drift": "dist/cli.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@drift/core": "0.1.0"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@drift/ast",
+  "version": "0.1.0",
+  "description": "Drift semantic parser: symbol extraction and AST delta computation (TypeScript/JavaScript, Python).",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "typescript": "^5.6.0"
+  }
+}

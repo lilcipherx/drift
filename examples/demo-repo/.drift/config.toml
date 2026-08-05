@@ -1,0 +1,24 @@
+# Drift configuration (PRD §17.1)
+[core]
+version = 1
+default_model = "claude-3-5-sonnet"
+
+[ast]
+parsers = ["typescript", "python"]
+fallback_to_text_on_error = true
+
+[redaction]
+patterns = [
+  "AKIA[0-9A-Z]{16}",
+  "sk-[A-Za-z0-9_-]{20,}",
+  "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+  "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}",
+  "github_pat_[A-Za-z0-9_]{22,}",
+  "xox[baprs]-[A-Za-z0-9-]{10,}",
+  "AIza[0-9A-Za-z_-]{35}",
+  "sk_live_[A-Za-z0-9]{24,}",
+  "eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+]
+
+[telemetry]
+enabled = false

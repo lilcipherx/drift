@@ -1,0 +1,236 @@
+/**
+ * End-to-end tests: spawn temp git repos, run the actual CLI binary,
+ * and assert the PRD MVS acceptance flow
+ *   init → realize → log → blame (with syntax rejection).
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+const CLI = resolve(process.cwd(), "packages", "drift-cli", "dist", "cli.js");
+
+function run(repo, args, env = {}) {
+  const res = spawnSync(process.execPath, [CLI, ...args], {
+    cwd: repo,
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1", ...env },
+  });
+  return { status: res.status, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+
+function git(repo, args) {
+  const res = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
+  return res.stdout.trim();
+}
+
+function makeRepo() {
+  const repo = mkdtempSync(join(tmpdir(), "drift-e2e-"));
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.name", "Test Dev"]);
+  git(repo, ["config", "user.email", "test@drift.dev"]);
+  mkdirSync(join(repo, "src"));
+  writeFileSync(
+    join(repo, "src", "auth.ts"),
+    `export function verifyToken(token: string): boolean {
+  return token.length > 0;
+}
+`,
+  );
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-m", "initial scaffold"]);
+  return repo;
+}
+
+function parseJson(stdout) {
+  return JSON.parse(stdout);
+}
+
+test("full MVS flow: init → realize → log → blame → verify → doctor → export", () => {
+  const repo = makeRepo();
+
+  // 1. init
+  const init = run(repo, ["init"]);
+  assert.equal(init.status, 0, init.stderr);
+  assert.ok(existsSync(join(repo, ".drift", "drift.db")));
+  assert.ok(existsSync(join(repo, ".drift", "config.toml")));
+  assert.ok(existsSync(join(repo, ".drift", "keys", "ed25519.pem")));
+
+  // 2. realize an agent intent
+  writeFileSync(
+    join(repo, "src", "auth.ts"),
+    `export function verifyToken(token: string): boolean {
+  return token.length > 0;
+}
+
+export function refreshToken(expired: string): string {
+  return expired;
+}
+`,
+  );
+  const realize = run(repo, [
+    "realize",
+    "-p",
+    "Fix race condition in token refresh",
+    "--agent",
+    "--model",
+    "claude-3-5-sonnet",
+    "--verify-cmd",
+    "node -e \"process.exit(0)\"",
+    "--json",
+  ]);
+  assert.equal(realize.status, 0, realize.stderr);
+  const realizeOut = parseJson(realize.stdout);
+  assert.equal(realizeOut.status, "ok");
+  assert.match(realizeOut.intentId, /^did_[0-9a-f]{32}$/);
+  assert.match(realizeOut.gitSha, /^[0-9a-f]{40}$/);
+  assert.ok(realizeOut.astDelta.some((d) => d.type === "ADDED" && d.summary.includes("refreshToken")));
+
+  // git trailer present
+  const lastMessage = git(repo, ["log", "-1", "--format=%B"]);
+  assert.ok(lastMessage.includes(`Drift-Intent: ${realizeOut.intentId}`));
+
+  // 3. log
+  const log = run(repo, ["log", "--json"]);
+  assert.equal(log.status, 0, log.stderr);
+  const logOut = parseJson(log.stdout);
+  assert.equal(logOut.status, "ok");
+  assert.equal(logOut.intents.length, 1);
+  assert.equal(logOut.intents[0].prompt, "Fix race condition in token refresh");
+  assert.equal(logOut.intents[0].authorType, "AGENT");
+
+  // 4. blame by function
+  const blame = run(repo, ["blame", "src/auth.ts", "--function", "refreshToken", "--json"]);
+  assert.equal(blame.status, 0, blame.stderr);
+  const blameOut = parseJson(blame.stdout);
+  assert.equal(blameOut.status, "ok");
+  assert.equal(blameOut.intent.prompt, "Fix race condition in token refresh");
+  assert.equal(blameOut.intent.author.model, "claude-3-5-sonnet");
+  assert.equal(blameOut.intent.signatureValid, true);
+
+  // blame on untouched pre-drift code → baseline
+  const baseline = run(repo, ["blame", "src/auth.ts", "--function", "verifyToken", "--json"]);
+  const baselineOut = parseJson(baseline.stdout);
+  assert.equal(baselineOut.status, "ok");
+  assert.equal(baselineOut.baseline, true);
+
+  // 5. verify
+  const verify = run(repo, ["verify", realizeOut.intentId, "--json"]);
+  assert.equal(verify.status, 0, verify.stderr);
+  assert.equal(parseJson(verify.stdout).status, "ok");
+  assert.equal(parseJson(verify.stdout).verifyStatus, "pass");
+
+  // 6. context
+  const ctx = run(repo, ["context", "src/auth.ts", "--json"]);
+  assert.equal(parseJson(ctx.stdout).intents.length, 1);
+
+  // 7. signature verification
+  const sig = run(repo, ["verify-intent", realizeOut.intentId, "--json"]);
+  assert.equal(parseJson(sig.stdout).status, "ok");
+
+  // 8. doctor
+  const doctor = run(repo, ["doctor", "--json"]);
+  const doctorOut = parseJson(doctor.stdout);
+  assert.equal(doctorOut.status, "ok");
+  assert.ok(doctorOut.checks.every((c) => c.ok), JSON.stringify(doctorOut.checks));
+
+  // 9. export
+  const exp = run(repo, ["export"]);
+  assert.equal(exp.status, 0);
+  const exported = JSON.parse(exp.stdout);
+  assert.equal(exported.intents.length, 1);
+});
+
+test("syntax errors are rejected and history stays clean (PRD §9.2)", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  const before = git(repo, ["rev-parse", "HEAD"]);
+
+  writeFileSync(join(repo, "src", "auth.ts"), "export const broken = ;\n");
+  const realize = run(repo, ["realize", "-p", "broken change"]);
+  assert.equal(realize.status, 2, realize.stderr);
+  assert.ok(realize.stderr.includes("Syntax error"));
+
+  const after = git(repo, ["rev-parse", "HEAD"]);
+  assert.equal(after, before, "no commit must be created on syntax error");
+  assert.equal(git(repo, ["status", "--porcelain"]).split("\n").length >= 1, true);
+
+  // no intents recorded
+  const log = parseJson(run(repo, ["log", "--json"]).stdout);
+  assert.equal(log.intents.length, 0);
+});
+
+test("E_NO_CHANGES when nothing staged (exit 3)", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  const res = run(repo, ["realize", "-p", "nothing changed"]);
+  assert.equal(res.status, 3);
+});
+
+test("blame reports uncommitted changes", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  // realize once, then edit without committing
+  writeFileSync(join(repo, "src", "auth.ts"), readFileSync(join(repo, "src", "auth.ts"), "utf8") + "\nexport const x = 1;\n");
+  run(repo, ["realize", "-p", "add const x"]);
+  writeFileSync(join(repo, "src", "auth.ts"), readFileSync(join(repo, "src", "auth.ts"), "utf8") + "\nexport const y = 2;\n");
+  const blame = parseJson(run(repo, ["blame", "src/auth.ts", "--line", "6", "--json"]).stdout);
+  assert.equal(blame.status, "ok");
+  assert.equal(blame.committed, false);
+});
+
+test("redaction: secrets in prompts never hit git history", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  writeFileSync(join(repo, "src", "auth.ts"), "export const a = 1;\n");
+  const realize = run(repo, ["realize", "-p", "use sk-abc123DEF456ghi789JKL0123456789 in config", "--json"]);
+  assert.equal(realize.status, 0, realize.stderr);
+  const log = parseJson(run(repo, ["log", "--json"]).stdout);
+  assert.ok(!log.intents[0].prompt.includes("sk-abc123"));
+  assert.ok(log.intents[0].prompt.includes("[REDACTED]"));
+});
+
+test("deleted files produce a DELETED intent delta", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  writeFileSync(join(repo, "src", "extra.ts"), "export const tmp = 1;\n");
+  run(repo, ["realize", "-p", "add extra file"]);
+  // delete the file, then realize
+  spawnSync("rm", [join(repo, "src", "extra.ts")]);
+  const realize = run(repo, ["realize", "-p", "remove extra file", "--json"]);
+  assert.equal(realize.status, 0, realize.stderr);
+  const out = parseJson(realize.stdout);
+  assert.ok(
+    out.astDelta.some((d) => d.type === "DELETED" && d.filePath === "src/extra.ts"),
+    JSON.stringify(out.astDelta),
+  );
+});
+
+test("log --file filters intents touching a file", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  writeFileSync(join(repo, "src", "auth.ts"), "export const a = () => 1;\n");
+  run(repo, ["realize", "-p", "touch auth"]);
+  writeFileSync(join(repo, "src", "other.ts"), "export const o = () => 2;\n");
+  run(repo, ["realize", "-p", "touch other"]);
+  const filtered = parseJson(run(repo, ["log", "--file", "src/other.ts", "--json"]).stdout);
+  assert.equal(filtered.intents.length, 1);
+  assert.equal(filtered.intents[0].prompt, "touch other");
+});
+
+test("replay restores agent state and checkout", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  writeFileSync(join(repo, "src", "auth.ts"), "export const b = 2;\n");
+  const state = Buffer.from(JSON.stringify({ step: 3, filesDone: ["auth.ts"] })).toString("base64");
+  const realize = run(repo, ["realize", "-p", "checkpoint", "--state", state, "--json"]);
+  const id = parseJson(realize.stdout).intentId;
+  const replay = parseJson(run(repo, ["replay", id, "--json"]).stdout);
+  assert.equal(replay.agentState, state);
+  const checkout = parseJson(run(repo, ["replay", id, "--checkout", "--json"]).stdout);
+  assert.equal(checkout.checkedOut, true);
+});

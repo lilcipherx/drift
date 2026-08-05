@@ -1,0 +1,242 @@
+#!/usr/bin/env node
+/**
+ * Drift MCP server (PRD §3.1, §14.2) — the agent-facing skill surface.
+ *
+ * Exposes capabilities agents did not have before:
+ *   drift_realize  commit changes with intent, rejecting broken syntax
+ *   drift_context  hydrate reasoning for a file
+ *   drift_replay   restore a prior cognitive state
+ *   drift_blame    ask "why does this function exist?"
+ *   drift_verify   re-run an intent's verification command
+ *   drift_log      inspect intent history
+ *
+ * Contract (PRD §11): this server never touches git or SQLite directly —
+ * every tool delegates to the `drift` CLI as a child process.
+ *
+ * Configure the repo with the `DRIFT_REPO` env var (defaults to the server's
+ * working directory).
+ */
+
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+const VERSION = "0.1.0";
+const SERVER_NAME = "drift";
+
+// --- locate the CLI ---------------------------------------------------------
+const HERE = dirname(fileURLToPath(import.meta.url));
+const CLI_CANDIDATES = [
+  join(HERE, "..", "..", "drift-cli", "dist", "cli.js"),
+  join(HERE, "..", "drift-cli", "dist", "cli.js"),
+];
+
+function findCli(): string {
+  for (const candidate of CLI_CANDIDATES) {
+    if (existsSync(candidate)) return candidate;
+  }
+  // Resolve a separately-installed @drift/cli
+  const resolved = resolve(process.cwd(), "node_modules", "@drift", "cli", "dist", "cli.js");
+  if (existsSync(resolved)) return resolved;
+  throw new Error(
+    "Drift CLI not found. Build the workspace (npm run build) or install @drift/cli.",
+  );
+}
+
+const CLI = findCli();
+const repoDir = process.env.DRIFT_REPO || process.cwd();
+
+interface CliOutcome {
+  ok: boolean;
+  data: Record<string, unknown> | null;
+  error: { type: string; message: string; exitCode: number } | null;
+  raw: { stdout: string; stderr: string; status: number };
+}
+
+function runCli(args: string[]): CliOutcome {
+  const res = spawnSync(process.execPath, [CLI, ...args, "--json"], {
+    cwd: repoDir,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+    windowsHide: true,
+  });
+  const raw = {
+    stdout: (res.stdout ?? "").toString(),
+    stderr: (res.stderr ?? "").toString(),
+    status: res.status ?? -1,
+  };
+  let data: Record<string, unknown> | null = null;
+  let error: CliOutcome["error"] = null;
+  const merged = raw.stdout.trim() || raw.stderr.trim();
+  try {
+    const parsed = JSON.parse(merged || "{}") as Record<string, unknown>;
+    if (parsed.status === "ok") {
+      data = parsed;
+    } else {
+      error = {
+        type: (parsed?.type as string) ?? "error",
+        message: (parsed?.message as string) || raw.stderr.trim() || "drift command failed",
+        exitCode: (parsed?.exitCode as number) ?? raw.status,
+      };
+    }
+  } catch {
+    error = {
+      type: "error",
+      message: raw.stderr.trim() || raw.stdout.trim() || "drift command failed",
+      exitCode: raw.status,
+    };
+  }
+  return { ok: data !== null, data, error, raw };
+}
+
+function text(content: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(content, null, 2) }],
+  };
+}
+
+const server = new McpServer({ name: SERVER_NAME, version: VERSION });
+
+server.registerTool(
+  "drift_realize",
+  {
+    title: "Drift Realize",
+    description:
+      "Commit changes with semantic intent tracking. Use instead of `git commit`. Rejects broken syntax before commit (never pollutes history). Prompts are redacted for secrets.",
+    inputSchema: {
+      prompt: z.string().describe("What you changed and why (the intent)"),
+      files: z.array(z.string()).optional().describe("Optional file paths to include (default: all changes)"),
+      model: z.string().optional().describe("Model identifier, e.g. claude-3-5-sonnet"),
+      agentState: z.string().optional().describe("base64 JSON cognitive state to checkpoint for replay"),
+      verifyCmd: z.string().optional().describe("Verification command recorded with the intent"),
+    },
+  },
+  async (args) => {
+    const cliArgs: string[] = ["realize", "-p", String(args.prompt ?? ""), "--agent"];
+    if (Array.isArray(args.files)) cliArgs.push(...args.files.map(String));
+    if (args.model) cliArgs.push("--model", String(args.model));
+    if (args.agentState) cliArgs.push("--state", String(args.agentState));
+    if (args.verifyCmd) cliArgs.push("--verify-cmd", String(args.verifyCmd));
+    const out = runCli(cliArgs);
+    if (!out.ok) {
+      return text({
+        status: "error",
+        type: out.error?.type ?? "syntax",
+        details: out.error?.message,
+        exitCode: out.error?.exitCode,
+      });
+    }
+    return text(out.data);
+  },
+);
+
+server.registerTool(
+  "drift_context",
+  {
+    title: "Drift Context",
+    description:
+      "Return the last N intents for a file to hydrate reasoning before editing. Use to ground yourself in prior intent.",
+    inputSchema: {
+      file: z.string(),
+      limit: z.number().int().positive().optional(),
+    },
+  },
+  async (args) => {
+    const cliArgs = ["context", String(args.file)];
+    if (args.limit) cliArgs.push("--limit", String(args.limit));
+    const out = runCli(cliArgs);
+    if (!out.ok) return text({ status: "error", details: out.error?.message });
+    return text(out.data);
+  },
+);
+
+server.registerTool(
+  "drift_replay",
+  {
+    title: "Drift Replay",
+    description:
+      "Restore a prior agent cognitive state. Optionally checks out the intent's commit first. Use to resume a crashed or interrupted task.",
+    inputSchema: {
+      intentId: z.string(),
+      checkout: z.boolean().optional(),
+    },
+  },
+  async (args) => {
+    const cliArgs = ["replay", String(args.intentId)];
+    if (args.checkout) cliArgs.push("--checkout");
+    const out = runCli(cliArgs);
+    if (!out.ok) return text({ status: "error", details: out.error?.message });
+    return text(out.data);
+  },
+);
+
+server.registerTool(
+  "drift_blame",
+  {
+    title: "Drift Blame",
+    description:
+      'Ask "why does this function exist?" — returns the originating prompt, model and intent for a line or function.',
+    inputSchema: {
+      file: z.string(),
+      line: z.number().int().positive().optional().describe("1-based line number"),
+      functionName: z.string().optional().describe("Function name to blame"),
+    },
+  },
+  async (args) => {
+    const cliArgs = ["blame", String(args.file)];
+    if (args.functionName) cliArgs.push("--function", String(args.functionName));
+    else if (args.line) cliArgs.push("--line", String(args.line));
+    const out = runCli(cliArgs);
+    if (!out.ok) return text({ status: "error", details: out.error?.message });
+    return text(out.data);
+  },
+);
+
+server.registerTool(
+  "drift_verify",
+  {
+    title: "Drift Verify",
+    description:
+      "Re-run the verification command recorded in an intent and report pass/fail.",
+    inputSchema: {
+      intentId: z.string(),
+    },
+  },
+  async (args) => {
+    const out = runCli(["verify", String(args.intentId)]);
+    if (!out.ok) return text({ status: "error", details: out.error?.message });
+    return text(out.data);
+  },
+);
+
+server.registerTool(
+  "drift_log",
+  {
+    title: "Drift Log",
+    description:
+      "List recorded intents (ID, author, model, prompt, files) with optional filters.",
+    inputSchema: {
+      author: z.string().optional(),
+      model: z.string().optional(),
+      file: z.string().optional(),
+      limit: z.number().int().positive().optional(),
+    },
+  },
+  async (args) => {
+    const cliArgs = ["log"];
+    if (args.author) cliArgs.push("--author", String(args.author));
+    if (args.model) cliArgs.push("--model", String(args.model));
+    if (args.file) cliArgs.push("--file", String(args.file));
+    if (args.limit) cliArgs.push("--limit", String(args.limit));
+    const out = runCli(cliArgs);
+    if (!out.ok) return text({ status: "error", details: out.error?.message });
+    return text(out.data);
+  },
+);
+
+const transport = new StdioServerTransport();
+await server.connect(transport);

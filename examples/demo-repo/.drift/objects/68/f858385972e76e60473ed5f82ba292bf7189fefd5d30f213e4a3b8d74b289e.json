@@ -1,0 +1,32 @@
+{
+  "id": "did_00e3f93f400c324ca13f754a036f1670",
+  "parentId": "did_c669d892e559c5e0946152cf5085587e",
+  "author": {
+    "type": "AGENT",
+    "identifier": "Drift Demo",
+    "model": "claude-3-5-sonnet"
+  },
+  "prompt": "Fix race condition in token refresh by de-duplicating in-flight refreshes",
+  "astDelta": [
+    {
+      "filePath": "src/auth.ts",
+      "type": "MOVED",
+      "nodeIds": [
+        "src/auth.ts::function::verifyToken",
+        "src/auth.ts::function::verifyToken"
+      ],
+      "summary": "function \"verifyToken\" moved from line 6 to 8"
+    },
+    {
+      "filePath": "src/auth.ts",
+      "type": "ADDED",
+      "nodeIds": [
+        "src/auth.ts::function::refreshToken"
+      ],
+      "summary": "function \"refreshToken\" added (line 12)"
+    }
+  ],
+  "timestamp": 1785919847957,
+  "gitCommitSha": "",
+  "signature": "v1IXH8q3st88wGS5H9+dfE9VcwOwloWED99fN2Ea2qXZ+qkQXuOia9Ntsb310S9FBGGgH8clJDYlL407JIQ9BA=="
+}

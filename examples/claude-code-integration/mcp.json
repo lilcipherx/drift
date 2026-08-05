@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/mcp.json",
+  "mcpServers": {
+    "drift": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/drift/packages/drift-mcp/dist/index.js"
+      ],
+      "env": {
+        "DRIFT_REPO": "/path/to/your/repository"
+      }
+    }
+  }
+}

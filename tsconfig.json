@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/drift-ast" },
+    { "path": "./packages/drift-core" },
+    { "path": "./packages/drift-cli" },
+    { "path": "./packages/drift-sdk" },
+    { "path": "./packages/drift-mcp" }
+  ]
+}
