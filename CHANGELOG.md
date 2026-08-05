@@ -81,6 +81,8 @@ All notable changes are tracked here (git-cliff style, kept manually).
   drops the now-unused `version` input; it will switch to npm-mode
   automatically once the publish chain lands.
 
+## [0.2.3] — 2026-08-05
+
 ### Fixed (wave-2 audit)
 - `doctor --fix` no longer fails with `FOREIGN KEY constraint failed` when
   deleting an intent that has children — `deleteById` reparents dependants to
