@@ -281,7 +281,7 @@ Install `@drift/app` to get intent summaries on every pull request:
 Check intent health in CI:
 
 ```yaml
-- uses: lilcipherx/drift@v0.2.1
+- uses: lilcipherx/drift@v0.3.0
   with:
     command: log     # or: doctor / verify <intent-id>
 ```
