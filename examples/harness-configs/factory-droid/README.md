@@ -8,8 +8,8 @@ Droid exposes MCP servers through its settings / `mcp_servers` configuration.
    config file).
 2. Add a **local** MCP server:
    - **Name:** `drift`
-   - **Command:** `node`
-   - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
+   - **Command:** `npx`
+   - **Args:** `-y @drift/mcp`
    - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
 3. Restart Droid so the server connects at session start.
 

@@ -3,11 +3,11 @@
 Ready-to-use configuration files that wire the Drift MCP server
 (`@drift/mcp`) into 11 coding-agent harnesses.
 
-All examples use the same two placeholders — replace them with your paths:
+All examples launch the MCP server via `npx -y @drift/mcp` (fetched from npm —
+no clone needed). The only placeholder to replace:
 
 | Placeholder | Replace with |
 | :--- | :--- |
-| `/abs/path/to/drift/packages/drift-mcp/dist/index.js` | absolute path to the MCP server (run `npm install` in the Drift repo first — `dist/` is committed) |
 | `/abs/path/to/your/repo` | the repository Drift should operate on (`DRIFT_REPO`) |
 
 ## File-based harnesses

@@ -4,8 +4,8 @@
   "description": "Intent-Driven Versioning — semantic commits, blame by intent, MCP tools for Gemini CLI.",
   "mcpServers": {
     "drift": {
-      "command": "node",
-      "args": ["${extensionPath}/packages/drift-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@drift/mcp"],
       "env": {
         "DRIFT_REPO": "${DRIFT_REPO}"
       }

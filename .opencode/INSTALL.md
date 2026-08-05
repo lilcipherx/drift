@@ -9,7 +9,7 @@ your `opencode.json` (note: OpenCode uses `environment`, not `env`):
   "mcp": {
     "drift": {
       "type": "local",
-      "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
+      "command": ["npx", "-y", "@drift/mcp"],
       "environment": {
         "DRIFT_REPO": "/abs/path/to/your/repo"
       },
@@ -19,11 +19,11 @@ your `opencode.json` (note: OpenCode uses `environment`, not `env`):
 }
 ```
 
-Replace the two placeholders:
+The server runs from npm via `npx` — no clone needed. The only placeholder to
+replace:
 
 | Placeholder | Replace with |
 | :--- | :--- |
-| `/abs/path/to/drift/packages/drift-mcp/dist/index.js` | absolute path to the MCP server (run `npm install` in the Drift repo first — `dist/` is committed) |
 | `/abs/path/to/your/repo` | the repository Drift should operate on |
 
 ## Verify
@@ -37,7 +37,5 @@ You should see `drift`. The agent now has six tools: `drift_realize`,
 
 ## Update
 
-```bash
-git -C /abs/path/to/drift pull origin main
-cd /abs/path/to/drift && npm install
-```
+`npx -y @drift/mcp` always fetches the latest published version — restart
+OpenCode (or run `opencode mcp reload`) to pick it up.

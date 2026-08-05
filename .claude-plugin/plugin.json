@@ -12,8 +12,8 @@
   "keywords": ["versioning", "intents", "git", "mcp", "ai"],
   "mcpServers": {
     "drift": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/packages/drift-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@drift/mcp"],
       "env": {
         "DRIFT_REPO": "${DRIFT_REPO}"
       }

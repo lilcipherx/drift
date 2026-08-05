@@ -7,8 +7,8 @@ The Codex desktop app configures MCP servers in its settings (Plugins section).
 1. Open **Settings → MCP servers** in the Codex app.
 2. Add a **local** MCP server:
    - **Name:** `drift`
-   - **Command:** `node`
-   - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
+   - **Command:** `npx`
+   - **Args:** `-y @drift/mcp`
    - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
 3. Save and follow the app's prompts to enable the server.
 

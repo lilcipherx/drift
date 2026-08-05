@@ -19,7 +19,7 @@ Or install directly from this repository:
 ```
 
 The plugin wires the Drift MCP server with a local `command` of
-`node /abs/path/to/drift/packages/drift-mcp/dist/index.js` and the
+`npx -y @drift/mcp` (fetched from npm — no clone needed) and the
 `DRIFT_REPO` environment variable set to the repository Drift should operate on
 (see `examples/harness-configs/kimi-code/` for the exact fields).
 
@@ -30,4 +30,5 @@ The plugin wires the Drift MCP server with a local `command` of
 
 ## Update
 
-Pull the latest Drift, rebuild, and reinstall the plugin.
+`npx -y @drift/mcp` always fetches the latest published version — just reinstall
+the plugin (or restart Kimi) to pick it up.
