@@ -1,0 +1,17 @@
+{
+  "name": "drift",
+  "description": "Intent-Driven Versioning — semantic commits, blame by intent, MCP tools for agents. Git tracks what changed; Drift tracks why.",
+  "source": {
+    "github": "lilcipherx/drift"
+  },
+  "plugins": [
+    {
+      "name": "drift",
+      "description": "Drift plugin for Claude Code — adds the drift MCP server (drift_realize, drift_context, drift_replay, drift_blame, drift_verify, drift_log)",
+      "source": {
+        "github": "lilcipherx/drift",
+        "path": ".claude-plugin/plugin.json"
+      }
+    }
+  ]
+}

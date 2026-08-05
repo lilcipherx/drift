@@ -77,7 +77,14 @@ npm** (the MCP server runs via `npx -y @drift/mcp`, no clone needed).
 
 ### Claude Code
 
-Add the Drift MCP server (project scope):
+Install as a plugin from the Drift marketplace (plugin-style, like Superpowers):
+
+```text
+/plugin marketplace add lilcipherx/drift
+/plugin install drift@drift
+```
+
+Or add the Drift MCP server directly (project scope):
 
 ```bash
 claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
@@ -90,6 +97,9 @@ cp examples/harness-configs/claude-code/.mcp.json .mcp.json
 ```
 
 Verify with `claude mcp list` — you should see `drift` with its six tools.
+
+> The marketplace manifest lives at `.claude-plugin/marketplace.json` in this
+> repository (`source: github lilcipherx/drift` → `.claude-plugin/plugin.json`).
 
 ### Antigravity
 
