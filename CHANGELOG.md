@@ -8,6 +8,9 @@ All notable changes are tracked here (git-cliff style, kept manually).
 - README rewritten in the Superpowers style: Quickstart, How it works,
   per-harness Installation, The Basic Workflow, What's Inside, Philosophy,
   Security, Contributing, Updating, Community.
+- README Quickstart now lists agent harnesses as anchor links (Claude Code,
+  Cursor, Codex, Cline, Windsurf, VS Code / Copilot), each jumping to its own
+  installation subsection with concrete MCP setup steps.
 
 ## [0.2.1] — 2026-08-05
 
