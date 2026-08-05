@@ -47,6 +47,11 @@ All notable changes are tracked here (git-cliff style, kept manually).
   entries use the GitHub-repo object form (`{"source":"github","repo":…}`)
   instead of bare URL strings; the `pi` package now ships a real prompt
   template (`prompts/drift.md`) and a `drift-intent` skill (`skills/drift/`).
+- Committed `packages/*/dist` (build output) so plugin manifests and CLI
+  instructions can run the MCP server / CLI from a fresh clone without a build
+  step — `npm install` is still required for workspace symlinks and external
+  deps. `.gitignore` now un-ignores `packages/*/dist`; install instructions
+  updated accordingly (`npm install` only).
 
 ## [0.2.1] — 2026-08-05
 

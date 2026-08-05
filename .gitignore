@@ -5,6 +5,12 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# ...but dist IS committed so plugin manifests can run the MCP server from a
+# fresh clone without a build step (npm install is still required for
+# workspace symlinks and external deps)
+!packages/*/dist/
+!packages/*/dist/**
+
 # Freebuff app internals (local workspace only)
 .freebuff/
 desktop-v2.db

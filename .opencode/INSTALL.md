@@ -23,7 +23,7 @@ Replace the two placeholders:
 
 | Placeholder | Replace with |
 | :--- | :--- |
-| `/abs/path/to/drift/packages/drift-mcp/dist/index.js` | absolute path to the built MCP server (run `npm install && npm run build` in the Drift repo first) |
+| `/abs/path/to/drift/packages/drift-mcp/dist/index.js` | absolute path to the MCP server (run `npm install` in the Drift repo first — `dist/` is committed) |
 | `/abs/path/to/your/repo` | the repository Drift should operate on |
 
 ## Verify
@@ -39,5 +39,5 @@ You should see `drift`. The agent now has six tools: `drift_realize`,
 
 ```bash
 git -C /abs/path/to/drift pull origin main
-cd /abs/path/to/drift && npm install && npm run build
+cd /abs/path/to/drift && npm install
 ```

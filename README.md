@@ -225,7 +225,7 @@ From this repository:
 
 ```bash
 git clone https://github.com/lilcipherx/drift.git && cd drift
-npm install && npm run build
+npm install
 node packages/drift-cli/dist/cli.js --help
 ```
 
@@ -374,7 +374,7 @@ and point your MCP / Action config at it:
 
 ```bash
 git pull origin main
-npm install && npm run build
+npm install
 ```
 
 Changelog: [CHANGELOG.md](CHANGELOG.md).

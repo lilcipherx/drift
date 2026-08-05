@@ -3,15 +3,17 @@
 > Goal: go from zero to `drift blame` showing the *why* behind a function in
 > under five minutes.
 
-## 1. Install & build
+## 1. Install
 
 Requires **Node.js >= 24** (uses the built-in `node:sqlite`) and git.
 
 ```bash
 git clone <your-fork> drift && cd drift
 npm install
-npm run build
 ```
+
+The `dist/` build output is committed, so no build step is needed. (`npm run
+build` still works if you edit the TypeScript sources.)
 
 ## 2. Seed the demo repository
 

@@ -7,7 +7,7 @@ All examples use the same two placeholders — replace them with your paths:
 
 | Placeholder | Replace with |
 | :--- | :--- |
-| `/abs/path/to/drift/packages/drift-mcp/dist/index.js` | absolute path to the built MCP server (run `npm install && npm run build` in the Drift repo first) |
+| `/abs/path/to/drift/packages/drift-mcp/dist/index.js` | absolute path to the MCP server (run `npm install` in the Drift repo first — `dist/` is committed) |
 | `/abs/path/to/your/repo` | the repository Drift should operate on (`DRIFT_REPO`) |
 
 ## File-based harnesses
