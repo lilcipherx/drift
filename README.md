@@ -53,175 +53,177 @@ And because these are MCP tools, your coding agent can use them directly —
 ## Installation
 
 Installation differs by harness. If you use more than one, install Drift
-separately for each one. All harnesses talk to the same MCP server
-(`@drift/mcp`) and expose the same six tools: `drift_realize`, `drift_context`,
-`drift_replay`, `drift_blame`, `drift_verify`, `drift_log`.
-
-One-time build, from this repository:
-
-```bash
-git clone https://github.com/lilcipherx/drift.git && cd drift
-npm install && npm run build
-```
-
-Then pick your harness below.
+separately for each one. All harnesses expose the same six tools:
+`drift_realize`, `drift_context`, `drift_replay`, `drift_blame`, `drift_verify`,
+`drift_log`.
 
 ### Claude Code
 
-Install the server in one command:
+Drift is available via the [official Claude plugin marketplace](https://claude.com/plugins).
 
-```bash
-claude mcp add drift \
-  --env DRIFT_REPO=/abs/path/to/your/repo \
-  -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+#### Official Marketplace
+
+Install the plugin from Anthropic's official marketplace:
+
+```text
+/plugin install drift@claude-plugins-official
 ```
 
-Or use the project config file instead:
-[`examples/harness-configs/claude-code/.mcp.json`](examples/harness-configs/claude-code/.mcp.json)
+#### Drift Marketplace
 
-Verify: `claude mcp list` shows `drift`.
+The Drift marketplace provides Drift and related plugins for Claude Code.
+
+- Register the marketplace:
+
+  ```text
+  /plugin marketplace add lilcipherx/drift-marketplace
+  ```
+
+- Install the plugin from this marketplace:
+
+  ```text
+  /plugin install drift@drift-marketplace
+  ```
 
 ### Antigravity
 
-No CLI — add the server in Antigravity's settings:
+Install Drift as a plugin from this repository:
 
-```text
-Settings → MCP servers → add local server:
-  Name:    drift
-  Command: node
-  Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
-  Env:     DRIFT_REPO=/abs/path/to/your/repo
+```bash
+agy plugin install https://github.com/lilcipherx/drift
 ```
 
-Step-by-step: [`examples/harness-configs/antigravity/`](examples/harness-configs/antigravity/)
+Antigravity runs the plugin's session-start hook, so Drift is active from the
+first message. Reinstall with the same command to update.
 
 ### Codex App
 
-In the Codex app, open **Settings → MCP servers** (Plugins section) and add a
-local server:
+Drift is available via the [official Codex plugin marketplace](https://github.com/openai/plugins).
 
-```text
-Name:    drift
-Command: node
-Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
-Env:     DRIFT_REPO=/abs/path/to/your/repo
-```
-
-Step-by-step: [`examples/harness-configs/codex-app/`](examples/harness-configs/codex-app/)
+- In the Codex app, click on **Plugins** in the sidebar.
+- You should see `drift` in the Coding section.
+- Click the `+` next to Drift and follow the prompts.
 
 ### Codex CLI
 
-Add the server to `~/.codex/config.toml`:
+Drift is available via the [official Codex plugin marketplace](https://github.com/openai/plugins).
 
-```toml
-[mcp_servers.drift]
-command = "node"
-args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
-env = { DRIFT_REPO = "/abs/path/to/your/repo" }
-```
+- Open the plugin search interface:
 
-Ready-made file: [`examples/harness-configs/codex-cli/config.toml`](examples/harness-configs/codex-cli/config.toml)
+  ```text
+  /plugins
+  ```
 
-Restart Codex; the six `drift_*` tools appear in the tool list.
+- Search for Drift:
+
+  ```text
+  drift
+  ```
+
+- Select `Install Plugin`.
 
 ### Cursor
 
-Drop the config into `.cursor/mcp.json`:
+- In Cursor Agent chat, install from marketplace:
 
-```bash
-cp examples/harness-configs/cursor/mcp.json .cursor/mcp.json
-```
+  ```text
+  /add-plugin drift
+  ```
 
-Then enable it: **Cursor Settings → MCP → `drift` → Enable**.
+- Or search for "drift" in the plugin marketplace.
 
 ### Factory Droid
 
-Add the server in Droid's MCP settings:
+- Register the marketplace:
 
-```text
-Name:    drift
-Command: node
-Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
-Env:     DRIFT_REPO=/abs/path/to/your/repo
-```
+  ```bash
+  droid plugin marketplace add https://github.com/lilcipherx/drift
+  ```
 
-Step-by-step: [`examples/harness-configs/factory-droid/`](examples/harness-configs/factory-droid/)
+- Install the plugin:
+
+  ```bash
+  droid plugin install drift@drift
+  ```
 
 ### Gemini CLI
 
-Add the `mcpServers` block to `.gemini/settings.json` (project) or
-`~/.gemini/settings.json` (global):
+- Install the extension:
 
-```bash
-cp examples/harness-configs/gemini-cli/settings.json .gemini/settings.json
-```
+  ```bash
+  gemini extensions install https://github.com/lilcipherx/drift
+  ```
 
-Then, in a session: `/mcp list` to confirm, `/mcp reload` after edits.
+- Update later:
+
+  ```bash
+  gemini extensions update drift
+  ```
 
 ### GitHub Copilot CLI
 
-Install the server in one command:
+- Register the marketplace:
 
-```bash
-copilot mcp add drift \
-  -e DRIFT_REPO=/abs/path/to/your/repo \
-  -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
-```
+  ```bash
+  copilot plugin marketplace add lilcipherx/drift-marketplace
+  ```
 
-Or use the repo config file:
-[`examples/harness-configs/github-copilot-cli/mcp.json`](examples/harness-configs/github-copilot-cli/mcp.json) → `.github/mcp.json`
+- Install the plugin:
+
+  ```bash
+  copilot plugin install drift@drift-marketplace
+  ```
 
 ### Kimi Code
 
-Add the server in Kimi Code's MCP settings:
+Drift is available in Kimi Code's plugin marketplace.
 
-```text
-Name:    drift
-Command: node
-Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
-Env:     DRIFT_REPO=/abs/path/to/your/repo
-```
+- Open Kimi Code's plugin manager:
 
-Step-by-step: [`examples/harness-configs/kimi-code/`](examples/harness-configs/kimi-code/)
+  ```text
+  /plugins
+  ```
+
+- Go to `Marketplace` > `Drift` and install it.
+
+- Or install directly from this repository:
+
+  ```text
+  /plugins install https://github.com/lilcipherx/drift
+  ```
+
+- Detailed docs: [docs/README.kimi.md](docs/README.kimi.md)
 
 ### OpenCode
 
-OpenCode uses its own config shape (note `environment`, not `env`). Add to
-`opencode.json`:
+OpenCode uses its own plugin install; install Drift separately even if you
+already use it in another harness.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "drift": {
-      "type": "local",
-      "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
-      "environment": { "DRIFT_REPO": "/abs/path/to/your/repo" },
-      "enabled": true
-    }
-  }
-}
-```
+- Tell OpenCode:
 
-Ready-made file: [`examples/harness-configs/opencode/opencode.json`](examples/harness-configs/opencode/opencode.json)
-Verify with `opencode mcp list`.
+  ```text
+  Fetch and follow instructions from https://raw.githubusercontent.com/lilcipherx/drift/main/.opencode/INSTALL.md
+  ```
+
+- Detailed docs: [docs/README.opencode.md](docs/README.opencode.md)
 
 ### Pi
 
-Install the Pi MCP adapter, then set up inside a session:
+Install Drift as a Pi package from this repository:
 
 ```bash
-pi install npm:pi-mcp-adapter
-# inside a pi session:
-/mcp setup
+pi install git:github.com/lilcipherx/drift
 ```
 
-Or drop the `mcpServers` block into `.mcp.json` / `~/.pi/agent/mcp.json`:
-[`examples/harness-configs/pi/mcp.json`](examples/harness-configs/pi/mcp.json)
+For local development, run Pi with this checkout loaded as a temporary package:
+
+```bash
+pi -e /path/to/drift
+```
 
 ### VS Code
 
-Add the `mcpServers` block to `.vscode/mcp.json` (native VS Code MCP support):
+Add the Drift MCP server to `.vscode/mcp.json` (native VS Code MCP support):
 
 ```bash
 cp examples/harness-configs/claude-code/.mcp.json .vscode/mcp.json
