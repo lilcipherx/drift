@@ -28,6 +28,10 @@ Prefer no agent? Use the [CLI](#cli), the [GitHub App](#github-app), the
 [GitHub Action](#github-action), or [VS Code](#vs-code). Want the 5-minute "aha"
 first? Seed the [demo repo](#demo) and run `drift blame`.
 
+**Documentation:** [Quickstart](docs/quickstart.md) (5-minute start) ·
+[API reference](docs/api.md) (CLI + MCP tools) ·
+[Architecture](docs/architecture.md) (how Drift works under the hood)
+
 ## How it works
 
 It starts the moment you run `drift init`. Drift creates `.drift/` — a SQLite DAG,
@@ -49,6 +53,12 @@ exactly where it left off.
 
 And because these are MCP tools, your coding agent can use them directly —
 `drift_realize` instead of `git commit`.
+
+Deeper reading: the full command reference lives in
+[docs/api.md](docs/api.md) (CLI flags, exit codes, JSON schemas, MCP tool
+inputs), and [docs/architecture.md](docs/architecture.md) explains the
+storage model, encryption at rest, the webhook app, and the security
+boundaries.
 
 ## Installation
 
