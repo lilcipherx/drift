@@ -74,6 +74,12 @@ All notable changes are tracked here (git-cliff style, kept manually).
   `@drift/ast` → `@drift/core` → `@drift/cli` → `@drift/mcp` chain in order,
   confirms each version on the registry, and verifies the `npx -y @drift/mcp`
   handshake from an empty directory.
+- GitHub Action runs the CLI **from its own checkout** (`node
+  packages/drift-cli/dist/cli.js`, `dist/` is committed) instead of
+  `npx -y @drift/cli@0.1.0` — the Action works today, before any `@drift/*`
+  package is published. It materialises the workspace links with `npm ci` and
+  drops the now-unused `version` input; it will switch to npm-mode
+  automatically once the publish chain lands.
 
 ### Fixed (production-readiness audit)
 - AST parser no longer trips over **regex literals containing `{`/`}`/`/`**
