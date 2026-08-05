@@ -7,7 +7,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync as fsSymlink,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -200,6 +208,60 @@ test("blame/context reject paths that escape the repository root", () => {
   assert.equal(realize.status, 1, realize.stderr);
   const log = parseJson(run(repo, ["log", "--json"]).stdout);
   assert.equal(log.intents.length, 0, "no intent must be recorded for a rejected realize");
+});
+
+test("symlink/junction pointing outside the repo is rejected by blame/context", async (t) => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  // real file OUTSIDE the repo
+  const outside = mkdtempSync(join(tmpdir(), "drift-outside-link-"));
+  writeFileSync(join(outside, "secret.ts"), "export function secretFn() { return 42; }\n");
+
+  // symlink INSIDE the repo → outside dir. Junction on Windows (no admin
+  // rights needed for dirs), plain symlink elsewhere.
+  const linkPath = join(repo, "escape");
+  try {
+    fsSymlink(outside, linkPath, process.platform === "win32" ? "junction" : "dir");
+  } catch (e) {
+    // e.g. Windows without developer mode / admin: EPERM — the live POSIX
+    // runner covers this case; skip here so CI stays green everywhere.
+    t.skip(`cannot create symlink on this platform: ${e.code}`);
+    return;
+  }
+
+  for (const [label, args] of [
+    ["blame through symlink", ["blame", "escape/secret.ts", "--line", "1", "--json"]],
+    ["context through symlink", ["context", "escape/secret.ts", "--json"]],
+  ]) {
+    const res = run(repo, args);
+    assert.equal(res.status, 1, `${label}: expected exit 1, got ${res.status}: ${res.stderr}`);
+    assert.match(res.stdout + res.stderr, /escapes the repository root/, `${label}: ${res.stdout}${res.stderr}`);
+  }
+
+  // a junction/symlink pointing INSIDE the repo is not an escape
+  mkdirSync(join(repo, "real"));
+  writeFileSync(join(repo, "real", "inner.ts"), "export const inner = 1;\n");
+  git(repo, ["add", "real/inner.ts"]);
+  git(repo, ["commit", "-m", "add inner file"]);
+  const innerLink = join(repo, "inner-link");
+  try {
+    fsSymlink(join(repo, "real"), innerLink, process.platform === "win32" ? "junction" : "dir");
+  } catch {
+    /* ignore */
+  }
+  // positive: the same file via its real path is NOT an escape
+  const ok = run(repo, ["blame", "real/inner.ts", "--line", "1", "--json"]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(parseJson(ok.stdout).status, "ok");
+
+  // positive: blame through a link that stays inside the repo is allowed by
+  // the guard (git itself may still refuse unknown paths like a junction —
+  // that is a git limitation, not a containment rejection)
+  if (existsSync(innerLink)) {
+    const inner = run(repo, ["blame", "inner-link/inner.ts", "--line", "1", "--json"]);
+    assert.notEqual(inner.status, 0); // git refuses — fine
+    assert.doesNotMatch(inner.stdout + inner.stderr, /escapes the repository root/);
+  }
 });
 
 test("blame reports uncommitted changes", () => {
