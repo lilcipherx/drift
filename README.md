@@ -87,7 +87,7 @@ repository Drift should operate on, and the agent gets the six `drift_*` tools.
     -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
   ```
 
-- Ready-made example: [`examples/claude-code-integration/mcp.json`](examples/claude-code-integration/mcp.json)
+- Ready-made example: [`examples/harness-configs/claude-code/.mcp.json`](examples/harness-configs/claude-code/.mcp.json)
 - Verify: `claude mcp list` shows `drift`.
 
 ### Antigravity
@@ -96,13 +96,14 @@ repository Drift should operate on, and the agent gets the six `drift_*` tools.
   - **Command:** `node`
   - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
   - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
+- Step-by-step: [`examples/harness-configs/antigravity/`](examples/harness-configs/antigravity/)
 - Antigravity runs the server at session start, so Drift is active from the first
   message. Reinstall by pulling and rebuilding this repo.
 
 ### Codex App
 
 - In the Codex app, open the MCP servers settings (Plugins section) and add a
-  local server:
+  local server (step-by-step: [`examples/harness-configs/codex-app/`](examples/harness-configs/codex-app/)):
   - **Command:** `node`
   - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
   - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
@@ -118,23 +119,27 @@ repository Drift should operate on, and the agent gets the six `drift_*` tools.
   env = { DRIFT_REPO = "/abs/path/to/your/repo" }
   ```
 
+- Ready-made file: [`examples/harness-configs/codex-cli/config.toml`](examples/harness-configs/codex-cli/config.toml)
 - Restart Codex; the six `drift_*` tools appear in the tool list.
 
 ### Cursor
 
 - Add the `mcpServers` block to `.cursor/mcp.json` in your project.
+- Ready-made file: [`examples/harness-configs/cursor/mcp.json`](examples/harness-configs/cursor/mcp.json)
 - Enable it: **Cursor Settings → MCP → `drift` → Enable**.
 
 ### Factory Droid
 
 - Open Droid's MCP server settings (or its `mcp_servers` config) and add a local
   server pointing at `node /abs/path/to/drift/packages/drift-mcp/dist/index.js`
-  with `DRIFT_REPO` set to your repository.
+  with `DRIFT_REPO` set to your repository (step-by-step:
+  [`examples/harness-configs/factory-droid/`](examples/harness-configs/factory-droid/)).
 
 ### Gemini CLI
 
 - Add the `mcpServers` block to `.gemini/settings.json` (project) or
   `~/.gemini/settings.json` (global).
+- Ready-made file: [`examples/harness-configs/gemini-cli/settings.json`](examples/harness-configs/gemini-cli/settings.json)
 - In a session, run `/mcp list` to confirm the connection, `/mcp reload` after
   editing the file.
 
@@ -148,14 +153,14 @@ repository Drift should operate on, and the agent gets the six `drift_*` tools.
     -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
   ```
 
-- Or `.github/mcp.json` with `{ "mcpServers": { "drift": { "type": "local",
-  "command": "node", "args": ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
-  "env": { "DRIFT_REPO": "/abs/path/to/your/repo" } } } }`.
+- Or use the ready-made [`examples/harness-configs/github-copilot-cli/mcp.json`](examples/harness-configs/github-copilot-cli/mcp.json)
+  (`.github/mcp.json`).
 
 ### Kimi Code
 
 - Open Kimi Code's MCP settings and add a local server with the `mcpServers`
-  block from the top of this section.
+  block from the top of this section (step-by-step:
+  [`examples/harness-configs/kimi-code/`](examples/harness-configs/kimi-code/)).
 
 ### OpenCode
 
@@ -176,6 +181,7 @@ repository Drift should operate on, and the agent gets the six `drift_*` tools.
   }
   ```
 
+- Ready-made file: [`examples/harness-configs/opencode/opencode.json`](examples/harness-configs/opencode/opencode.json)
 - Verify with `opencode mcp list`.
 
 ### Pi
@@ -188,6 +194,7 @@ repository Drift should operate on, and the agent gets the six `drift_*` tools.
   /mcp setup
   ```
 
+- Ready-made file: [`examples/harness-configs/pi/mcp.json`](examples/harness-configs/pi/mcp.json)
 - Or drop the `mcpServers` block into `.mcp.json` / `~/.pi/agent/mcp.json`.
 
 ### VS Code

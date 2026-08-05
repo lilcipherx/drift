@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "drift": {
+      "type": "local",
+      "command": "node",
+      "args": ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
+      "env": {
+        "DRIFT_REPO": "/abs/path/to/your/repo"
+      }
+    }
+  }
+}

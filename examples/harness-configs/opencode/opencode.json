@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "drift": {
+      "type": "local",
+      "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
+      "environment": {
+        "DRIFT_REPO": "/abs/path/to/your/repo"
+      },
+      "enabled": true
+    }
+  }
+}

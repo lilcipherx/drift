@@ -16,6 +16,12 @@ All notable changes are tracked here (git-cliff style, kept manually).
   Kimi Code, OpenCode, Pi — each with its own installation subsection
   (per-harness MCP config shapes: TOML for Codex CLI, `environment` for
   OpenCode, `copilot mcp add` for Copilot CLI, `pi-mcp-adapter` for Pi, …).
+- Added `examples/harness-configs/` — ready-made config files for all 11
+  harnesses (`.mcp.json` for Claude Code, `.cursor/mcp.json`, Codex CLI
+  `config.toml`, Gemini CLI `settings.json`, Copilot `.github/mcp.json`,
+  OpenCode `opencode.json`, Pi `mcp.json`, plus step-by-step READMEs for the
+  settings-panel harnesses Antigravity / Codex App / Factory Droid / Kimi Code),
+  linked from each README installation section.
 
 ## [0.2.1] — 2026-08-05
 

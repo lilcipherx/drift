@@ -1,0 +1,7 @@
+# ~/.codex/config.toml — add the [mcp_servers.drift] block.
+# Restart Codex after editing; the six drift_* tools will appear.
+
+[mcp_servers.drift]
+command = "node"
+args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
+env = { DRIFT_REPO = "/abs/path/to/your/repo" }
