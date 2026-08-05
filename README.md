@@ -59,36 +59,25 @@ separately for each one. All harnesses expose the same six tools:
 
 Every command below is backed by a real manifest in this repository
 (`.claude-plugin/plugin.json`, `.plugin/plugin.json`, `gemini-extension.json`,
-`plugin.json`, `.factory-plugin/`, `package.json` → `pi`) and the
-[drift-marketplace](https://github.com/lilcipherx/drift-marketplace) repo.
+`plugin.json`, `.factory-plugin/`, `package.json` → `pi`) or a ready-made
+config in `examples/harness-configs/` — installation needs nothing outside
+this repository.
 
 ### Claude Code
 
-Drift is available via the [official Claude plugin marketplace](https://claude.com/plugins).
+Add the Drift MCP server (project scope):
 
-#### Official Marketplace
-
-Install the plugin from Anthropic's official marketplace:
-
-```text
-/plugin install drift@claude-plugins-official
+```bash
+claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
 ```
 
-#### Drift Marketplace
+Or copy the ready-made config:
 
-The Drift marketplace provides Drift and related plugins for Claude Code.
+```bash
+cp examples/harness-configs/claude-code/.mcp.json .mcp.json
+```
 
-- Register the marketplace:
-
-  ```text
-  /plugin marketplace add lilcipherx/drift-marketplace
-  ```
-
-- Install the plugin from this marketplace:
-
-  ```text
-  /plugin install drift@drift-marketplace
-  ```
+Verify with `claude mcp list` — you should see `drift` with its six tools.
 
 ### Antigravity
 
@@ -103,39 +92,35 @@ first message. Reinstall with the same command to update.
 
 ### Codex App
 
-Drift is available via the [official Codex plugin marketplace](https://github.com/openai/plugins).
+In the Codex app, open **Settings → MCP servers** and add:
 
-- In the Codex app, click on **Plugins** in the sidebar.
-- You should see `drift` in the Coding section.
-- Click the `+` next to Drift and follow the prompts.
+- **Name**: `drift`
+- **Command**: `node`
+- **Args**: `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
+- **Env**: `DRIFT_REPO=/abs/path/to/your/repo`
 
 ### Codex CLI
 
-Drift is available via the [official Codex plugin marketplace](https://github.com/openai/plugins).
+Add the Drift MCP server to `~/.codex/config.toml`:
 
-- Open the plugin search interface:
+```toml
+[mcp_servers.drift]
+command = "node"
+args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
+env = { DRIFT_REPO = "/abs/path/to/your/repo" }
+```
 
-  ```text
-  /plugins
-  ```
-
-- Search for Drift:
-
-  ```text
-  drift
-  ```
-
-- Select `Install Plugin`.
+Restart Codex, then ask for `drift_blame` / `drift_context` in any session.
 
 ### Cursor
 
-- In Cursor Agent chat, install from marketplace:
+Copy the ready-made config and enable MCP servers in Cursor settings:
 
-  ```text
-  /add-plugin drift
-  ```
+```bash
+cp examples/harness-configs/cursor/mcp.json .cursor/mcp.json
+```
 
-- Or search for "drift" in the plugin marketplace.
+Then ask for `drift_blame` in chat.
 
 ### Factory Droid
 
@@ -167,17 +152,13 @@ Drift is available via the [official Codex plugin marketplace](https://github.co
 
 ### GitHub Copilot CLI
 
-- Register the marketplace:
+Add the Drift MCP server:
 
-  ```bash
-  copilot plugin marketplace add lilcipherx/drift-marketplace
-  ```
+```bash
+copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+```
 
-- Install the plugin:
-
-  ```bash
-  copilot plugin install drift@drift-marketplace
-  ```
+Or copy the ready-made config to `.github/mcp.json` and restart Copilot.
 
 ### Kimi Code
 

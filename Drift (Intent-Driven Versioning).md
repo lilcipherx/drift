@@ -82,12 +82,12 @@ After installing the Drift MCP server, an agent gains five tools:
 | Channel | Package | Versioning | Notes |
 | :--- | :--- | :--- | :--- |
 | npm | `@drift/cli` | SemVer | Downloads precompiled Rust binary on `postinstall` |
-| Homebrew | `drift` | SemVer | Tap: `drift-dev/tap` |
+| Homebrew | `drift` | SemVer | Formula shipped with the project |
 | cargo | `drift-cli` | SemVer | Source build |
 | npm | `@drift/mcp` | SemVer | MCP server |
 | npm | `@drift/sdk` | SemVer | TS SDK |
 | GitHub Marketplace | Drift App | n/a | GitHub App |
-| GitHub Action | `drift-dev/drift-action` | Tagged | `action.yml` |
+| GitHub Action | `action.yml` (composite) | Tagged | `action.yml` |
 
 ---
 
@@ -865,7 +865,7 @@ Eval results are stored as a baseline; CI fails if any metric regresses >5%.
 ### 25.1 Install
 ```bash
 npm i -g @drift/cli     # or
-brew install drift-dev/tap/drift     # or
+brew install drift                 # or
 curl -fsSL https://drift.dev/install.sh | sh
 ```
 
@@ -874,8 +874,8 @@ curl -fsSL https://drift.dev/install.sh | sh
 # 1. Install
 npm i -g @drift/cli
 
-# 2. Clone the demo repo (pre-seeded with intents)
-git clone https://github.com/drift-dev/drift-demo && cd drift-demo
+# 2. Seed the demo repo (real Drift history, generated locally)
+bash scripts/seed-demo.sh && cd examples/demo-repo
 
 # 3. See intent history
 drift log

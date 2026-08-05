@@ -5,9 +5,9 @@ All notable changes are tracked here (git-cliff style, kept manually).
 ## [Unreleased]
 
 ### Changed
-- README rewritten in the Superpowers style: Quickstart, How it works,
-  per-harness Installation, The Basic Workflow, What's Inside, Philosophy,
-  Security, Contributing, Updating, Community.
+- README rewritten: Quickstart, How it works, per-harness Installation, The
+  Basic Workflow, What's Inside, Philosophy, Security, Contributing, Updating,
+  Community.
 - README Quickstart now lists agent harnesses as anchor links (Claude Code,
   Cursor, Codex, Cline, Windsurf, VS Code / Copilot), each jumping to its own
   installation subsection with concrete MCP setup steps.
@@ -22,16 +22,13 @@ All notable changes are tracked here (git-cliff style, kept manually).
   OpenCode `opencode.json`, Pi `mcp.json`, plus step-by-step READMEs for the
   settings-panel harnesses Antigravity / Codex App / Factory Droid / Kimi Code),
   linked from each README installation section.
-- README installation sections reworked Superpowers-style: every harness now
-  starts with a short one-command install (`claude mcp add`, `copilot mcp add`,
+- README installation sections reworked: every harness now starts with a short
+  one-command install (`claude mcp add`, `copilot mcp add`,
   `pi install npm:pi-mcp-adapter`, config copies, settings panels), then a
   verify step and a link to the ready-made config file.
-- Installation commands now shown as plugin-style installs with Drift
-  identifiers, mirroring Superpowers: `/plugin install drift@drift-marketplace`,
-  `/plugin marketplace add lilcipherx/drift-marketplace`,
+- Installation commands shown as plugin-style installs with Drift identifiers:
   `agy plugin install https://github.com/lilcipherx/drift`,
   `droid plugin install drift@drift`, `gemini extensions install`,
-  `copilot plugin install drift@drift-marketplace`,
   `/plugins install https://github.com/lilcipherx/drift`,
   `pi install git:github.com/lilcipherx/drift`.
 - Added `.opencode/INSTALL.md` (fetched by OpenCode's install instruction) and
@@ -42,11 +39,8 @@ All notable changes are tracked here (git-cliff style, kept manually).
   CLI), `plugin.json` + `mcp_config.json` (Antigravity), `.factory-plugin/`
   plugin + marketplace (Factory Droid), `mcp.json` (Droid MCP servers), and a
   `pi` key in the root `package.json` (Pi).
-- Published the [drift-marketplace](https://github.com/lilcipherx/drift-marketplace)
-  repo with `.claude-plugin/marketplace.json` (Claude Code) and
-  `.github/plugin/marketplace.json` (GitHub Copilot CLI) —
-  `/plugin marketplace add lilcipherx/drift-marketplace` and
-  `copilot plugin marketplace add lilcipherx/drift-marketplace` now resolve.
+- Removed all references to external repositories from the README, PRD and
+  changelog — installation is fully self-contained to this repository.
 
 ## [0.2.1] — 2026-08-05
 
