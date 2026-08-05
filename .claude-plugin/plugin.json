@@ -13,7 +13,10 @@
   "mcpServers": {
     "drift": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/packages/drift-mcp/dist/index.js"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/packages/drift-mcp/dist/index.js"],
+      "env": {
+        "DRIFT_REPO": "${DRIFT_REPO}"
+      }
     }
   }
 }

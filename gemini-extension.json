@@ -5,7 +5,10 @@
   "mcpServers": {
     "drift": {
       "command": "node",
-      "args": ["${extensionPath}/packages/drift-mcp/dist/index.js"]
+      "args": ["${extensionPath}/packages/drift-mcp/dist/index.js"],
+      "env": {
+        "DRIFT_REPO": "${DRIFT_REPO}"
+      }
     }
   },
   "settings": [

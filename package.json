@@ -13,8 +13,8 @@
   "pi": {
     "description": "Drift — Intent-Driven Versioning. Semantic commits, blame by intent, MCP tools for agents.",
     "keywords": ["pi-package", "pi", "versioning", "intents", "mcp"],
-    "skills": [],
-    "prompts": [],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
     "extensions": []
   },
   "scripts": {

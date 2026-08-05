@@ -9,7 +9,10 @@
       "name": "drift",
       "description": "Intent-Driven Versioning for Factory Droid — semantic commits, blame by intent.",
       "version": "0.2.1",
-      "source": "https://github.com/lilcipherx/drift"
+      "source": {
+        "source": "github",
+        "repo": "lilcipherx/drift"
+      }
     }
   ]
 }

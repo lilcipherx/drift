@@ -58,10 +58,12 @@ separately for each one. All harnesses expose the same six tools:
 `drift_log`.
 
 Every command below is backed by a real manifest in this repository
-(`.claude-plugin/plugin.json`, `.plugin/plugin.json`, `gemini-extension.json`,
-`plugin.json`, `.factory-plugin/`, `package.json` → `pi`) or a ready-made
-config in `examples/harness-configs/` — installation needs nothing outside
-this repository.
+(`.claude-plugin/plugin.json`, `.plugin/plugin.json`,
+`.cursor-plugin/plugin.json`, `.codex-plugin/plugin.json`,
+`gemini-extension.json`, `plugin.json`, `.factory-plugin/`,
+`package.json` → `pi`) or a ready-made config in
+`examples/harness-configs/` — installation needs nothing outside this
+repository.
 
 ### Claude Code
 

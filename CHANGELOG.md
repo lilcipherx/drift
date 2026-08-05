@@ -41,6 +41,12 @@ All notable changes are tracked here (git-cliff style, kept manually).
   `pi` key in the root `package.json` (Pi).
 - Removed all references to external repositories from the README, PRD and
   changelog — installation is fully self-contained to this repository.
+- Added `.cursor-plugin/plugin.json` and `.codex-plugin/plugin.json` manifests;
+  all plugin manifests now pass `DRIFT_REPO` to the MCP server (which falls
+  back to the server's working directory when unset); marketplace `source`
+  entries use the GitHub-repo object form (`{"source":"github","repo":…}`)
+  instead of bare URL strings; the `pi` package now ships a real prompt
+  template (`prompts/drift.md`) and a `drift-intent` skill (`skills/drift/`).
 
 ## [0.2.1] — 2026-08-05
 
