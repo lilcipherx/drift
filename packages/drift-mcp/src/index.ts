@@ -19,6 +19,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -30,18 +31,28 @@ const SERVER_NAME = "drift";
 
 // --- locate the CLI ---------------------------------------------------------
 const HERE = dirname(fileURLToPath(import.meta.url));
+const requireFromHere = createRequire(import.meta.url);
 const CLI_CANDIDATES = [
   join(HERE, "..", "..", "drift-cli", "dist", "cli.js"),
   join(HERE, "..", "drift-cli", "dist", "cli.js"),
 ];
 
 function findCli(): string {
+  // 1. Monorepo layout: sibling package in the same checkout.
   for (const candidate of CLI_CANDIDATES) {
     if (existsSync(candidate)) return candidate;
   }
-  // Resolve a separately-installed @drift/cli
-  const resolved = resolve(process.cwd(), "node_modules", "@drift", "cli", "dist", "cli.js");
-  if (existsSync(resolved)) return resolved;
+  // 2. Installed @drift/cli (npm / npx): resolve from this package's own
+  //    dependency tree, wherever npm hoisted it.
+  try {
+    const installed = requireFromHere.resolve("@drift/cli/dist/cli.js");
+    if (existsSync(installed)) return installed;
+  } catch {
+    // fall through
+  }
+  // 3. A separately-installed @drift/cli next to the consumer project.
+  const cwdResolved = resolve(process.cwd(), "node_modules", "@drift", "cli", "dist", "cli.js");
+  if (existsSync(cwdResolved)) return cwdResolved;
   throw new Error(
     "Drift CLI not found. Build the workspace (npm run build) or install @drift/cli.",
   );
