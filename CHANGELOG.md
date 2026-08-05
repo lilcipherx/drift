@@ -26,6 +26,16 @@ All notable changes are tracked here (git-cliff style, kept manually).
   starts with a short one-command install (`claude mcp add`, `copilot mcp add`,
   `pi install npm:pi-mcp-adapter`, config copies, settings panels), then a
   verify step and a link to the ready-made config file.
+- Installation commands now shown as plugin-style installs with Drift
+  identifiers, mirroring Superpowers: `/plugin install drift@drift-marketplace`,
+  `/plugin marketplace add lilcipherx/drift-marketplace`,
+  `agy plugin install https://github.com/lilcipherx/drift`,
+  `droid plugin install drift@drift`, `gemini extensions install`,
+  `copilot plugin install drift@drift-marketplace`,
+  `/plugins install https://github.com/lilcipherx/drift`,
+  `pi install git:github.com/lilcipherx/drift`.
+- Added `.opencode/INSTALL.md` (fetched by OpenCode's install instruction) and
+  `docs/README.opencode.md`, `docs/README.kimi.md` harness docs.
 
 ## [0.2.1] — 2026-08-05
 
