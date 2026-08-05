@@ -2,8 +2,10 @@
  * Live E2E for drift-app webhook server:
  * real `createWebhookServer` + real `GitHubAppClient` (RS256 JWT) pointed at
  * a local mock GitHub API over HTTP. Exercises real pull_request payloads:
- * opened, synchronize (idempotent update), commit pagination via Link header,
- * oversized body → 413, bad HMAC, non-PR events, health.
+ * opened, reopened, synchronize (idempotent update), commit pagination via
+ * Link header, missing installation.id, missing intent object (subject
+ * fallback), no Drift-Intent trailers, oversized body → 413, bad HMAC,
+ * non-PR events, health.
  */
 
 import { describe, test, before, after } from "node:test";
@@ -20,13 +22,22 @@ const mod = (name) => import(pathToFileURL(join(appDist, name)).href);
 const SECRET = "test-webhook-secret";
 
 // ---------------------------------------------------------------- mock GitHub
-const state = { comments: [], posted: 0, updated: 0, checkRuns: 0, log: [] };
 const ID1 = "did_11111111111111111111111111111111";
 const ID2 = "did_22222222222222222222222222222222";
+const ID3 = "did_33333333333333333333333333333333"; // object missing → subject fallback
 const HEAD1 = "a".repeat(40);
 const HEAD2 = "b".repeat(40);
+const HEAD3 = "c".repeat(40); // PR 8 head
+const HEAD4 = "d".repeat(40); // PR 9 head
 const objectPath1 = ".drift/objects/11/1111111111111111111111111111111111111111.json";
 const objectPath2 = ".drift/objects/22/2222222222222222222222222222222222222222.json";
+// NOTE: objectPath3 deliberately has NO entry in `objects` below
+const objectPath3 = ".drift/objects/33/3333333333333333333333333333333333333333.json";
+
+// per-PR comment stores (id ascending) + global counters
+const prComments = { 7: [], 8: [], 9: [] };
+let nextCommentId = 1000;
+const state = { posted: 0, updated: 0, checkRuns: 0, log: [] };
 
 const intentObj = (id, prompt, file) => ({
   id,
@@ -53,6 +64,12 @@ const commit = (n, id) => ({
 });
 const commitsPage1 = Array.from({ length: 100 }, (_, i) => commit(i, ID1));
 const commitsPage2 = Array.from({ length: 50 }, (_, i) => commit(i + 100, ID2));
+// PR 8: one commit with a trailer whose object is missing
+const commitsPr8 = [
+  { sha: "e".repeat(40), commit: { message: `fallback subject here\n\nDrift-Intent: ${ID3}` } },
+];
+// PR 9: one commit with no Drift-Intent trailer
+const commitsPr9 = [{ sha: "f".repeat(40), commit: { message: "plain chore without intents" } }];
 
 function json(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -64,11 +81,11 @@ let mockPort;
 let webhook; // { port, close }
 let hookPort;
 
-const basePayload = (action, headSha) => ({
+const basePayload = (action, headSha, prNumber = 7) => ({
   action,
   installation: { id: 42 },
   repository: { name: "demo", owner: { login: "lilcipherx" } },
-  pull_request: { number: 7, title: "feat: add login", head: { sha: headSha } },
+  pull_request: { number: prNumber, title: "feat: add login", head: { sha: headSha } },
 });
 
 function sign(raw) {
@@ -109,10 +126,18 @@ before(async () => {
           expires_at: new Date(Date.now() + 3_600_000).toISOString(),
         });
       }
+      // pull request head by number
       if (req.method === "GET" && /\/pulls\/\d+$/.test(path)) {
-        return json(res, 200, { head: { sha: HEAD1 }, title: "feat: add login" });
+        const n = Number(path.split("/").pop());
+        const sha = { 7: HEAD1, 8: HEAD3, 9: HEAD4 }[n] ?? HEAD1;
+        return json(res, 200, { head: { sha }, title: "feat: add login" });
       }
-      if (req.method === "GET" && path.includes("/pulls/7/commits")) {
+      // commits by PR: 7 → paginated (100 + 50), 8 → fallback, 9 → no trailers
+      const commitsMatch = req.method === "GET" && path.match(/\/pulls\/(\d+)\/commits$/);
+      if (commitsMatch) {
+        const n = Number(commitsMatch[1]);
+        if (n === 8) return json(res, 200, commitsPr8);
+        if (n === 9) return json(res, 200, commitsPr9);
         const page = u.searchParams.get("page") ?? "1";
         if (page === "2") return json(res, 200, commitsPage2);
         const base = `${u.protocol}//${u.host}${path}`;
@@ -122,13 +147,15 @@ before(async () => {
         });
         return res.end(JSON.stringify(commitsPage1));
       }
+      // trees: PR 8 head references the missing object path, others the two real ones
       if (req.method === "GET" && path.includes("/git/trees/")) {
-        return json(res, 200, {
-          tree: [
+        const tree =
+          path.includes(HEAD3) ? [{ path: objectPath3, type: "blob" }] :
+          [
             { path: objectPath1, type: "blob" },
             { path: objectPath2, type: "blob" },
-          ],
-        });
+          ];
+        return json(res, 200, { tree });
       }
       if (req.method === "GET" && path.includes("/contents/")) {
         const obj = objects[decodeURIComponent(path.split("/contents/")[1].split("?")[0])];
@@ -138,21 +165,31 @@ before(async () => {
           encoding: "base64",
         });
       }
-      if (req.method === "GET" && path.includes("/issues/7/comments")) {
-        return json(res, 200, state.comments.map(({ id, body }) => ({ id, body })));
-      }
-      if (req.method === "POST" && path.includes("/issues/7/comments")) {
-        const { body: text } = JSON.parse(body || "{}");
-        state.posted++;
-        state.comments.push({ id: 1000 + state.posted, body: text });
-        return json(res, 201, { id: 1000 + state.posted, body: text });
+      // issue comments per PR
+      const commentsMatch = path.match(/\/issues\/(\d+)\/comments$/);
+      if (commentsMatch) {
+        const n = Number(commentsMatch[1]);
+        if (req.method === "GET") {
+          return json(res, 200, prComments[n].map(({ id, body }) => ({ id, body })));
+        }
+        if (req.method === "POST") {
+          const { body: text } = JSON.parse(body || "{}");
+          state.posted++;
+          prComments[n].push({ id: nextCommentId, body: text });
+          return json(res, 201, { id: nextCommentId++, body: text });
+        }
       }
       if (req.method === "PATCH" && path.includes("/issues/comments/")) {
         const id = Number(path.split("/").pop());
         const { body: text } = JSON.parse(body || "{}");
         state.updated++;
-        const c = state.comments.find((x) => x.id === id);
-        if (c) c.body = text;
+        for (const list of Object.values(prComments)) {
+          const c = list.find((x) => x.id === id);
+          if (c) {
+            c.body = text;
+            break;
+          }
+        }
         return json(res, 200, { id, body: text });
       }
       if (req.method === "POST" && path.includes("/check-runs")) {
@@ -190,8 +227,8 @@ test("opened: posts summary comment, pagination finds page-2 trailer", async () 
   assert.equal(r.data.action, "commented");
   assert.equal(r.data.intentsFound, 2, "page-2 trailer must be found via pagination");
   assert.equal(state.posted, 1);
-  assert.ok(state.comments.some((c) => c.body.includes(SUMMARY_MARKER)));
-  assert.ok(state.comments.some((c) => c.body.includes("Drift intent summary")));
+  assert.ok(prComments[7].some((c) => c.body.includes(SUMMARY_MARKER)));
+  assert.ok(prComments[7].some((c) => c.body.includes("Drift intent summary")));
   assert.equal(state.checkRuns, 1);
   assert.ok(state.log.some((l) => l.includes("page=2")), state.log.join(" | "));
   assert.ok(state.log.some((l) => l.includes("access_tokens")));
@@ -204,7 +241,7 @@ test("synchronize: updates the existing comment in place (PATCH, not POST)", asy
   assert.equal(r.data.action, "updated");
   assert.equal(state.updated, 1);
   assert.equal(state.posted, 1);
-  assert.equal(state.comments.length, 1);
+  assert.equal(prComments[7].length, 1);
 });
 
 // ------------------------------------------------------------- 3) idempotent retry
@@ -213,7 +250,57 @@ test("retry: repeated delivery still keeps exactly one comment", async () => {
   assert.equal(r.data.action, "updated");
   assert.equal(state.updated, 2);
   assert.equal(state.posted, 1);
-  assert.equal(state.comments.length, 1);
+  assert.equal(prComments[7].length, 1);
+});
+
+// ------------------------------------------------------------- 3b) reopened
+test("reopened: treated like opened (updates the existing comment)", async () => {
+  const r = await sendWebhook("pull_request", basePayload("reopened", HEAD2));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.action, "updated");
+  assert.equal(state.updated, 3);
+  assert.equal(state.posted, 1);
+  assert.equal(prComments[7].length, 1);
+});
+
+// ------------------------------------------------------------- 3c) missing installation.id
+test("payload without installation.id: clean error, not retryable", async () => {
+  const payload = basePayload("opened", HEAD1);
+  delete payload.installation;
+  const postedBefore = state.posted;
+  const checkRunsBefore = state.checkRuns;
+  const r = await sendWebhook("pull_request", payload);
+  assert.equal(r.status, 200);
+  assert.equal(r.data.action, "error");
+  assert.equal(r.data.error, "no installation id in payload");
+  assert.equal(r.data.retryable, false);
+  // nothing was written for this request
+  assert.equal(state.posted, postedBefore);
+  assert.equal(state.checkRuns, checkRunsBefore);
+});
+
+// ------------------------------------------------------------- 3d) object missing → subject fallback
+test("intent object missing: falls back to the commit subject as prompt", async () => {
+  const r = await sendWebhook("pull_request", basePayload("opened", HEAD3, 8));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.action, "commented");
+  assert.equal(r.data.intentsFound, 1);
+  assert.equal(prComments[8].length, 1);
+  assert.ok(prComments[8][0].body.includes("fallback subject here"), prComments[8][0].body);
+  assert.equal(state.posted, 2);
+});
+
+// ------------------------------------------------------------- 3e) no Drift-Intent trailers
+test("PR without Drift-Intent trailers: no-intents, nothing written", async () => {
+  const postedBefore = state.posted;
+  const checkRunsBefore = state.checkRuns;
+  const r = await sendWebhook("pull_request", basePayload("opened", HEAD4, 9));
+  assert.equal(r.status, 200);
+  assert.equal(r.data.action, "no-intents");
+  assert.equal(r.data.intentsFound, 0);
+  assert.equal(prComments[9].length, 0);
+  assert.equal(state.posted, postedBefore, "no comment must be posted");
+  assert.equal(state.checkRuns, checkRunsBefore, "no check run must be created");
 });
 
 // ------------------------------------------------------------- 4) bad signature
