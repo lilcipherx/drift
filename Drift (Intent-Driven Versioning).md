@@ -755,7 +755,7 @@ enabled = false                           # opt-in only
 - Signed releases (cosign) in CI.
 
 ### 18.4 SECURITY.md content
-- Reporting: `security@drift.dev` + GitHub private vulnerability reporting.
+- Reporting: GitHub private vulnerability reporting only (no public contact email).
 - Scope, SLA (ack 48h, fix 14d), and safe-harbor statement.
 
 ---

@@ -2,8 +2,9 @@
 
 ## Reporting a Vulnerability
 
-Please report security issues to **security@drift.dev** or use the GitHub
-private vulnerability reporting feature on this repository.
+Please report security issues using the GitHub private vulnerability
+reporting feature on this repository:
+https://github.com/lilcipherx/drift/security/advisories/new
 
 **Do not open a public issue for security problems.**
 

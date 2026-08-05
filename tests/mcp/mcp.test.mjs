@@ -23,7 +23,7 @@ function setupRepo() {
   const repo = mkdtempSync(join(tmpdir(), "drift-mcp-"));
   git(repo, ["init", "-b", "main"]);
   git(repo, ["config", "user.name", "MCP Test"]);
-  git(repo, ["config", "user.email", "mcp@drift.dev"]);
+  git(repo, ["config", "user.email", "mcp@example.com"]);
   mkdirSync(join(repo, "src"));
   writeFileSync(join(repo, "src", "util.ts"), "export const n = 1;\n");
   git(repo, ["add", "-A"]);

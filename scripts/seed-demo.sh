@@ -23,7 +23,7 @@ mkdir -p "$DEMO/src"
 cd "$DEMO"
 git init -q -b main
 git config user.name "Drift Demo"
-git config user.email "demo@drift.dev"
+git config user.email "demo@example.com"
 
 cat > src/auth.ts <<'EOF'
 export function verifyToken(token: string): boolean {

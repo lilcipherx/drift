@@ -32,7 +32,7 @@ function makeRepo() {
   const repo = mkdtempSync(join(tmpdir(), "drift-e2e-"));
   git(repo, ["init", "-b", "main"]);
   git(repo, ["config", "user.name", "Test Dev"]);
-  git(repo, ["config", "user.email", "test@drift.dev"]);
+  git(repo, ["config", "user.email", "test@example.com"]);
   mkdirSync(join(repo, "src"));
   writeFileSync(
     join(repo, "src", "auth.ts"),
