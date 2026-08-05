@@ -4,6 +4,11 @@ All notable changes are tracked here (git-cliff style, kept manually).
 
 ## [Unreleased]
 
+### Changed
+- README rewritten in the Superpowers style: Quickstart, How it works,
+  per-harness Installation, The Basic Workflow, What's Inside, Philosophy,
+  Security, Contributing, Updating, Community.
+
 ## [0.2.1] — 2026-08-05
 
 ### Changed
