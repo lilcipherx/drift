@@ -17,7 +17,9 @@ https://github.com/lilcipherx/drift/security/advisories/new
 ## Scope
 
 - The `drift` CLI and MCP server
-- Intent signature & verification (`drift-crypto`)
+- The GitHub App webhook server (`packages/drift-app`) — HMAC signature
+  verification, request-size limits, idempotent comment updates
+- Intent signature & verification (`drift-core` crypto module)
 - Secret redaction logic
 - SQLite DAG integrity
 

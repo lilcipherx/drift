@@ -9,7 +9,7 @@
 ## How to verify
 
 - [ ] `npm run build`
-- [ ] `npm test` (all 40 tests green)
+- [ ] `npm test` (all 83 tests green)
 - [ ] Manual: `cd examples/demo-repo && node ../../packages/drift-cli/dist/cli.js doctor`
 
 ## Notes

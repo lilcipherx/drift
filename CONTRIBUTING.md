@@ -22,6 +22,7 @@ packages/drift-core    Intent store (SQLite), git wrapper, crypto, redaction, pi
 packages/drift-cli     The `drift` command-line interface
 packages/drift-sdk     Programmatic SDK + Zod intent schema
 packages/drift-mcp     MCP server exposing drift tools to AI agents
+packages/drift-app     GitHub App webhook server (pull_request handler)
 packages/drift-action  GitHub Action (composite)
 ```
 
