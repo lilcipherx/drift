@@ -81,6 +81,43 @@ All notable changes are tracked here (git-cliff style, kept manually).
   drops the now-unused `version` input; it will switch to npm-mode
   automatically once the publish chain lands.
 
+### Fixed
+- **CLI fuzz hardening** (real file-based fuzz over prompts/paths with spaces,
+  quotes, `$()`, backticks, tabs, newlines, unicode incl. non-BMP, long
+  paths, and garbage `--line`/`--limit` values): `drift <unknown> --json`
+  now emits a machine-readable `{"status":"error",…}` on stdout instead of
+  leaking the plain-text usage banner. All JSON output parses; no stack
+  traces or unhandled exceptions on any input.
+- **Path containment extended to symlinks/junctions**: `drift blame`/`drift
+  context` already rejected `../` and absolute/cross-drive escapes (v0.2.3);
+  a live junction test proved the realpath guard also blocks a link *inside*
+  the repo pointing outside — before any filesystem read. Positive cases
+  (real path, in-repo link) keep working; regression test skips only where
+  symlinks cannot be created (Windows without privileges).
+- **`drift-app dev --dry-run` actually dry**: the handler unconditionally
+  posted the comment and created a check run even in dry-run mode. Added
+  `readOnly` to `WebhookDeps` — the summary is built and returned as
+  `action: "dry-run"` with zero writes (verified against a local mock: only
+  GET requests, no POST).
+- `drift-app dev`/`start` honor **`GITHUB_API_BASE_URL`** (the client already
+  supported `baseUrl`) so the dev command can point at a local mock instead
+  of always hitting `api.github.com`.
+
+### Added
+- **Live webhook-server E2E suite** (`tests/app/live-server.test.mjs`): real
+  `createWebhookServer` + real `GitHubAppClient` (RS256 JWT) against a local
+  mock GitHub API. Covers `opened` (posts summary comment), `reopened`,
+  commit pagination via `Link` header (150 commits, trailer only on page 2),
+  `synchronize` idempotent PATCH, repeated-delivery idempotency, payload
+  without `installation.id` (clean error, not retryable), intent object
+  missing → commit-subject fallback, PR with no `Drift-Intent` trailers
+  (`no-intents`, nothing written), bad HMAC (acked, not retryable), 9 MB body
+  → 413, `/health`.
+- README badge + PR template test counts refreshed (69 → 83 → current);
+  CONTRIBUTING/SECURITY/PR-template refresh: layout lists `drift-app`,
+  security scope includes the webhook server, `drift-crypto` misnomer fixed
+  (crypto lives in `drift-core`).
+
 ## [0.2.3] — 2026-08-05
 
 ### Fixed (wave-2 audit)
