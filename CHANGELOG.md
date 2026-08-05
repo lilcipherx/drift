@@ -2,9 +2,16 @@
 
 All notable changes are tracked here (git-cliff style, kept manually for v0.1.0).
 
-## [Unreleased] — v0.2.0 (encryption at rest)
+## [Unreleased] — v0.2.0 (encryption at rest + GitHub App)
 
 ### Added
+- **`@drift/app` GitHub App** (PRD §16): `pull_request` webhook handler that
+  reads `Drift-Intent` trailers from PR commits, hydrates intent objects from
+  `.drift/objects/` at the PR head, and posts a semantic intent summary comment
+  plus a check run. HMAC webhook signature verification, GitHub App JWT →
+  installation token auth, optional `DRIFT_MASTER_KEY` decryption of encrypted
+  prompts, `drift-app start` / `drift-app dev <payload> [--dry-run]`, mock
+  payload fixture, smee.io webhook proxy script.
 - **AES-256-GCM encryption at rest** (PRD §7.4, §17.1–17.2): when
   `[encryption] enabled = true` in `.drift/config.toml`, the intent's `prompt`
   and `agentState` are encrypted before storage (marker `encv1:`). Key comes

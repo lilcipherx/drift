@@ -1,0 +1,19 @@
+{
+  "name": "@drift/app",
+  "version": "0.1.0",
+  "description": "Drift GitHub App: pull_request webhook handler that reads Drift-Intent trailers and posts semantic intent summaries (PRD §16).",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "drift-app": "dist/index.js"
+  },
+  "files": ["dist", "app.yml"],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@drift/core": "0.1.0"
+  }
+}

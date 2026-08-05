@@ -1,0 +1,12 @@
+# GitHub App manifest (PRD §16.1)
+name: Drift
+description: Semantic intent provenance for AI-generated code — post intent summaries on pull requests
+url: https://drift.dev
+hook_attributes:
+  url: https://app.drift.dev/webhook
+events:
+  - pull_request
+permissions:
+  contents: read
+  pull_requests: write
+  checks: write

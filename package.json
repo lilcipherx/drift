@@ -13,10 +13,11 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty false",
-    "test": "npm run build && node --test \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\" \"tests/mcp/*.test.mjs\"",
+    "test": "npm run build && node --test \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\" \"tests/mcp/*.test.mjs\" \"tests/app/*.test.mjs\"",
     "test:unit": "node --test \"tests/unit/*.test.mjs\"",
     "test:integration": "node --test \"tests/integration/*.test.mjs\"",
-    "test:mcp": "node --test \"tests/mcp/*.test.mjs\""
+    "test:mcp": "node --test \"tests/mcp/*.test.mjs\"",
+    "test:app": "node --test \"tests/app/*.test.mjs\""
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

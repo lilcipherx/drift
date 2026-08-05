@@ -90,6 +90,8 @@ packages/drift-cli     The drift CLI (bin: drift)
 packages/drift-sdk     Typed SDK + Zod intent schemas
 packages/drift-mcp     MCP server — delegates to the CLI (never touches git directly)
 packages/drift-action  GitHub Action (composite, action.yml at repo root)
+packages/drift-app     GitHub App — pull_request webhook that reads Drift-Intent
+                       trailers and posts semantic intent summaries (PRD §16)
 ```
 
 Storage is 100% dependency-free: **SQLite via Node's built-in `node:sqlite`**
@@ -131,7 +133,7 @@ npm test    # 40 tests: unit (redact/crypto/ast/config), integration (temp git r
 ## Roadmap (per PRD)
 
 - **v0.1.0 ✅** init · realize · log · blame · context · verify · replay · doctor · export · MCP · SDK · Action
-- **v0.2.0** encryption at rest (AES-256-GCM), more parsers (JS, Go, Rust), GitHub App PR annotations, eval harness in CI
+- **v0.2.0** encryption at rest (AES-256-GCM ✅), GitHub App PR intent summaries ✅, more parsers (JS, Go, Rust), eval harness in CI
 - **v0.3.0** semantic merge (`drift merge`), VS Code blame viewer
 
 ## License

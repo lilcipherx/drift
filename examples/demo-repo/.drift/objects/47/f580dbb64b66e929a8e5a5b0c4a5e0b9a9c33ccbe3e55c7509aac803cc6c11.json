@@ -1,5 +1,5 @@
 {
-  "id": "did_c669d892e559c5e0946152cf5085587e",
+  "id": "did_6de005814ec6998dac7001d058008906",
   "parentId": null,
   "author": {
     "type": "AGENT",
@@ -19,7 +19,7 @@
     }
   ],
   "verifyCmd": "npm test",
-  "timestamp": 1785919847123,
+  "timestamp": 1785921918547,
   "gitCommitSha": "",
-  "signature": "i2mSwqxYflZRgx3ufoubQnOePmdPdfqYr8NzLaGmt8swH/UOOJw+MZo+0mYniC3eo/H5Ipf/OkGJwRzOZCjTCg=="
+  "signature": "plWYlsNSBsKsYFsuOklsWPk0iJXvUVcW55UuR20ADWy/Mn0XUSegzrvBgBgo3/KWaSDL0BJrCh8qIdDcwqcXAg=="
 }

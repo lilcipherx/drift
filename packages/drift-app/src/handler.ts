@@ -1,0 +1,118 @@
+/**
+ * pull_request webhook handler (PRD §16.2).
+ *
+ * On `opened`/`synchronize`/`reopened`:
+ *   1. read `Drift-Intent` trailers from the PR commits;
+ *   2. hydrate intent objects from `.drift/objects/` at the PR head;
+ *   3. post a semantic summary comment and a check run.
+ */
+
+import { createHmac, timingSafeEqual } from "node:crypto";
+import type { GitHubClientLike } from "./github.js";
+import { extractIntentIds, fetchIntents } from "./intents.js";
+import { summarizeIntents } from "./summarize.js";
+
+export interface WebhookDeps {
+  github: GitHubClientLike;
+  /** HMAC webhook secret (X-Hub-Signature-256). Undefined ⇒ skip verification. */
+  webhookSecret?: string;
+  /** Optional DRIFT_MASTER_KEY to decrypt encrypted prompts. */
+  masterKey?: string;
+  /** Disable check-run creation (comment-only mode). */
+  checkRun?: boolean;
+}
+
+export interface WebhookResult {
+  handled: boolean;
+  action: "commented" | "no-intents" | "skipped" | "error";
+  commentBody?: string;
+  intentsFound: number;
+  error?: string;
+  /** False for client-side errors (GitHub must not retry). */
+  retryable?: boolean;
+}
+
+export interface WebhookEvent {
+  event: string; // X-GitHub-Event
+  signature?: string; // X-Hub-Signature-256
+  payload: Record<string, unknown>;
+  rawBody: string;
+}
+
+export function verifyWebhookSignature(rawBody: string, signature: string | undefined, secret: string): boolean {
+  if (!signature) return false;
+  const expected = `sha256=${createHmac("sha256", secret).update(rawBody, "utf8").digest("hex")}`;
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(signature, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+const PR_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
+
+export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Promise<WebhookResult> {
+  const { github } = deps;
+
+  if (deps.webhookSecret && !verifyWebhookSignature(event.rawBody, event.signature, deps.webhookSecret)) {
+    return { handled: true, action: "error", intentsFound: 0, error: "invalid webhook signature", retryable: false };
+  }
+
+  if (event.event !== "pull_request") {
+    return { handled: true, action: "skipped", intentsFound: 0 };
+  }
+
+  const payload = event.payload;
+  const action = payload.action as string | undefined;
+  if (!action || !PR_ACTIONS.has(action)) {
+    return { handled: true, action: "skipped", intentsFound: 0 };
+  }
+
+  const pr = payload.pull_request as { number?: number; head?: { sha?: string }; title?: string } | undefined;
+  const repo = payload.repository as { name?: string; owner?: { login?: string } } | undefined;
+  const installation = payload.installation as { id?: number } | undefined;
+  const owner = repo?.owner?.login;
+  const repoName = repo?.name;
+  const prNumber = pr?.number;
+  const headSha = pr?.head?.sha;
+
+  if (!owner || !repoName || !prNumber || !headSha) {
+    return { handled: true, action: "error", intentsFound: 0, error: "malformed pull_request payload", retryable: false };
+  }
+  if (!installation?.id) {
+    return { handled: true, action: "error", intentsFound: 0, error: "no installation id in payload", retryable: false };
+  }
+
+  try {
+    github.setInstallation(installation.id);
+    const commits = await github.getPullCommits(owner, repoName, prNumber);
+    const ids = extractIntentIds(commits);
+    if (ids.length === 0) {
+      return { handled: true, action: "no-intents", intentsFound: 0 };
+    }
+
+    const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids, deps.masterKey);
+
+    const commentBody = summarizeIntents({
+      owner,
+      repo: repoName,
+      prNumber,
+      prTitle: pr?.title ?? "",
+      intents,
+    });
+    await github.postComment(owner, repoName, prNumber, commentBody);
+
+    if (deps.checkRun !== false) {
+      await github.createCheckRun(owner, repoName, {
+        name: "Drift intent check",
+        headSha,
+        conclusion: "success",
+        title: `${intents.length} intent${intents.length === 1 ? "" : "s"} summarized`,
+        summary: commentBody,
+      });
+    }
+
+    return { handled: true, action: "commented", commentBody, intentsFound: intents.length };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    return { handled: true, action: "error", intentsFound: 0, error, retryable: true };
+  }
+}

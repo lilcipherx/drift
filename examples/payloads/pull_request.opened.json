@@ -1,0 +1,30 @@
+{
+  "action": "opened",
+  "installation": {
+    "id": 12345678
+  },
+  "repository": {
+    "id": 987654321,
+    "name": "drift-demo",
+    "full_name": "lilcipherx/drift-demo",
+    "owner": { "login": "lilcipherx" },
+    "default_branch": "main"
+  },
+  "pull_request": {
+    "id": 55555555,
+    "number": 7,
+    "title": "Fix race condition in token refresh",
+    "state": "open",
+    "user": { "login": "some-agent" },
+    "head": {
+      "sha": "526aae2a76163a2e98feb36f6443f322be9a0b88",
+      "ref": "fix-token-refresh",
+      "repo": { "name": "drift-demo", "owner": { "login": "lilcipherx" } }
+    },
+    "base": {
+      "sha": "be59108b9eb35bb9aa6b972b6366beda724c388b",
+      "ref": "main",
+      "repo": { "name": "drift-demo", "owner": { "login": "lilcipherx" } }
+    }
+  }
+}

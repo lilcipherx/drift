@@ -20,5 +20,9 @@ patterns = [
   "eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
 ]
 
+[encryption]
+enabled = false
+key_provider = "env:DRIFT_MASTER_KEY"
+
 [telemetry]
 enabled = false

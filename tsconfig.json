@@ -5,6 +5,7 @@
     { "path": "./packages/drift-core" },
     { "path": "./packages/drift-cli" },
     { "path": "./packages/drift-sdk" },
-    { "path": "./packages/drift-mcp" }
+    { "path": "./packages/drift-mcp" },
+    { "path": "./packages/drift-app" }
   ]
 }
