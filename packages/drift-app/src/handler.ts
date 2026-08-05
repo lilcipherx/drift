@@ -25,11 +25,13 @@ export interface WebhookDeps {
   masterKey?: string;
   /** Disable check-run creation (comment-only mode). */
   checkRun?: boolean;
+  /** Build the summary without writing anything (dev --dry-run). */
+  readOnly?: boolean;
 }
 
 export interface WebhookResult {
   handled: boolean;
-  action: "commented" | "updated" | "no-intents" | "skipped" | "error";
+  action: "commented" | "updated" | "no-intents" | "skipped" | "error" | "dry-run";
   commentBody?: string;
   intentsFound: number;
   error?: string;
@@ -108,6 +110,10 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     // otherwise post a new one.
     const comments = await github.listIssueComments(owner, repoName, prNumber);
     const existing = comments.find((c) => c.body.includes(SUMMARY_MARKER));
+    // dev --dry-run: build the summary but write nothing (no comment, no check run).
+    if (deps.readOnly) {
+      return { handled: true, action: "dry-run", commentBody, intentsFound: intents.length };
+    }
     let action: "commented" | "updated";
     if (existing) {
       await github.updateComment(owner, repoName, existing.id, commentBody);

@@ -68,6 +68,10 @@ export async function handleWebhook(event, deps) {
         // otherwise post a new one.
         const comments = await github.listIssueComments(owner, repoName, prNumber);
         const existing = comments.find((c) => c.body.includes(SUMMARY_MARKER));
+        // dev --dry-run: build the summary but write nothing (no comment, no check run).
+        if (deps.readOnly) {
+            return { handled: true, action: "dry-run", commentBody, intentsFound: intents.length };
+        }
         let action;
         if (existing) {
             await github.updateComment(owner, repoName, existing.id, commentBody);

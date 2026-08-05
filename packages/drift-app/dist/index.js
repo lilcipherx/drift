@@ -18,8 +18,9 @@ Usage:
   drift-app start                Run the webhook server on PORT (default 3000)
                                  Env: GITHUB_APP_ID, GITHUB_PRIVATE_KEY (path or PEM),
                                       GITHUB_WEBHOOK_SECRET, DRIFT_MASTER_KEY (optional),
+                                      GITHUB_API_BASE_URL (optional, e.g. local mock),
                                       PORT
-  drift-app dev <payload.json>   Process one webhook payload against the live GitHub API
+  drift-app dev <payload.json>   Process one webhook payload against the GitHub API
                                  (--dry-run: build the summary without posting)
 `;
 function loadPrivateKey() {
@@ -40,6 +41,7 @@ async function runDev(payloadPath, dryRun) {
     const github = new GitHubAppClient({
         appId: process.env.GITHUB_APP_ID ?? "",
         privateKeyPem: loadPrivateKey(),
+        ...(process.env.GITHUB_API_BASE_URL ? { baseUrl: process.env.GITHUB_API_BASE_URL } : {}),
     });
     const event = {
         event: "pull_request",
@@ -50,6 +52,7 @@ async function runDev(payloadPath, dryRun) {
         github,
         webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
         masterKey: process.env.DRIFT_MASTER_KEY,
+        readOnly: dryRun,
     });
     if (dryRun && result.commentBody) {
         console.log(result.commentBody);

@@ -151,6 +151,29 @@ function eventFor(payload, raw = JSON.stringify(payload)) {
   return { event: "pull_request", payload, rawBody: raw };
 }
 
+test("handler: readOnly (dev --dry-run) builds the summary without writing", async () => {
+  const commits = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
+  const objects = {
+    ".drift/objects/64/b1.json": JSON.stringify({
+      id: INTENT_ID,
+      prompt: "Fix race condition in token refresh by de-duplicating in-flight refreshes",
+      author: { type: "AGENT", identifier: "Drift Demo", model: "claude-3-5-sonnet" },
+      astDelta: [{ filePath: "src/auth.ts", type: "ADDED", nodeIds: [], summary: 'function "refreshToken" added (line 12)' }],
+      signature: "fake-ed25519",
+    }),
+  };
+  const github = new FakeGitHub(commits, objects);
+  const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
+  assert.equal(result.action, "dry-run");
+  assert.equal(result.intentsFound, 1);
+  assert.ok(result.commentBody.includes("Drift intent summary"));
+  assert.ok(result.commentBody.includes("de-duplicating in-flight refreshes"));
+  // nothing was written: no comment, no check run
+  assert.equal(github.calls.comments.length, 0);
+  assert.equal(github.calls.updates.length, 0);
+  assert.equal(github.calls.checks.length, 0);
+});
+
 test("handler: posts intent summary comment + check run", async () => {
   const commits = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
   const objects = {

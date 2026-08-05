@@ -20,10 +20,12 @@ export interface WebhookDeps {
     masterKey?: string;
     /** Disable check-run creation (comment-only mode). */
     checkRun?: boolean;
+    /** Build the summary without writing anything (dev --dry-run). */
+    readOnly?: boolean;
 }
 export interface WebhookResult {
     handled: boolean;
-    action: "commented" | "updated" | "no-intents" | "skipped" | "error";
+    action: "commented" | "updated" | "no-intents" | "skipped" | "error" | "dry-run";
     commentBody?: string;
     intentsFound: number;
     error?: string;
