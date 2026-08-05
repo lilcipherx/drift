@@ -304,7 +304,7 @@ export class IntentStore {
       FROM intents i
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY i.timestamp DESC
-      ${filters.limit ? "LIMIT " + Math.max(1, Math.floor(filters.limit)) : ""}
+      ${filters.limit !== undefined ? "LIMIT " + safeLimit(filters.limit, 100) : ""}
     `;
     const rows = this.db.prepare(sql).all(...params) as unknown as LogRow[];
     return rows.map((r) => this.rowToLogEntry(r));
@@ -344,7 +344,7 @@ export class IntentStore {
          ORDER BY i.timestamp DESC
          LIMIT ?`,
       )
-      .all(filePath, Math.max(1, Math.floor(limit))) as unknown as LogRow[];
+      .all(filePath, safeLimit(limit, 5)) as unknown as LogRow[];
     return rows.map((r) => this.rowToLogEntry(r));
   }
 
@@ -369,6 +369,18 @@ function safeParseJson<T>(text: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Clamp a user-supplied limit to a safe, finite positive integer.
+ * Non-finite input (Infinity / NaN from a `--limit` flag or SDK call) falls
+ * back instead of being interpolated into SQL (which would raise
+ * "no such column: Infinity").
+ */
+function safeLimit(n: number | undefined, fallback: number): number {
+  if (n === undefined) return fallback;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.floor(n));
 }
 
 export { MIGRATION_001 };

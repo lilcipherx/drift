@@ -6,7 +6,18 @@
  */
 
 import { writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { Drift, DriftError, EXIT } from "@drift/core";
+
+const require_ = createRequire(import.meta.url);
+let VERSION = "0.0.0";
+try {
+  // dist/cli.js → ../package.json (works both in the monorepo and in the
+  // installed @drift/cli under node_modules)
+  VERSION = (require_("../package.json") as { version?: string }).version ?? VERSION;
+} catch {
+  // packaged without package.json (e.g. bundled) — fall back
+}
 
 const USAGE = `Drift — Intent-Driven Versioning
 
@@ -363,7 +374,7 @@ function run(argv: string[]): number {
       }
 
       case "version": {
-        console.log("drift 0.1.0");
+        console.log(`drift ${VERSION}`);
         return EXIT.OK;
       }
 
@@ -384,7 +395,11 @@ function stringFlag(flags: Map<string, string | boolean>, key: string): string |
 
 function numberFlag(flags: Map<string, string | boolean>, key: string): number | undefined {
   const v = stringFlag(flags, key);
-  return v !== undefined && !Number.isNaN(Number(v)) ? Number(v) : undefined;
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  // Reject Infinity/NaN (e.g. `--limit 1e999`) instead of propagating them
+  // into SQL "LIMIT Infinity".
+  return Number.isFinite(n) ? n : undefined;
 }
 
 const code = run(process.argv.slice(2));

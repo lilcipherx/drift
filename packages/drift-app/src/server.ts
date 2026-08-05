@@ -14,27 +14,57 @@ export interface ServerOptions extends WebhookDeps {
   maxBodyBytes?: number;
 }
 
-const MAX_BODY_BYTES = 1024 * 1024;
+// GitHub webhook payloads can reach several MB on busy PRs — keep a bounded
+// but realistic cap (8 MB) instead of rejecting legitimate large deliveries.
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    req.on("data", (c: Buffer) => {
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("aborted", onAborted);
+    };
+    const onData = (c: Buffer) => {
       size += c.length;
       if (size > maxBytes) {
+        cleanup();
+        // Stop buffering but keep draining the rest of the body so the
+        // server can answer with 413 and close cleanly instead of resetting
+        // the connection mid-send (which surfaces as a socket error).
+        req.removeAllListeners("data");
+        req.resume();
         reject(new Error("request body too large"));
-        req.destroy();
         return;
       }
       chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    const onError = (e: Error) => {
+      cleanup();
+      reject(e);
+    };
+    const onAborted = () => {
+      cleanup();
+      reject(new Error("request aborted"));
+    };
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("aborted", onAborted);
   });
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  // The request may already have been terminated (timeout, oversized body,
+  // aborted client) — writing again would throw ERR_HTTP_HEADERS_SENT.
+  if (res.headersSent || res.writableEnded) return;
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 }
@@ -42,6 +72,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 export async function createWebhookServer(opts: ServerOptions) {
   const log = opts.log ?? (() => {});
   const server = createServer(async (req, res) => {
+    // Bound slow/abandoned connections so idle sockets never hold the server.
+    req.setTimeout(30_000, () => {
+      res.writeHead(408, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "request timeout" }));
+      req.destroy();
+    });
     if (req.method === "GET" && req.url === "/health") {
       sendJson(res, 200, { status: "ok" });
       return;
@@ -66,7 +102,14 @@ export async function createWebhookServer(opts: ServerOptions) {
       const status = result.action === "error" && result.retryable ? 500 : 200;
       sendJson(res, status, result);
     } catch (err) {
-      log(`[webhook] fatal: ${err instanceof Error ? err.message : String(err)}`);
+      const message = err instanceof Error ? err.message : String(err);
+      // Oversized payloads are a client error — ack with 413 so GitHub stops
+      // redelivering (5xx would trigger endless retries).
+      if (message.includes("body too large")) {
+        sendJson(res, 413, { error: "request body too large" });
+        return;
+      }
+      log(`[webhook] fatal: ${message}`);
       sendJson(res, 500, { error: "internal error" });
     }
   });

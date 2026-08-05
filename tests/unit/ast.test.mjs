@@ -39,6 +39,32 @@ export const helper = (x: number) => x * 2;
   assert.ok(vt.endLine > vt.startLine);
 });
 
+test("regex literals with braces do not break parsing", () => {
+  // A `}` / `{` / `/` inside a regex literal must be masked, not counted
+  // against brace balance nor parsed as a declaration.
+  const src =
+    'const re1 = /}/;\n' +
+    'const re2 = /[{]\\//g;\n' +
+    "export function useRe() { return re1.test('a') && re2.test('b'); }\n";
+  const symbols = parseSymbols(src, "typescript");
+  const names = symbols.map((s) => s.name);
+  assert.ok(names.includes("useRe"));
+  assert.ok(!names.includes("re1"));
+  assert.ok(!names.includes("re2"));
+});
+
+test("division is not mistaken for a regex literal", () => {
+  const src = "export const ratio = a / b / c;\nexport function f() { return a / b; }\n";
+  const symbols = parseSymbols(src, "typescript");
+  assert.ok(symbols.some((s) => s.name === "f"));
+});
+
+test("regex after return keyword is masked", () => {
+  const src = "export function matcher() { return /a[}]b/; }\n";
+  const symbols = parseSymbols(src, "typescript");
+  assert.ok(symbols.some((s) => s.name === "matcher"));
+});
+
 test("string literals do not create false declarations", () => {
   const src = `
 const msg = "function fakeName() { return 1; }";

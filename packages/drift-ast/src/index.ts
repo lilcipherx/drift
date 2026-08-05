@@ -76,9 +76,79 @@ export function isBinary(content: Buffer): boolean {
   return sample.includes(0);
 }
 
+/** Characters that put the lexer in an expression position (a `/` starts a regex literal). */
+const REGEX_START_PREV = new Set([
+  "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";",
+  "+", "-", "*", "%", "^", "~", "<", ">",
+]);
+
+/** Keywords after which a `/` starts a regex literal (e.g. `return /re/`). */
+const REGEX_START_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "case", "delete",
+  "void", "throw", "new", "do", "else", "yield", "await", "default",
+]);
+
 /**
- * Replace strings and comments with spaces (newlines preserved) so that
- * declaration regexes and brace matching never trip over literals.
+ * True when the `/` at `i` starts a regex literal rather than a division.
+ * Uses the standard lexer heuristic: an expression-position slash (previous
+ * non-space char is an operator/punct or a keyword like `return`) starts a
+ * regex; a slash after an identifier/`)`/`]` is division.
+ */
+function isRegexStart(src: string, i: number): boolean {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(src[j]!)) j--;
+  if (j < 0) return true; // start of input
+  const prev = src[j]!;
+  if (REGEX_START_PREV.has(prev)) return true;
+  if (/[A-Za-z0-9_$]/.test(prev)) {
+    let k = j;
+    while (k >= 0 && /[A-Za-z0-9_$]/.test(src[k]!)) k--;
+    const word = src.slice(k + 1, j + 1);
+    return REGEX_START_KEYWORDS.has(word);
+  }
+  return false;
+}
+
+/**
+ * Mask a regex literal `[...]`-aware (escapes and char classes keep `/`
+ * from closing it). Returns the index just past the literal, or -1 when the
+ * slash turns out not to be a regex (no closing `/` before a newline).
+ */
+function maskRegexLiteral(out: string[], src: string, i: number, n: number): number {
+  let inClass = false;
+  let k = i + 1;
+  while (k < n) {
+    const ch = src[k]!;
+    if (ch === "\\") {
+      k += 2;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      k++;
+      continue;
+    }
+    if (ch === "]") {
+      inClass = false;
+      k++;
+      continue;
+    }
+    if (ch === "\n") break; // unterminated — not a regex literal
+    if (ch === "/" && !inClass) {
+      for (let m = i; m <= k; m++) {
+        if (src[m] !== "\n") out[m] = " ";
+      }
+      return k + 1;
+    }
+    k++;
+  }
+  return -1;
+}
+
+/**
+ * Replace strings, comments and regex literals with spaces (newlines
+ * preserved) so that declaration regexes and brace matching never trip over
+ * literals.
  */
 function maskCode(src: string): string {
   const out = src.split("");
@@ -104,6 +174,15 @@ function maskCode(src: string): string {
       maskTo(Math.min(j + 1, n - 1));
       i = Math.min(j + 2, n);
       continue;
+    }
+    if (c === "/" && src[i + 1] !== "/" && src[i + 1] !== "*") {
+      if (isRegexStart(src, i)) {
+        const after = maskRegexLiteral(out, src, i, n);
+        if (after > i) {
+          i = after;
+          continue;
+        }
+      }
     }
     if (c === '"' || c === "'") {
       let j = i + 1;

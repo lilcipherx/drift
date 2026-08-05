@@ -323,3 +323,19 @@ test("webhook server: POST /webhook with valid signature returns 200 + posts com
     void server;
   }
 });
+
+test("webhook server: oversized body is rejected with 413 (not retryable)", async () => {
+  const github = new FakeGitHub([], {});
+  const { port, close } = await createWebhookServer({ github, port: 0, log: () => {}, maxBodyBytes: 1024 });
+  try {
+    const big = JSON.stringify({ action: "opened", padding: "x".repeat(4096) });
+    const res = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": "pull_request" },
+      body: big,
+    });
+    assert.equal(res.status, 413);
+  } finally {
+    await close();
+  }
+});

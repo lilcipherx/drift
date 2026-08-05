@@ -28,6 +28,11 @@ function truncate(text: string): string {
   return `${text.slice(0, TRUNCATE - 1)}…`;
 }
 
+/** Escape `|` so untrusted paths/summaries cannot break the markdown table. */
+function escCell(text: string | null | undefined): string {
+  return String(text ?? "").replace(/\|/g, "\\|");
+}
+
 export function summarizeIntents(input: SummaryInput): string {
   const { intents } = input;
   const authors = new Set(intents.map((i) => `${i.authorId} (${i.authorType})`));
@@ -61,7 +66,7 @@ export function summarizeIntents(input: SummaryInput): string {
       lines.push("| File | Change |");
       lines.push("| --- | --- |");
       for (const f of intent.files.slice(0, 12)) {
-        lines.push(`| \`${f.path}\` | **${f.mutationType}** — ${f.summary ?? "changed"} |`);
+        lines.push(`| \`${escCell(f.path)}\` | **${f.mutationType}** — ${escCell(f.summary) || "changed"} |`);
       }
       if (intent.files.length > 12) {
         lines.push(`| … | +${intent.files.length - 12} more |`);

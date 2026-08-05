@@ -62,6 +62,9 @@ export async function fetchIntents(github, owner, repo, ref, commits, ids, maste
         }
         if (obj.id && ids.includes(obj.id))
             loaded.set(obj.id, obj);
+        // All referenced intents found — stop issuing more content API calls.
+        if (loaded.size >= ids.length)
+            break;
     }
     // subject fallback: map each intent id to the commit that introduced it
     const subjectByIntent = new Map();

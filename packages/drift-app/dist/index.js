@@ -62,6 +62,9 @@ async function runStart() {
         privateKeyPem: loadPrivateKey(),
     });
     const port = Number(process.env.PORT ?? 3000);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        throw new Error(`invalid PORT: ${process.env.PORT ?? ""}`);
+    }
     const { close } = await createWebhookServer({
         github,
         webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,

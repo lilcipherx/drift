@@ -110,10 +110,18 @@ export class GitHubAppClient implements GitHubClientLike {
 
   async getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]> {
     const token = await this.getInstallationToken(await this.requireInstallation());
-    const res = await this.request(`/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`, token);
-    if (!res.ok) throw new Error(`getPullCommits failed: ${res.status}`);
-    const data = (await res.json()) as { sha: string; commit: { message: string } }[];
-    return data.map((c) => ({ sha: c.sha, message: c.commit.message }));
+    const commits: PullCommit[] = [];
+    // Paginate so PRs with more than 100 commits still get fully scanned
+    // (cap at 5 000 commits to stay bounded on pathological PRs).
+    let path: string | null = `/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`;
+    for (let page = 0; path && page < 50; page++) {
+      const res = await this.request(path, token);
+      if (!res.ok) throw new Error(`getPullCommits failed: ${res.status}`);
+      const data = (await res.json()) as { sha: string; commit: { message: string } }[];
+      commits.push(...data.map((c) => ({ sha: c.sha, message: c.commit.message })));
+      path = nextPagePath(res.headers.get("link"));
+    }
+    return commits;
   }
 
   /** All file paths under `.drift/objects/` reachable from `ref`. */

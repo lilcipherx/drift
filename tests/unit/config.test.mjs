@@ -43,6 +43,19 @@ test("loadConfig merges [encryption] section", () => {
   assert.equal(cfg.encryption.key_provider, "env:DRIFT_MASTER_KEY");
 });
 
+test("parseToml strips inline comments outside strings", () => {
+  const parsed = parseToml(
+    "[encryption]\n" +
+      "enabled = false # inline comment\n" +
+      'key_provider = "env:DRIFT_MASTER_KEY" # keep the value\n' +
+      "[redaction]\n" +
+      'patterns = ["a#b", "c"] # array with hashes\n',
+  );
+  assert.equal(parsed.encryption.enabled, false);
+  assert.equal(parsed.encryption.key_provider, "env:DRIFT_MASTER_KEY");
+  assert.deepEqual(parsed.redaction.patterns, ["a#b", "c"]);
+});
+
 test("loadConfig merges file over defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "drift-config-"));
   mkdirSync(dir, { recursive: true });

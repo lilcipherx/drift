@@ -37,6 +37,7 @@ test against production or third-party systems.
 | Data at rest (prompt / agent state) | AES-256-GCM via `DRIFT_MASTER_KEY` when `[encryption] enabled = true` (v0.2.0); GCM auth detects tampering |
 | Prompt injection via code comments | Reviewer/merge LLM prompts ignore code comments; LLM output re-validated |
 | Malformed AST input | Parsers are bounded; parse failure aborts commit (exit code 2) |
+| Malicious `verifyCmd` / `--verify-cmd` | `drift verify` re-runs the recorded command with the user's shell. Only run `verify` on intents you trust (local or from a trusted upstream); verify `verifyCmd` before recording it via `realize --verify-cmd`. |
 
 ## Encryption at rest (v0.2.0)
 

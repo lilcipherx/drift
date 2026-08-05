@@ -54,12 +54,43 @@ key_provider = "env:DRIFT_MASTER_KEY"
 [telemetry]
 enabled = false
 `;
+/**
+ * Strip an inline `#` comment from a line, honoring quotes (so `#` inside
+ * a string or array element survives).
+ */
+function stripInlineComment(line) {
+    let quote = null;
+    let escaped = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch === "\\" && quote === '"') {
+            escaped = true;
+            continue;
+        }
+        if (quote) {
+            if (ch === quote)
+                quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+            quote = ch;
+            continue;
+        }
+        if (ch === "#")
+            return line.slice(0, i);
+    }
+    return line;
+}
 /** Minimal TOML-subset parser: sections, `key = "value"`, arrays, bools, ints. */
 export function parseToml(text) {
     const out = {};
     let section = "";
     for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
+        const line = stripInlineComment(rawLine).trim();
         if (!line || line.startsWith("#"))
             continue;
         if (line.startsWith("[") && line.endsWith("]")) {

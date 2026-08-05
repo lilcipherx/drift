@@ -52,6 +52,48 @@ All notable changes are tracked here (git-cliff style, kept manually).
   step — `npm install` is still required for workspace symlinks and external
   deps. `.gitignore` now un-ignores `packages/*/dist`; install instructions
   updated accordingly (`npm install` only).
+- **MCP server prepared for npm publishing** (`@drift/mcp`, chain
+  `@drift/ast` → `@drift/core` → `@drift/cli` → `@drift/mcp`). All harness
+  manifests (`.claude-plugin/`, `.plugin/`, `.cursor-plugin/`,
+  `.codex-plugin/`, `gemini-extension.json`, `mcp_config.json`, `mcp.json`),
+  `examples/harness-configs/*`, `.opencode/INSTALL.md`, README and docs now
+  launch the server via `npx -y @drift/mcp` — no clone needed once the
+  packages are published to npm (only `DRIFT_REPO` must be set). CLI is
+  available the same way: `npx -y @drift/cli`. `@drift/mcp` gains a `mcp` bin
+  entry so npx resolves the executable by package name.
+- README gains a **“Verified live”** section documenting the real end-to-end
+  test (fresh clone + `npm install` + MCP handshake + CLI cycle + `claude mcp
+  add` executed for real, with results and dates) — including the npm path:
+  the packed `@drift/*` tarballs installed via `npm install` into an empty
+  directory answered `serverInfo: drift 0.1.0` with all six tools (`HANDSHAKE
+  OK`), proving `npx -y @drift/mcp` needs no clone.
+- Fixed `@drift/cli` `main` field (`dist/index.js` → `dist/cli.js`) — the CLI
+  package only builds `cli.js`, so the old `main` pointed at a file that does
+  not exist (broke `import "@drift/cli"`).
+- Added `scripts/publish-npm.sh` — one command that publishes the
+  `@drift/ast` → `@drift/core` → `@drift/cli` → `@drift/mcp` chain in order,
+  confirms each version on the registry, and verifies the `npx -y @drift/mcp`
+  handshake from an empty directory.
+
+### Fixed (production-readiness audit)
+- AST parser no longer trips over **regex literals containing `{`/`}`/`/`**
+  (now masked like strings/comments) — valid code with regexes is no longer
+  rejected by the syntax gate (exit 2). Division is not mistaken for a regex.
+- `drift log`/`drift context` with a non-finite `--limit` (e.g. `Infinity`,
+  `NaN`) no longer crashes with a SQL error — limits are clamped to a safe
+  positive integer.
+- `drift version` reports the real package version instead of a hardcoded
+  string.
+- GitHub App: PR commits are **paginated** (PRs with > 100 commits are fully
+  scanned); intent-object fetching stops as soon as all referenced intents are
+  loaded; webhook requests get a 30s timeout; oversized bodies are rejected
+  with **413** (no endless GitHub retries) up to an 8 MB cap; `PORT` is
+  validated; summary table cells escape `|` so untrusted paths/summaries
+  cannot break markdown; the response writer is guarded against
+  `ERR_HTTP_HEADERS_SENT` when a request is terminated mid-handling.
+- `config.toml` inline `#` comments are now honored (outside strings).
+- SECURITY.md documents the `verify` / `--verify-cmd` shell-execution trust
+  boundary.
 
 ### Removed
 - Removed GitHub Actions from the repository: `.github/workflows/ci.yml` and

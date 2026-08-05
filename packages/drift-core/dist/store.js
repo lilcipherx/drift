@@ -200,7 +200,7 @@ export class IntentStore {
       FROM intents i
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY i.timestamp DESC
-      ${filters.limit ? "LIMIT " + Math.max(1, Math.floor(filters.limit)) : ""}
+      ${filters.limit !== undefined ? "LIMIT " + safeLimit(filters.limit, 100) : ""}
     `;
         const rows = this.db.prepare(sql).all(...params);
         return rows.map((r) => this.rowToLogEntry(r));
@@ -234,7 +234,7 @@ export class IntentStore {
          WHERE ifx.file_path = ?
          ORDER BY i.timestamp DESC
          LIMIT ?`)
-            .all(filePath, Math.max(1, Math.floor(limit)));
+            .all(filePath, safeLimit(limit, 5));
         return rows.map((r) => this.rowToLogEntry(r));
     }
     /** PRAGMA integrity_check — 'ok' on success. */
@@ -256,6 +256,19 @@ function safeParseJson(text, fallback) {
     catch {
         return fallback;
     }
+}
+/**
+ * Clamp a user-supplied limit to a safe, finite positive integer.
+ * Non-finite input (Infinity / NaN from a `--limit` flag or SDK call) falls
+ * back instead of being interpolated into SQL (which would raise
+ * "no such column: Infinity").
+ */
+function safeLimit(n, fallback) {
+    if (n === undefined)
+        return fallback;
+    if (!Number.isFinite(n))
+        return fallback;
+    return Math.max(1, Math.floor(n));
 }
 export { MIGRATION_001 };
 export { join as joinPath } from "node:path";
