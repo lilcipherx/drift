@@ -3,53 +3,66 @@
 > Goal: go from zero to `drift blame` showing the *why* behind a function in
 > under five minutes.
 
-## 1. Install
-
 Requires **Node.js >= 24** (uses the built-in `node:sqlite`) and git.
 
+## 1. Install
+
 ```bash
-git clone <your-fork> drift && cd drift
+git clone https://github.com/lilcipherx/drift.git && cd drift
 npm install
 ```
 
-The `dist/` build output is committed, so no build step is needed. (`npm run
-build` still works if you edit the TypeScript sources.)
+The `dist/` build output is committed, so no build step is needed. (Optional:
+`npm link` inside `packages/drift-cli` makes a global `drift` command so you
+can drop the `node packages/drift-cli/dist/cli.js` prefix below.)
 
-## 2. Seed the demo repository
-
-```bash
-bash scripts/seed-demo.sh
-cd examples/demo-repo
-```
-
-This generates a real git + Drift history: an initial scaffold plus three
-intents (two agent, one human) — all produced by running the actual CLI.
-
-## 3. See the "aha"
+## 2. Initialize Drift in a repo
 
 ```bash
-node ../../packages/drift-cli/dist/cli.js log
-node ../../packages/drift-cli/dist/cli.js blame src/auth.ts --function refreshToken
-node ../../packages/drift-cli/dist/cli.js context src/auth.ts --limit 5
-```
-
-## 4. Try it on your own repo
-
-```bash
-cd /your/repo
+cd /path/to/your/repo
 node /path/to/drift/packages/drift-cli/dist/cli.js init
-
-# edit a file, then:
-node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "What you changed and why" --agent --model your-model
-node /path/to/drift/packages/drift-cli/dist/cli.js log --json
 ```
 
-## What just happened
+This creates `.drift/` — a SQLite DAG store, `config.toml`, and a per-repo
+Ed25519 signing key. Nothing in your git history is touched.
 
-- `drift init` created `.drift/` — SQLite DAG, config, and a per-repo Ed25519 key.
-- `drift realize` parsed your file, validated syntax (broken code → exit 2, no
-  commit), redacted secrets from your prompt, computed the AST delta, signed the
-  intent, stored it content-addressed in `.drift/objects/`, and committed with a
-  `Drift-Intent: <id>` trailer.
-- `drift blame` maps a line/function through `git blame` to the intent that
-  created it.
+## 3. Make a change with intent
+
+Edit a file, then:
+
+```bash
+node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "Add login flow with validation" --agent --model claude-3-5-sonnet
+```
+
+`realize` stages the change, checks the syntax (broken code → exit 2, **no
+commit**), redacts secrets from your prompt, computes the AST delta, signs the
+intent, stores it in `.drift/objects/`, and commits with a `Drift-Intent: <id>`
+trailer.
+
+## 4. See the "why"
+
+```bash
+node /path/to/drift/packages/drift-cli/dist/cli.js log
+node /path/to/drift/packages/drift-cli/dist/cli.js blame src/auth.ts --function login
+node /path/to/drift/packages/drift-cli/dist/cli.js context src/auth.ts --limit 5
+```
+
+`blame` maps the line or function through `git blame` back to the intent that
+created it — the original prompt, author, model, and signature.
+
+## 5. Verify your intent
+
+```bash
+node /path/to/drift/packages/drift-cli/dist/cli.js verify-intent <intent-id>
+node /path/to/drift/packages/drift-cli/dist/cli.js doctor
+```
+
+`verify-intent` checks the Ed25519 signature; `doctor` reports store integrity
+(and can repair orphans with `--fix`).
+
+## Next steps
+
+- Full command reference: [api.md](api.md)
+- How Drift works under the hood: [architecture.md](architecture.md)
+- Configuring encryption at rest, redaction, and the AST parser:
+  [api.md](api.md#configuration-driftconfigtoml)

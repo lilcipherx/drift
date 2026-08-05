@@ -2,6 +2,8 @@
 
 Thanks for helping build the provenance layer for AI-generated code.
 
+Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Development setup
 
 Requirements: **Node.js >= 24** (uses the built-in `node:sqlite`), npm, git.

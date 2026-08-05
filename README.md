@@ -62,15 +62,15 @@ Every command below is backed by a real manifest in this repository
 `.cursor-plugin/plugin.json`, `.codex-plugin/plugin.json`,
 `gemini-extension.json`, `plugin.json`, `.factory-plugin/`,
 `package.json` → `pi`) or a ready-made config in
-`examples/harness-configs/` — installation needs nothing outside this
-repository.
+`examples/harness-configs/` — installation needs only **Node.js ≥ 24 and
+npm** (the MCP server runs via `npx -y @drift/mcp`, no clone needed).
 
 ### Claude Code
 
 Add the Drift MCP server (project scope):
 
 ```bash
-claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
 ```
 
 Or copy the ready-made config:
@@ -97,8 +97,8 @@ first message. Reinstall with the same command to update.
 In the Codex app, open **Settings → MCP servers** and add:
 
 - **Name**: `drift`
-- **Command**: `node`
-- **Args**: `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
+- **Command**: `npx`
+- **Args**: `-y @drift/mcp`
 - **Env**: `DRIFT_REPO=/abs/path/to/your/repo`
 
 ### Codex CLI
@@ -107,8 +107,8 @@ Add the Drift MCP server to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.drift]
-command = "node"
-args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
+command = "npx"
+args = ["-y", "@drift/mcp"]
 env = { DRIFT_REPO = "/abs/path/to/your/repo" }
 ```
 
@@ -157,7 +157,7 @@ Then ask for `drift_blame` in chat.
 Add the Drift MCP server:
 
 ```bash
-copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
 ```
 
 Or copy the ready-made config to `.github/mcp.json` and restart Copilot.
@@ -221,6 +221,12 @@ VS Code picks it up on window reload.
 
 ### CLI
 
+Without cloning — the CLI is published to npm:
+
+```bash
+npx -y @drift/cli --help
+```
+
 From this repository:
 
 ```bash
@@ -258,6 +264,19 @@ Check intent health in CI:
   with:
     command: log     # or: doctor / verify <intent-id>
 ```
+
+## Verified live (Проверено вживую)
+
+Verified on **2026-08-05** (Windows 11 · Node v24.18.0 · npm 11.16.0 · git).
+
+| # | Step | Command | Result | Date |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | Fresh clone + install | `git clone https://github.com/lilcipherx/drift.git && npm install` | ✅ 0 vulnerabilities; no build step (`dist/` committed) | 2026-08-05 |
+| 2 | MCP handshake | `initialize` + `tools/list` (stdio JSON-RPC) | ✅ `serverInfo: drift 0.1.0`; all six tools (`drift_realize`, `drift_context`, `drift_replay`, `drift_blame`, `drift_verify`, `drift_log`) | 2026-08-05 |
+| 3 | CLI cycle (temp repo) | `drift init` → `realize` → `log` → `blame` | ✅ intent `did_…` + `Drift-Intent:` trailer; `blame` returns the prompt with a **valid** Ed25519 signature | 2026-08-05 |
+| 4 | Claude Code (real CLI) | `claude mcp add drift --env DRIFT_REPO=… -- npx -y @drift/mcp` | ✅ `Added stdio MCP server drift…`; `.mcp.json` written; listed as ⏸ *Pending approval* (tested via the committed `dist/` path — same server) | 2026-08-05 |
+| 5 | Other nine harnesses | their configs/manifests: Codex `config.toml`, Cursor `.cursor/mcp.json`, Copilot `.github/mcp.json`, OpenCode `opencode.json`, Gemini `settings.json`, Pi `mcp.json`, Antigravity `mcp_config.json`, Droid `mcp.json`, Claude `.mcp.json` | ⚠️ harness CLIs not installed; all 9 configs start the server with a correct handshake | 2026-08-05 |
+| 6 | npm path — no clone | packed `@drift/ast` → `@drift/core` → `@drift/cli` → `@drift/mcp`; `npm install` into an empty dir; ran the installed `mcp` bin | ✅ `serverInfo: drift 0.1.0`; six tools; `HANDSHAKE OK` — what `npx -y @drift/mcp` runs; re-verified by `scripts/publish-npm.sh` on release | 2026-08-05 |
 
 ## Demo
 
@@ -357,7 +376,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The general flow:
 
 1. Fork the repository.
 2. Create a branch for your work.
-3. Keep `npm test` green (69 tests: unit, temp-git-repo integration, MCP
+3. Keep `npm test` green (81 tests: unit, temp-git-repo integration, MCP
    JSON-RPC e2e, GitHub App handler).
 4. Submit a PR using the template.
 
@@ -368,9 +387,10 @@ the drop-in point for a future tree-sitter implementation.
 
 ## Updating
 
-Drift is released on the [releases page](https://github.com/lilcipherx/drift/releases)
-as versioned tags (`v0.1.0`, `v0.2.0`, `v0.2.1`, …). Pull the latest tag, rebuild,
-and point your MCP / Action config at it:
+MCP servers launched via `npx -y @drift/mcp` pick up new versions automatically
+(`npx` always fetches the latest published release). Releases are tagged on the
+[releases page](https://github.com/lilcipherx/drift/releases) (`v0.1.0`,
+`v0.2.0`, `v0.2.1`, …). For the CLI from a checkout:
 
 ```bash
 git pull origin main
@@ -388,4 +408,5 @@ MIT — see [LICENSE](LICENSE). Security notes: [SECURITY.md](SECURITY.md).
 - **Repository**: [github.com/lilcipherx/drift](https://github.com/lilcipherx/drift)
 - **Issues**: [github.com/lilcipherx/drift/issues](https://github.com/lilcipherx/drift/issues)
 - **Releases**: [github.com/lilcipherx/drift/releases](https://github.com/lilcipherx/drift/releases)
-- **Documentation**: [`docs/`](docs/quickstart.md), [`examples/demo-repo`](examples/demo-repo)
+- **Documentation**: [quickstart](docs/quickstart.md) · [API reference](docs/api.md) · [architecture](docs/architecture.md) · [`examples/demo-repo`](examples/demo-repo)
+- **Code of Conduct**: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
