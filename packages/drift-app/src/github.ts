@@ -21,12 +21,19 @@ export interface CheckRunInput {
   summary: string;
 }
 
+export interface IssueComment {
+  id: number;
+  body: string;
+}
+
 export interface GitHubClientLike {
   setInstallation(id: number): void;
   getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
   getObjectPaths(owner: string, repo: string, ref: string): Promise<string[]>;
   getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
+  listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
   postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
+  updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
   createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<void>;
 }
 
@@ -135,6 +142,25 @@ export class GitHubAppClient implements GitHubClientLike {
     return Buffer.from(data.content, data.encoding === "base64" ? "base64" : "utf8").toString("utf8");
   }
 
+  /**
+   * All issue/PR comments, most recent first (idempotency needs the existing
+   * Drift comment). Paginates through the Link header (cap 10 pages) so the
+   * marker comment is found even on heavily-commented PRs.
+   */
+  async listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]> {
+    const token = await this.getInstallationToken(await this.requireInstallation());
+    const comments: IssueComment[] = [];
+    let path: string | null = `/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=100`;
+    for (let page = 0; path && page < 10; page++) {
+      const res = await this.request(path, token);
+      if (!res.ok) throw new Error(`listIssueComments failed: ${res.status}`);
+      const data = (await res.json()) as { id: number; body: string }[];
+      comments.push(...data.map((c) => ({ id: c.id, body: c.body })));
+      path = nextPagePath(res.headers.get("link"));
+    }
+    return comments;
+  }
+
   // ----------------------------------------------------------- writes
   async postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void> {
     const token = await this.getInstallationToken(await this.requireInstallation());
@@ -143,6 +169,16 @@ export class GitHubAppClient implements GitHubClientLike {
       body: JSON.stringify({ body }),
     });
     if (!res.ok) throw new Error(`postComment failed: ${res.status} ${await res.text()}`);
+  }
+
+  /** PATCH an existing comment in place (keeps the thread tidy across synchronize events). */
+  async updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void> {
+    const token = await this.getInstallationToken(await this.requireInstallation());
+    const res = await this.request(`/repos/${owner}/${repo}/issues/comments/${commentId}`, token, {
+      method: "PATCH",
+      body: JSON.stringify({ body }),
+    });
+    if (!res.ok) throw new Error(`updateComment failed: ${res.status} ${await res.text()}`);
   }
 
   async createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<void> {
@@ -176,4 +212,21 @@ export class GitHubAppClient implements GitHubClientLike {
 
 function encodePath(path: string): string {
   return path.split("/").map((seg) => encodeURIComponent(seg)).join("/");
+}
+
+/** Extract the relative path of the `rel="next"` page from a Link header. */
+function nextPagePath(link: string | null): string | null {
+  if (!link) return null;
+  for (const part of link.split(",").map((p) => p.trim())) {
+    const m = part.match(/<([^>]+)>\s*;\s*rel="next"/);
+    if (m) {
+      try {
+        const u = new URL(m[1]!);
+        return u.pathname + u.search;
+      } catch {
+        return m[1]!;
+      }
+    }
+  }
+  return null;
 }

@@ -5,6 +5,13 @@
 
 import type { IntentView } from "./intents.js";
 
+/**
+ * Invisible marker embedded in every Drift summary comment. The webhook
+ * handler uses it to find an existing comment and update it in place, so
+ * comments never accumulate across `synchronize` deliveries.
+ */
+export const SUMMARY_MARKER = "<!-- drift:summary -->";
+
 export interface SummaryInput {
   owner: string;
   repo: string;
@@ -26,6 +33,7 @@ export function summarizeIntents(input: SummaryInput): string {
   const authors = new Set(intents.map((i) => `${i.authorId} (${i.authorType})`));
   const lines: string[] = [];
 
+  lines.push(SUMMARY_MARKER);
   lines.push(`## 🤖 Drift intent summary`);
   lines.push("");
   lines.push(

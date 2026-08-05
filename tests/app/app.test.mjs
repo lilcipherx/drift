@@ -113,17 +113,29 @@ test("createAppJwt: RS256 header, iss/iat/exp claims, TTL capped at 600s", () =>
 
 // ------------------------------------------------------- handler (fake GH)
 class FakeGitHub {
-  constructor(commits, objects) {
+  constructor(commits, objects, existingComments = []) {
     this.commits = commits;
     this.objects = objects;
-    this.calls = { comments: [], checks: [] };
+    // issue comments already on the PR (id ascending)
+    this.existing = existingComments.map((body, i) => ({ id: i + 1, body }));
+    this.nextId = this.existing.length + 1;
+    this.calls = { comments: [], checks: [], updates: [] };
     this.installation = null;
   }
   setInstallation(id) { this.installation = id; }
   async getPullCommits() { return this.commits; }
   async getObjectPaths() { return Object.keys(this.objects); }
   async getFileContent(owner, repo, path) { return this.objects[path] ?? null; }
-  async postComment(owner, repo, issueNumber, body) { this.calls.comments.push({ issueNumber, body }); }
+  async listIssueComments() { return [...this.existing]; }
+  async postComment(owner, repo, issueNumber, body) {
+    this.calls.comments.push({ issueNumber, body });
+    this.existing.push({ id: this.nextId++, body });
+  }
+  async updateComment(owner, repo, commentId, body) {
+    this.calls.updates.push({ commentId, body });
+    const c = this.existing.find((x) => x.id === commentId);
+    if (c) c.body = body;
+  }
   async createCheckRun(owner, repo, input) { this.calls.checks.push(input); }
 }
 
@@ -159,6 +171,8 @@ test("handler: posts intent summary comment + check run", async () => {
   assert.equal(github.calls.comments[0].issueNumber, 7);
   assert.ok(github.calls.comments[0].body.includes("Drift intent summary"));
   assert.ok(github.calls.comments[0].body.includes("de-duplicating in-flight refreshes"));
+  // the summary embeds the idempotency marker
+  assert.ok(github.calls.comments[0].body.includes("<!-- drift:summary -->"));
   assert.equal(github.calls.checks.length, 1);
   assert.equal(github.calls.checks[0].headSha, "abc123def");
 });
@@ -202,6 +216,55 @@ test("handler: rejects wrong signature and non-PR events", async () => {
   assert.equal(bad.action, "error");
   const push = await handleWebhook({ ...eventFor(PAYLOAD), event: "push" }, { github });
   assert.equal(push.action, "skipped");
+});
+
+test("handler: synchronize updates the existing Drift comment instead of posting", async () => {
+  const commits = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
+  const objects = {
+    ".drift/objects/64/b1.json": JSON.stringify({
+      id: INTENT_ID,
+      prompt: "Fix race condition in token refresh by de-duplicating in-flight refreshes",
+      author: { type: "AGENT", identifier: "Drift Demo", model: "claude-3-5-sonnet" },
+      astDelta: [],
+      signature: "fake-ed25519",
+    }),
+  };
+  const existing = [`old draft\n<!-- drift:summary -->\n(previous summary)`, "a human comment, no marker"];
+  const github = new FakeGitHub(commits, objects, existing);
+  const result = await handleWebhook(
+    { ...eventFor(PAYLOAD), payload: { ...PAYLOAD, action: "synchronize" } },
+    { github },
+  );
+  assert.equal(result.action, "updated");
+  // updated in place: 2 updates? no — exactly one PATCH on the marker comment
+  assert.equal(github.calls.updates.length, 1);
+  assert.equal(github.calls.updates[0].commentId, 1);
+  assert.ok(github.calls.updates[0].body.includes("de-duplicating in-flight refreshes"));
+  // no new comment was posted, the human comment is untouched
+  assert.equal(github.calls.comments.length, 0);
+  assert.equal(github.existing.length, 2);
+  assert.equal(github.existing[1].body, "a human comment, no marker");
+});
+
+test("handler: synchronize with no prior Drift comment posts a new one", async () => {
+  const commits = [{ sha: "s", message: `Add validation\n\nDrift-Intent: ${INTENT_ID}` }];
+  const objects = {
+    ".drift/objects/aa/bb.json": JSON.stringify({
+      id: INTENT_ID,
+      prompt: "Add JWT validation",
+      author: { type: "AGENT", identifier: "Bot", model: "m" },
+      astDelta: [],
+      signature: "sig",
+    }),
+  };
+  const github = new FakeGitHub(commits, objects, ["just a human comment"]);
+  const result = await handleWebhook(
+    { ...eventFor(PAYLOAD), payload: { ...PAYLOAD, action: "synchronize" } },
+    { github },
+  );
+  assert.equal(result.action, "commented");
+  assert.equal(github.calls.comments.length, 1);
+  assert.equal(github.calls.updates.length, 0);
 });
 
 test("fetchIntents: falls back to commit subject when object missing", async () => {

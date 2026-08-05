@@ -4,6 +4,16 @@ All notable changes are tracked here (git-cliff style, kept manually).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-05
+
+### Changed
+- **Idempotent summary comments** in `@drift/app`: the comment embeds an
+  invisible `<!-- drift:summary -->` marker; on any PR action
+  (`opened`/`synchronize`/`reopened`) the existing Drift comment is updated in
+  place (PATCH) instead of posting a new one, so comments never accumulate on
+  repeated deliveries. Adds paginated `listIssueComments` and `updateComment`
+  GitHub API methods.
+
 ## [0.2.0] — 2026-08-05
 
 ### Added

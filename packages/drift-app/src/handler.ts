@@ -5,12 +5,17 @@
  *   1. read `Drift-Intent` trailers from the PR commits;
  *   2. hydrate intent objects from `.drift/objects/` at the PR head;
  *   3. post a semantic summary comment and a check run.
+ *
+ * Idempotent: the summary embeds an invisible `SUMMARY_MARKER`; if a Drift
+ * comment already exists on the PR it is updated in place, so repeated
+ * deliveries (GitHub webhook retries, `synchronize` pushes) never stack
+ * duplicate comments.
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { GitHubClientLike } from "./github.js";
 import { extractIntentIds, fetchIntents } from "./intents.js";
-import { summarizeIntents } from "./summarize.js";
+import { summarizeIntents, SUMMARY_MARKER } from "./summarize.js";
 
 export interface WebhookDeps {
   github: GitHubClientLike;
@@ -24,7 +29,7 @@ export interface WebhookDeps {
 
 export interface WebhookResult {
   handled: boolean;
-  action: "commented" | "no-intents" | "skipped" | "error";
+  action: "commented" | "updated" | "no-intents" | "skipped" | "error";
   commentBody?: string;
   intentsFound: number;
   error?: string;
@@ -98,7 +103,19 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
       prTitle: pr?.title ?? "",
       intents,
     });
-    await github.postComment(owner, repoName, prNumber, commentBody);
+
+    // Idempotent write: update the existing Drift comment when present,
+    // otherwise post a new one.
+    const comments = await github.listIssueComments(owner, repoName, prNumber);
+    const existing = comments.find((c) => c.body.includes(SUMMARY_MARKER));
+    let action: "commented" | "updated";
+    if (existing) {
+      await github.updateComment(owner, repoName, existing.id, commentBody);
+      action = "updated";
+    } else {
+      await github.postComment(owner, repoName, prNumber, commentBody);
+      action = "commented";
+    }
 
     if (deps.checkRun !== false) {
       await github.createCheckRun(owner, repoName, {
@@ -110,7 +127,7 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
       });
     }
 
-    return { handled: true, action: "commented", commentBody, intentsFound: intents.length };
+    return { handled: true, action, commentBody, intentsFound: intents.length };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     return { handled: true, action: "error", intentsFound: 0, error, retryable: true };
