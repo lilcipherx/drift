@@ -81,6 +81,18 @@ All notable changes are tracked here (git-cliff style, kept manually).
   drops the now-unused `version` input; it will switch to npm-mode
   automatically once the publish chain lands.
 
+### Fixed (wave-2 audit)
+- `doctor --fix` no longer fails with `FOREIGN KEY constraint failed` when
+  deleting an intent that has children — `deleteById` reparents dependants to
+  the deleted intent's parent first.
+- CLI usage errors (empty prompt, missing arguments) stay machine-readable
+  under `--json` instead of leaking plain text to stdout.
+- `drift blame` / `drift context` reject paths that escape the repository root
+  (`../` traversal, absolute/cross-drive paths, symlinks via realpath) before
+  any filesystem read.
+
+## [0.2.2] — 2026-08-05
+
 ### Fixed (production-readiness audit)
 - AST parser no longer trips over **regex literals containing `{`/`}`/`/`**
   (now masked like strings/comments) — valid code with regexes is no longer
