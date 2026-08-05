@@ -58,24 +58,35 @@ async function runDev(payloadPath, dryRun) {
         console.log(result.commentBody);
     }
     console.log(`[dev] action=${result.action} intents=${result.intentsFound}${result.error ? ` error=${result.error}` : ""}`);
+    // error action (bad signature, malformed payload, permanent API error)
+    // means the dev run failed — surface it in the exit code for scripts/CI.
+    if (result.action === "error")
+        process.exitCode = 1;
 }
 async function runStart() {
+    // A public webhook endpoint with HMAC verification disabled lets anyone
+    // forge pull_request events — require the secret in server mode (dev mode
+    // stays permissive because it processes a local file).
+    if (!process.env.GITHUB_WEBHOOK_SECRET) {
+        throw new Error("GITHUB_WEBHOOK_SECRET is required for drift-app start");
+    }
     const github = new GitHubAppClient({
         appId: process.env.GITHUB_APP_ID ?? "",
         privateKeyPem: loadPrivateKey(),
+        ...(process.env.GITHUB_API_BASE_URL ? { baseUrl: process.env.GITHUB_API_BASE_URL } : {}),
     });
     const port = Number(process.env.PORT ?? 3000);
     if (!Number.isInteger(port) || port < 0 || port > 65535) {
         throw new Error(`invalid PORT: ${process.env.PORT ?? ""}`);
     }
-    const { close } = await createWebhookServer({
+    const { close, port: actualPort } = await createWebhookServer({
         github,
         webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
         masterKey: process.env.DRIFT_MASTER_KEY,
         port,
         log: (line) => console.log(line),
     });
-    console.log(`drift-app listening on http://127.0.0.1:${port}/webhook`);
+    console.log(`drift-app listening on http://127.0.0.1:${actualPort}/webhook`);
     console.log("  point your GitHub App webhook URL here (or use scripts/webhook-proxy.sh with smee.io)");
     const shutdown = async () => {
         await close();

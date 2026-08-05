@@ -108,12 +108,13 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
 
     // Idempotent write: update the existing Drift comment when present,
     // otherwise post a new one.
-    const comments = await github.listIssueComments(owner, repoName, prNumber);
-    const existing = comments.find((c) => c.body.includes(SUMMARY_MARKER));
-    // dev --dry-run: build the summary but write nothing (no comment, no check run).
+    // dev --dry-run: build the summary but write nothing (no comment, no check
+    // run, and no comment listing — the summary needs only commits + objects).
     if (deps.readOnly) {
       return { handled: true, action: "dry-run", commentBody, intentsFound: intents.length };
     }
+    const comments = await github.listIssueComments(owner, repoName, prNumber);
+    const existing = comments.find((c) => c.body.includes(SUMMARY_MARKER));
     let action: "commented" | "updated";
     if (existing) {
       await github.updateComment(owner, repoName, existing.id, commentBody);
@@ -136,6 +137,13 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     return { handled: true, action, commentBody, intentsFound: intents.length };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    return { handled: true, action: "error", intentsFound: 0, error, retryable: true };
+    // Permanent GitHub API errors (4xx: repo deleted, bad permissions, invalid
+    // installation) will never succeed on retry — ack with 200 so GitHub stops
+    // redelivering. Only transient failures (network, 5xx) should be retried.
+    const status = /failed: (\d{3})/.exec(error)?.[1];
+    const code = status ? Number(status) : 0;
+    // 429 (rate limit) is transient even though it is < 500.
+    const retryable = !status || code === 429 || code >= 500;
+    return { handled: true, action: "error", intentsFound: 0, error, retryable };
   }
 }

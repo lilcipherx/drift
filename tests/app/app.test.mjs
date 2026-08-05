@@ -137,6 +137,10 @@ class FakeGitHub {
     if (c) c.body = body;
   }
   async createCheckRun(owner, repo, input) { this.calls.checks.push(input); }
+  async listIssueComments() {
+    this.calls.list = (this.calls.list ?? 0) + 1;
+    return [...this.existing];
+  }
 }
 
 const INTENT_ID = "did_43102f533af8feb75e084d07b670c29c";
@@ -172,6 +176,8 @@ test("handler: readOnly (dev --dry-run) builds the summary without writing", asy
   assert.equal(github.calls.comments.length, 0);
   assert.equal(github.calls.updates.length, 0);
   assert.equal(github.calls.checks.length, 0);
+  // and dry-run does not even list comments — the summary needs only commits
+  assert.equal(github.calls.list ?? 0, 0);
 });
 
 test("handler: posts intent summary comment + check run", async () => {
@@ -288,6 +294,36 @@ test("handler: synchronize with no prior Drift comment posts a new one", async (
   assert.equal(result.action, "commented");
   assert.equal(github.calls.comments.length, 1);
   assert.equal(github.calls.updates.length, 0);
+});
+
+test("handler: permanent 4xx GitHub API errors are not retryable", async () => {
+  // repo deleted / bad permissions — retrying for days would be pointless
+  const github = new FakeGitHub([], {});
+  github.getPullCommits = async () => {
+    throw new Error("getPullCommits failed: 404");
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), { github });
+  assert.equal(result.action, "error");
+  assert.equal(result.retryable, false);
+  assert.ok(result.error.includes("404"));
+});
+
+test("handler: transient 5xx / network errors are retryable", async () => {
+  const github = new FakeGitHub([], {});
+  github.getPullCommits = async () => {
+    throw new Error("getPullCommits failed: 503");
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), { github });
+  assert.equal(result.action, "error");
+  assert.equal(result.retryable, true);
+
+  // network-level failure without a status code is transient too
+  const github2 = new FakeGitHub([], {});
+  github2.getPullCommits = async () => {
+    throw new TypeError("fetch failed");
+  };
+  const result2 = await handleWebhook(eventFor(PAYLOAD), { github: github2 });
+  assert.equal(result2.retryable, true);
 });
 
 test("fetchIntents: falls back to commit subject when object missing", async () => {

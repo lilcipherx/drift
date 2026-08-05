@@ -63,8 +63,9 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   // The request may already have been terminated (timeout, oversized body,
-  // aborted client) — writing again would throw ERR_HTTP_HEADERS_SENT.
-  if (res.headersSent || res.writableEnded) return;
+  // aborted client) — writing again would throw ERR_HTTP_HEADERS_SENT or
+  // ERR_STREAM_DESTROYED (client disconnect destroys the response stream).
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 }
@@ -74,6 +75,9 @@ export async function createWebhookServer(opts: ServerOptions) {
   const server = createServer(async (req, res) => {
     // Bound slow/abandoned connections so idle sockets never hold the server.
     req.setTimeout(30_000, () => {
+      // The response may already be gone (client disconnected) — writing
+      // would throw and crash the process from the timer callback.
+      if (res.headersSent || res.writableEnded || res.destroyed) return;
       res.writeHead(408, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "request timeout" }));
       req.destroy();
