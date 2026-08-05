@@ -359,7 +359,23 @@ export class IntentStore {
   }
 
   deleteById(id: string): void {
-    this.db.prepare("DELETE FROM intents WHERE id = ?").run(id);
+    // `intents.parent_id` has no ON DELETE clause, so deleting an intent that
+    // has dependants fails with a FOREIGN KEY error (e.g. `doctor --fix` on
+    // an orphan that is a parent). Reparent the children to the removed
+    // intent's parent first, keeping the DAG valid.
+    this.db.exec("BEGIN");
+    try {
+      const row = this.db.prepare("SELECT parent_id FROM intents WHERE id = ?").get(id) as
+        | { parent_id: string | null }
+        | undefined;
+      const parent = row?.parent_id ?? null;
+      this.db.prepare("UPDATE intents SET parent_id = ? WHERE parent_id = ?").run(parent, id);
+      this.db.prepare("DELETE FROM intents WHERE id = ?").run(id);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
   }
 }
 

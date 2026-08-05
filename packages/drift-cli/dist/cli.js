@@ -115,6 +115,17 @@ function run(argv) {
         }
         return exit;
     };
+    // Usage errors stay machine-readable under --json so MCP tool calls never
+    // receive plain-text output on stdout.
+    const usageError = (message) => {
+        if (json) {
+            console.log(JSON.stringify({ status: "error", type: "error", message, exitCode: EXIT.ERROR }));
+        }
+        else {
+            console.log(colorize(!noColor, "yellow", message));
+        }
+        return EXIT.ERROR;
+    };
     try {
         switch (command) {
             case "init": {
@@ -135,9 +146,7 @@ function run(argv) {
             case "realize": {
                 const prompt = stringFlag(flags, "prompt");
                 if (!prompt) {
-                    console.log(colorize(!noColor, "yellow", "missing -p \"prompt\" — describe your change"));
-                    console.log(USAGE);
-                    return EXIT.ERROR;
+                    return usageError("missing -p \"prompt\" — describe your change");
                 }
                 const drift = Drift.fromCwd(process.cwd());
                 const result = drift.realize({
@@ -197,8 +206,7 @@ function run(argv) {
             case "blame": {
                 const file = positional[0];
                 if (!file) {
-                    console.log(colorize(!noColor, "yellow", "usage: drift blame <file> --line N | --function NAME"));
-                    return EXIT.ERROR;
+                    return usageError("usage: drift blame <file> --line N | --function NAME");
                 }
                 const drift = Drift.fromCwd(process.cwd());
                 const line = numberFlag(flags, "line");
@@ -230,8 +238,7 @@ function run(argv) {
             case "context": {
                 const file = positional[0];
                 if (!file) {
-                    console.log(colorize(!noColor, "yellow", "usage: drift context <file> [--limit N]"));
-                    return EXIT.ERROR;
+                    return usageError("usage: drift context <file> [--limit N]");
                 }
                 const drift = Drift.fromCwd(process.cwd());
                 const entries = drift.context(file, numberFlag(flags, "limit") ?? 5);
@@ -256,8 +263,7 @@ function run(argv) {
             case "verify": {
                 const id = positional[0];
                 if (!id) {
-                    console.log(colorize(!noColor, "yellow", "usage: drift verify <intent-id>"));
-                    return EXIT.ERROR;
+                    return usageError("usage: drift verify <intent-id>");
                 }
                 const drift = Drift.fromCwd(process.cwd());
                 const result = drift.verify(id);
@@ -290,8 +296,7 @@ function run(argv) {
             case "replay": {
                 const id = positional[0];
                 if (!id) {
-                    console.log(colorize(!noColor, "yellow", "usage: drift replay <intent-id> [--checkout]"));
-                    return EXIT.ERROR;
+                    return usageError("usage: drift replay <intent-id> [--checkout]");
                 }
                 const drift = Drift.fromCwd(process.cwd());
                 const result = drift.replay(id, { checkout: flags.has("checkout") });
@@ -346,8 +351,7 @@ function run(argv) {
             case "verify-intent": {
                 const id = positional[0];
                 if (!id) {
-                    console.log(colorize(!noColor, "yellow", "usage: drift verify-intent <intent-id>"));
-                    return EXIT.ERROR;
+                    return usageError("usage: drift verify-intent <intent-id>");
                 }
                 const drift = Drift.fromCwd(process.cwd());
                 const result = drift.verifyIntentSignature(id);

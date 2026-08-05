@@ -7,11 +7,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
 import { createPublicKey } from "node:crypto";
-import { dirname, join, relative as relPath, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative as relPath, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   computeDelta,
@@ -406,6 +407,13 @@ export class Drift {
   blame(filePath: string, opts: { line?: number; functionName?: string } = {}): BlameResult {
     const file = resolve(this.repoRoot, filePath);
     const relative = relPath(this.repoRoot, file).replace(/\\/g, "/");
+    // The CLI/MCP must never read files outside the repository root — reject
+    // `../` traversal, absolute paths, cross-drive paths, and symlinks that
+    // escape the repo before touching the filesystem (blame previously read
+    // the file first).
+    if (!isInsideRepo(this.repoRoot, file)) {
+      throw new DriftError(`Path escapes the repository root: ${filePath}`);
+    }
     let line = opts.line;
     let functionName: string | undefined;
     if (opts.functionName) {
@@ -469,7 +477,15 @@ export class Drift {
 
   // --------------------------------------------------------------- context
   context(filePath: string, limit = 5): LogEntry[] {
-    return this.store.contextForFile(filePath, limit).map((e) => ({
+    // Same containment rule as blame: file arguments are repo-relative, and
+    // normalising here also makes `./src/a.ts` and absolute in-repo paths
+    // match the stored repo-relative intent paths.
+    const file = resolve(this.repoRoot, filePath);
+    const relative = relPath(this.repoRoot, file).replace(/\\/g, "/");
+    if (!isInsideRepo(this.repoRoot, file)) {
+      throw new DriftError(`Path escapes the repository root: ${filePath}`);
+    }
+    return this.store.contextForFile(relative, limit).map((e) => ({
       ...e,
       prompt: this.decryptText(e.prompt, e.id),
     }));
@@ -655,4 +671,28 @@ export class Drift {
 
 function publicKeyFromPrivate(privateKeyPem: string): string {
   return createPublicKey(privateKeyPem).export({ type: "spki", format: "pem" }).toString();
+}
+
+/**
+ * True when `resolved` (absolute) stays inside `root` (absolute). Lexical
+ * checks alone would be bypassed by a symlink inside the repo pointing
+ * outside, so realpaths are used when the file exists; missing files (e.g.
+ * `context` on a deleted-but-recorded path) fall back to the lexical path.
+ * The repo root itself is allowed (`rel === ""`).
+ */
+function isInsideRepo(root: string, resolved: string): boolean {
+  let rootReal = root;
+  let fileReal = resolved;
+  try {
+    rootReal = realpathSync(root);
+  } catch {
+    // keep lexical
+  }
+  try {
+    fileReal = realpathSync(resolved);
+  } catch {
+    // file may not exist yet — keep lexical
+  }
+  const rel = relPath(rootReal, fileReal).replace(/\\/g, "/");
+  return !isAbsolute(rel) && rel.split("/")[0] !== "..";
 }

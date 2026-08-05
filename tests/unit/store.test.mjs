@@ -59,6 +59,22 @@ test("listIntents: negative and fractional limits are clamped to >= 1", () => {
   }
 });
 
+test("deleteById reparents children instead of failing the foreign key", () => {
+  const { store } = makeStore();
+  try {
+    const parentId = "did_00000000000000000000000000000031";
+    const childId = "did_00000000000000000000000000000032";
+    store.insertIntent(record(parentId, "h".repeat(40)));
+    store.insertIntent({ ...record(childId, "i".repeat(40)), parentId });
+    // deleting a parent that has dependants must not throw (doctor --fix path)
+    assert.doesNotThrow(() => store.deleteById(parentId));
+    const child = store.getById(childId);
+    assert.equal(child.parentId, null);
+  } finally {
+    store.close();
+  }
+});
+
 test("contextForFile: non-finite limit does not crash", () => {
   const { store } = makeStore();
   try {

@@ -146,6 +146,25 @@ test("drift_realize rejects syntax errors", async () => {
   writeFileSync(join(repo, "src", "util.ts"), "export const n = 1;\nexport const answer = () => 42;\n");
 });
 
+test("drift_realize with empty prompt returns a JSON error", async () => {
+  const result = await client.request("tools/call", {
+    name: "drift_realize",
+    arguments: { prompt: "" },
+  });
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.status, "error");
+  assert.ok(data.details.includes("prompt"));
+});
+
+test("drift_verify with unknown intent returns a JSON error", async () => {
+  const result = await client.request("tools/call", {
+    name: "drift_verify",
+    arguments: { intentId: "did_ffffffffffffffffffffffffffffffff" },
+  });
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.status, "error");
+});
+
 test("drift_blame returns originating prompt", async () => {
   const result = await client.request("tools/call", {
     name: "drift_blame",

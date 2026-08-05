@@ -171,6 +171,37 @@ test("E_NO_CHANGES when nothing staged (exit 3)", () => {
   assert.equal(res.status, 3);
 });
 
+test("blame/context reject paths that escape the repository root", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  // real file OUTSIDE the repo (would be read before the fix)
+  const outside = mkdtempSync(join(tmpdir(), "drift-outside-"));
+  writeFileSync(join(outside, "secret.ts"), "export function secretFn() { return 42; }\n");
+  const outsideAbs = join(outside, "secret.ts");
+
+  // relative traversal from the repo root: `../<outside-dir>/secret.ts` (both
+  // live under os.tmpdir(), so the repo's parent is the outside file's parent)
+  const outsideRel = join("..", outside.split(/[\\/]/).pop() ?? "outside", "secret.ts");
+
+  for (const [label, args] of [
+    ["absolute outside path", ["blame", outsideAbs, "--line", "1", "--json"]],
+    ["relative ../ traversal", ["blame", outsideRel, "--line", "1", "--json"]],
+    ["--function on outside file", ["blame", outsideAbs, "--function", "secretFn", "--json"]],
+    ["context outside path", ["context", outsideRel, "--json"]],
+  ]) {
+    const res = run(repo, args);
+    assert.equal(res.status, 1, `${label}: expected exit 1, got ${res.status}: ${res.stderr}`);
+    assert.match(res.stdout + res.stderr, /escapes the repository root/, `${label}: ${res.stdout}${res.stderr}`);
+  }
+
+  // realize with an outside file is rejected by git itself (nothing staged)
+  writeFileSync(join(repo, "src", "auth.ts"), "export const g = 3;\n");
+  const realize = run(repo, ["realize", "-p", "outside ref", outsideAbs, "--json"]);
+  assert.equal(realize.status, 1, realize.stderr);
+  const log = parseJson(run(repo, ["log", "--json"]).stdout);
+  assert.equal(log.intents.length, 0, "no intent must be recorded for a rejected realize");
+});
+
 test("blame reports uncommitted changes", () => {
   const repo = makeRepo();
   run(repo, ["init"]);
