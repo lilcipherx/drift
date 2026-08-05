@@ -100,7 +100,11 @@ functional git repo.
 
 **Security defaults:** every intent is Ed25519-signed; prompts are regex-redacted
 for secrets before any storage; telemetry is off; local operations make no network
-calls.
+calls. **Optional encryption at rest (v0.2.0):** set `[encryption] enabled = true`
+in `.drift/config.toml` + `DRIFT_MASTER_KEY` to AES-256-GCM-encrypt the intent's
+`prompt` and `agentState` (AAD-bound to the intent id). Note: the commit message
+keeps the plaintext prompt by design (PRD §9.1), so git history remains readable
+— see [SECURITY.md](SECURITY.md).
 
 ## Design decisions (ADR)
 

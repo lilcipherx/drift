@@ -12,8 +12,13 @@ export type {
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export type { ExitCode } from "./errors.js";
 export {
+  ENCRYPTION_MARKER,
   canonicalJson,
+  decryptAesGcm,
+  deriveMasterKey,
+  encryptAesGcm,
   generateKeyPair,
+  isEncrypted,
   newIntentId,
   sha256Hex,
   signPayload,

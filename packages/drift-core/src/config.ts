@@ -12,6 +12,7 @@ export interface DriftConfig {
   core: { version: number; default_model: string };
   ast: { parsers: string[]; fallback_to_text_on_error: boolean };
   redaction: { patterns: string[] };
+  encryption: { enabled: boolean; key_provider: string };
   telemetry: { enabled: boolean };
 }
 
@@ -31,6 +32,7 @@ export const DEFAULT_CONFIG: DriftConfig = {
       "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
     ],
   },
+  encryption: { enabled: false, key_provider: "env:DRIFT_MASTER_KEY" },
   telemetry: { enabled: false },
 };
 
@@ -55,6 +57,10 @@ patterns = [
   "sk_live_[A-Za-z0-9]{24,}",
   "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
 ]
+
+[encryption]
+enabled = false
+key_provider = "env:DRIFT_MASTER_KEY"
 
 [telemetry]
 enabled = false
@@ -120,6 +126,12 @@ export function loadConfig(driftDir: string): DriftConfig {
     const red = parsed["redaction"];
     if (red && Array.isArray(red.patterns)) {
       config.redaction.patterns = red.patterns as string[];
+    }
+    const enc = parsed["encryption"];
+    if (enc) {
+      if (typeof enc.enabled === "boolean") config.encryption.enabled = enc.enabled;
+      if (typeof enc.key_provider === "string")
+        config.encryption.key_provider = enc.key_provider;
     }
     const tel = parsed["telemetry"];
     if (tel && typeof tel.enabled === "boolean")

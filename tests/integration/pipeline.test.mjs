@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -192,6 +192,113 @@ test("redaction: secrets in prompts never hit git history", () => {
   const log = parseJson(run(repo, ["log", "--json"]).stdout);
   assert.ok(!log.intents[0].prompt.includes("sk-abc123"));
   assert.ok(log.intents[0].prompt.includes("[REDACTED]"));
+});
+
+test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY without key", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  // enable encryption-at-rest in the repo config
+  const configPath = join(repo, ".drift", "config.toml");
+  writeFileSync(
+    configPath,
+    readFileSync(configPath, "utf8") +
+      "\n[encryption]\nenabled = true\nkey_provider = \"env:DRIFT_MASTER_KEY\"\n",
+  );
+  const MASTER_KEY = "ab".repeat(32); // 64-hex
+  const env = { DRIFT_MASTER_KEY: MASTER_KEY };
+
+  // realize with the key — must succeed
+  writeFileSync(join(repo, "src", "auth.ts"), "export const encrypted = () => 1;\n");
+  const state = Buffer.from(JSON.stringify({ step: 1, goal: "top secret" })).toString("base64");
+  const realize = run(
+    repo,
+    ["realize", "-p", "super secret prompt: rotate the token", "--agent", "--state", state, "--json"],
+    env,
+  );
+  assert.equal(realize.status, 0, realize.stderr);
+  const out = parseJson(realize.stdout);
+
+  // at rest: every object file is encrypted, plaintext prompt nowhere on disk
+  const objectsDir = join(repo, ".drift", "objects");
+  const allFiles = readdirSync(objectsDir, { recursive: true }).map(String).filter((f) => f.endsWith(".json"));
+  assert.ok(allFiles.length >= 1);
+  for (const f of allFiles) {
+    const content = readFileSync(join(objectsDir, f), "utf8");
+    assert.ok(content.includes("encv1:"), `object ${f} should be encrypted`);
+    assert.ok(!content.includes("super secret prompt"), `plaintext prompt leaked into ${f}`);
+    assert.ok(!content.includes("top secret"), `plaintext state leaked into ${f}`);
+  }
+
+  // read paths decrypt with the key
+  const log = parseJson(run(repo, ["log", "--json"], env).stdout);
+  assert.equal(log.intents[0].prompt, "super secret prompt: rotate the token");
+
+  const blame = parseJson(
+    run(repo, ["blame", "src/auth.ts", "--function", "encrypted", "--json"], env).stdout,
+  );
+  assert.equal(blame.intent.prompt, "super secret prompt: rotate the token");
+  assert.equal(blame.intent.signatureValid, true);
+
+  const replay = parseJson(run(repo, ["replay", out.intentId, "--json"], env).stdout);
+  assert.equal(replay.agentState, state);
+
+  // doctor reports the key check
+  const doctor = parseJson(run(repo, ["doctor", "--json"], env).stdout);
+  const encCheck = doctor.checks.find((c) => c.name === "encryption-key");
+  assert.ok(encCheck, "doctor should report encryption-key check");
+  assert.equal(encCheck.ok, true);
+
+  // without the key: realize → E_KEY (exit 4); replay → E_KEY (exit 4)
+  const NO_KEY = { DRIFT_MASTER_KEY: "" }; // explicitly unset (run() merges process.env)
+  writeFileSync(join(repo, "src", "auth.ts"), "export const encrypted2 = () => 2;\n");
+  const noKeyRealize = run(repo, ["realize", "-p", "no key here", "--json"], NO_KEY);
+  assert.equal(noKeyRealize.status, 4, noKeyRealize.stderr);
+  const noKeyReplay = run(repo, ["replay", out.intentId, "--json"], NO_KEY);
+  assert.equal(noKeyReplay.status, 4, noKeyReplay.stderr);
+
+  // read paths degrade gracefully without a key: prompt placeholder, exit 0
+  const noKeyLog = parseJson(run(repo, ["log", "--json"], NO_KEY).stdout);
+  assert.equal(noKeyLog.status, "ok");
+  assert.equal(noKeyLog.intents[0].prompt, "[encrypted]");
+
+  // doctor reports the missing key
+  const noKeyDoctor = parseJson(run(repo, ["doctor", "--json"], NO_KEY).stdout);
+  assert.equal(noKeyDoctor.checks.find((c) => c.name === "encryption-key").ok, false);
+
+  // wrong key: replay fails with the decrypt error (still exit 4)
+  const wrongKeyReplay = run(repo, ["replay", out.intentId, "--json"], { DRIFT_MASTER_KEY: "cd".repeat(32) });
+  assert.equal(wrongKeyReplay.status, 4, wrongKeyReplay.stderr);
+  assert.ok(wrongKeyReplay.stderr.includes("Failed to decrypt"));
+});
+
+test("encryption: legacy plaintext intents pass through untouched (backward compat)", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]); // encryption stays disabled (default)
+  writeFileSync(join(repo, "src", "auth.ts"), "export const legacy = () => 0;\n");
+  run(repo, ["realize", "-p", "legacy plaintext prompt", "--json"]);
+
+  // enable encryption afterwards
+  const configPath = join(repo, ".drift", "config.toml");
+  writeFileSync(
+    configPath,
+    readFileSync(configPath, "utf8") + "\n[encryption]\nenabled = true\n",
+  );
+  const env = { DRIFT_MASTER_KEY: "ab".repeat(32) };
+
+  // new intent is encrypted; old one still readable as plaintext (no key needed for it)
+  writeFileSync(join(repo, "src", "auth.ts"), "export const legacy = () => 0;\nexport const fresh = () => 1;\n");
+  run(repo, ["realize", "-p", "new encrypted prompt", "--json"], env);
+
+  const log = parseJson(run(repo, ["log", "--json"], env).stdout);
+  assert.equal(log.intents.length, 2);
+  const prompts = log.intents.map((i) => i.prompt);
+  assert.ok(prompts.includes("legacy plaintext prompt"));
+  assert.ok(prompts.includes("new encrypted prompt"));
+
+  const noKeyLog = parseJson(run(repo, ["log", "--json"], { DRIFT_MASTER_KEY: "" }).stdout);
+  const byPrompt = Object.fromEntries(noKeyLog.intents.map((i) => [i.prompt, i.id]));
+  assert.ok(byPrompt["legacy plaintext prompt"], "legacy prompt must stay visible without a key");
+  assert.ok(byPrompt["[encrypted]"], "new prompt must degrade to placeholder without a key");
 });
 
 test("deleted files produce a DELETED intent delta", () => {

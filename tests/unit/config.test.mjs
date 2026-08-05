@@ -30,7 +30,17 @@ test("loadConfig defaults when no file", () => {
   const cfg = loadConfig(dir);
   assert.equal(cfg.core.version, 1);
   assert.equal(cfg.telemetry.enabled, false);
+  assert.equal(cfg.encryption.enabled, false);
+  assert.equal(cfg.encryption.key_provider, "env:DRIFT_MASTER_KEY");
   assert.ok(cfg.redaction.patterns.length > 0);
+});
+
+test("loadConfig merges [encryption] section", () => {
+  const dir = mkdtempSync(join(tmpdir(), "drift-config-"));
+  writeFileSync(join(dir, "config.toml"), "[encryption]\nenabled = true\nkey_provider = \"env:DRIFT_MASTER_KEY\"\n");
+  const cfg = loadConfig(dir);
+  assert.equal(cfg.encryption.enabled, true);
+  assert.equal(cfg.encryption.key_provider, "env:DRIFT_MASTER_KEY");
 });
 
 test("loadConfig merges file over defaults", () => {

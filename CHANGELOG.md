@@ -2,6 +2,20 @@
 
 All notable changes are tracked here (git-cliff style, kept manually for v0.1.0).
 
+## [Unreleased] — v0.2.0 (encryption at rest)
+
+### Added
+- **AES-256-GCM encryption at rest** (PRD §7.4, §17.1–17.2): when
+  `[encryption] enabled = true` in `.drift/config.toml`, the intent's `prompt`
+  and `agentState` are encrypted before storage (marker `encv1:`). Key comes
+  from `DRIFT_MASTER_KEY` (64-hex verbatim, otherwise SHA-256 passphrase).
+- `E_KEY` (exit 4) when encryption is enabled but the key is missing, and when
+  replaying encrypted state without it.
+- `drift doctor` gains an `encryption-key` check when encryption is on.
+- Backward compatible: legacy plaintext intents pass through untouched; the
+  Ed25519 signature covers the stored (encrypted) canonical form, so signature
+  verification never needs the master key.
+
 ## [0.1.0] — 2026-08-05
 
 ### Added

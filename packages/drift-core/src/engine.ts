@@ -24,7 +24,18 @@ import {
   type ASTDelta,
   type SymbolInfo,
 } from "@drift/ast";
-import { canonicalJson, generateKeyPair, newIntentId, sha256Hex, signPayload, verifyPayload } from "./crypto.js";
+import {
+  canonicalJson,
+  decryptAesGcm,
+  deriveMasterKey,
+  encryptAesGcm,
+  generateKeyPair,
+  isEncrypted,
+  newIntentId,
+  sha256Hex,
+  signPayload,
+  verifyPayload,
+} from "./crypto.js";
 import { CONFIG_TEMPLATE, loadConfig, type DriftConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
 import {
@@ -125,6 +136,42 @@ export class Drift {
     const keys = this.loadKeys();
     this.privateKeyPem = keys.privateKeyPem;
     this.publicKeyPem = keys.publicKeyPem;
+  }
+
+  // ---------------------------------------------------------- encryption
+  /** DRIFT_MASTER_KEY → 32-byte AES key, or null when not set (PRD §17.2). */
+  private getMasterKey(): Buffer | null {
+    const secret = process.env.DRIFT_MASTER_KEY;
+    return secret ? deriveMasterKey(secret) : null;
+  }
+
+  /** Throw E_KEY (exit 4) when encryption is enabled but the key is missing. */
+  private masterKeyOrThrow(): Buffer {
+    const key = this.getMasterKey();
+    if (!key) {
+      throw new DriftError(
+        "Encryption is enabled in .drift/config.toml but DRIFT_MASTER_KEY is not set. Set the environment variable or disable encryption.",
+        EXIT.KEY,
+      );
+    }
+    return key;
+  }
+
+  /**
+   * Decrypt a stored value when it is an encrypted payload (AAD-bound to the
+   * intent id). Legacy plaintext passes through untouched. Without a key:
+   * readable fields degrade to a placeholder; `replay`/`verify` fail hard
+   * with E_KEY instead.
+   */
+  private decryptText(value: string, aad?: string): string {
+    if (!isEncrypted(value)) return value; // legacy plaintext (v0.1.0)
+    const key = this.getMasterKey();
+    if (!key) return "[encrypted]";
+    try {
+      return decryptAesGcm(value, key, aad);
+    } catch {
+      return "[encrypted:invalid-key-or-corrupt]";
+    }
   }
 
   // ------------------------------------------------------------------ setup
@@ -284,13 +331,23 @@ export class Drift {
       model: opts.model,
     };
 
+    // v0.2.0 encryption at rest: when enabled, the intent's prompt and agent
+    // state are AES-256-GCM encrypted (AAD-bound to the intent id) before they
+    // are stored. The git commit message keeps the plaintext prompt so history
+    // stays readable; the signature covers the stored (encrypted) canonical
+    // form, so verification never requires the master key.
+    const encKey = this.config.encryption.enabled ? this.masterKeyOrThrow() : null;
+    const storedPrompt = encKey ? encryptAesGcm(safePrompt, encKey, id) : safePrompt;
+    const storedState =
+      encKey && safeState !== undefined ? encryptAesGcm(safeState, encKey, id) : safeState;
+
     const intentBase = {
       id,
       parentId: headId,
       author,
-      prompt: safePrompt,
+      prompt: storedPrompt,
       astDelta: deltas,
-      agentState: safeState,
+      agentState: storedState,
       verifyCmd: opts.verifyCmd,
       timestamp,
     };
@@ -339,7 +396,10 @@ export class Drift {
 
   // -------------------------------------------------------------------- log
   log(filters: { author?: string; model?: string; file?: string; limit?: number } = {}): LogEntry[] {
-    return this.store.listIntents(filters);
+    return this.store.listIntents(filters).map((e) => ({
+      ...e,
+      prompt: this.decryptText(e.prompt, e.id),
+    }));
   }
 
   // ------------------------------------------------------------------ blame
@@ -391,6 +451,7 @@ export class Drift {
         const signature = (obj?.signature as string | undefined) ?? record.signature;
         intent = {
           ...record,
+          prompt: this.decryptText(record.prompt, record.id),
           signatureValid: signature ? verifyPayload(canonical, this.publicKeyPem, signature) : false,
         };
       }
@@ -408,7 +469,10 @@ export class Drift {
 
   // --------------------------------------------------------------- context
   context(filePath: string, limit = 5): LogEntry[] {
-    return this.store.contextForFile(filePath, limit);
+    return this.store.contextForFile(filePath, limit).map((e) => ({
+      ...e,
+      prompt: this.decryptText(e.prompt, e.id),
+    }));
   }
 
   // ---------------------------------------------------------------- verify
@@ -444,10 +508,28 @@ export class Drift {
     if (opts.checkout) {
       checkout(this.repoRoot, intent.gitCommitSha);
     }
+    let agentState = intent.agentState ?? null;
+    if (agentState && isEncrypted(agentState)) {
+      const key = this.getMasterKey();
+      if (!key) {
+        throw new DriftError(
+          "Intent state is encrypted (v0.2.0). Set DRIFT_MASTER_KEY to replay it.",
+          EXIT.KEY,
+        );
+      }
+      try {
+        agentState = decryptAesGcm(agentState, key, intent.id);
+      } catch (err) {
+        throw new DriftError(
+          `Failed to decrypt agent state: ${err instanceof Error ? err.message : String(err)}`,
+          EXIT.KEY,
+        );
+      }
+    }
     return {
       intentId,
       gitSha: intent.gitCommitSha,
-      agentState: intent.agentState ?? null,
+      agentState,
       checkedOut: Boolean(opts.checkout),
     };
   }
@@ -474,6 +556,17 @@ export class Drift {
       ok: storedPub === this.publicKey.trim(),
       detail: storedPub === this.publicKey.trim() ? "key matches DAG header" : "key mismatch",
     });
+
+    if (this.config.encryption.enabled) {
+      const keyPresent = Boolean(process.env.DRIFT_MASTER_KEY);
+      checks.push({
+        name: "encryption-key",
+        ok: keyPresent,
+        detail: keyPresent
+          ? `DRIFT_MASTER_KEY configured (provider: ${this.config.encryption.key_provider})`
+          : `DRIFT_MASTER_KEY missing (provider: ${this.config.encryption.key_provider})`,
+      });
+    }
 
     // orphan intents: row present but git commit gone
     for (const row of this.store.allRows()) {
@@ -531,7 +624,7 @@ export class Drift {
         authorType: e.authorType,
         authorId: e.authorId,
         model: e.model,
-        prompt: e.prompt,
+        prompt: this.decryptText(e.prompt, e.id),
         timestamp: new Date(e.timestamp).toISOString(),
         files: e.files,
       }));
