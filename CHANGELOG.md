@@ -4,6 +4,8 @@ All notable changes are tracked here (git-cliff style, kept manually).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-05
+
 ### Changed
 - README rewritten: Quickstart, How it works, per-harness Installation, The
   Basic Workflow, What's Inside, Philosophy, Security, Contributing, Updating,
