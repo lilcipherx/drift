@@ -54,153 +54,180 @@ And because these are MCP tools, your coding agent can use them directly —
 
 Installation differs by harness. If you use more than one, install Drift
 separately for each one. All harnesses talk to the same MCP server
-(`@drift/mcp`). Most read the same `mcpServers` block:
+(`@drift/mcp`) and expose the same six tools: `drift_realize`, `drift_context`,
+`drift_replay`, `drift_blame`, `drift_verify`, `drift_log`.
+
+One-time build, from this repository:
+
+```bash
+git clone https://github.com/lilcipherx/drift.git && cd drift
+npm install && npm run build
+```
+
+Then pick your harness below.
+
+### Claude Code
+
+Install the server in one command:
+
+```bash
+claude mcp add drift \
+  --env DRIFT_REPO=/abs/path/to/your/repo \
+  -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+```
+
+Or use the project config file instead:
+[`examples/harness-configs/claude-code/.mcp.json`](examples/harness-configs/claude-code/.mcp.json)
+
+Verify: `claude mcp list` shows `drift`.
+
+### Antigravity
+
+No CLI — add the server in Antigravity's settings:
+
+```text
+Settings → MCP servers → add local server:
+  Name:    drift
+  Command: node
+  Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
+  Env:     DRIFT_REPO=/abs/path/to/your/repo
+```
+
+Step-by-step: [`examples/harness-configs/antigravity/`](examples/harness-configs/antigravity/)
+
+### Codex App
+
+In the Codex app, open **Settings → MCP servers** (Plugins section) and add a
+local server:
+
+```text
+Name:    drift
+Command: node
+Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
+Env:     DRIFT_REPO=/abs/path/to/your/repo
+```
+
+Step-by-step: [`examples/harness-configs/codex-app/`](examples/harness-configs/codex-app/)
+
+### Codex CLI
+
+Add the server to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.drift]
+command = "node"
+args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
+env = { DRIFT_REPO = "/abs/path/to/your/repo" }
+```
+
+Ready-made file: [`examples/harness-configs/codex-cli/config.toml`](examples/harness-configs/codex-cli/config.toml)
+
+Restart Codex; the six `drift_*` tools appear in the tool list.
+
+### Cursor
+
+Drop the config into `.cursor/mcp.json`:
+
+```bash
+cp examples/harness-configs/cursor/mcp.json .cursor/mcp.json
+```
+
+Then enable it: **Cursor Settings → MCP → `drift` → Enable**.
+
+### Factory Droid
+
+Add the server in Droid's MCP settings:
+
+```text
+Name:    drift
+Command: node
+Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
+Env:     DRIFT_REPO=/abs/path/to/your/repo
+```
+
+Step-by-step: [`examples/harness-configs/factory-droid/`](examples/harness-configs/factory-droid/)
+
+### Gemini CLI
+
+Add the `mcpServers` block to `.gemini/settings.json` (project) or
+`~/.gemini/settings.json` (global):
+
+```bash
+cp examples/harness-configs/gemini-cli/settings.json .gemini/settings.json
+```
+
+Then, in a session: `/mcp list` to confirm, `/mcp reload` after edits.
+
+### GitHub Copilot CLI
+
+Install the server in one command:
+
+```bash
+copilot mcp add drift \
+  -e DRIFT_REPO=/abs/path/to/your/repo \
+  -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+```
+
+Or use the repo config file:
+[`examples/harness-configs/github-copilot-cli/mcp.json`](examples/harness-configs/github-copilot-cli/mcp.json) → `.github/mcp.json`
+
+### Kimi Code
+
+Add the server in Kimi Code's MCP settings:
+
+```text
+Name:    drift
+Command: node
+Args:    /abs/path/to/drift/packages/drift-mcp/dist/index.js
+Env:     DRIFT_REPO=/abs/path/to/your/repo
+```
+
+Step-by-step: [`examples/harness-configs/kimi-code/`](examples/harness-configs/kimi-code/)
+
+### OpenCode
+
+OpenCode uses its own config shape (note `environment`, not `env`). Add to
+`opencode.json`:
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "drift": {
-      "command": "node",
-      "args": ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
-      "env": { "DRIFT_REPO": "/abs/path/to/your/repo" }
+      "type": "local",
+      "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
+      "environment": { "DRIFT_REPO": "/abs/path/to/your/repo" },
+      "enabled": true
     }
   }
 }
 ```
 
-Where a harness uses a different shape (TOML, OpenCode's `environment`), the
-difference is shown in that section. In every case: `DRIFT_REPO` points at the
-repository Drift should operate on, and the agent gets the six `drift_*` tools.
-
-### Claude Code
-
-- Register the server with the CLI (or drop the `mcpServers` block into your
-  project's `.mcp.json`):
-
-  ```bash
-  # one-time build, from this repository
-  git clone https://github.com/lilcipherx/drift.git && cd drift
-  npm install && npm run build
-
-  claude mcp add drift \
-    --env DRIFT_REPO=/abs/path/to/your/repo \
-    -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
-  ```
-
-- Ready-made example: [`examples/harness-configs/claude-code/.mcp.json`](examples/harness-configs/claude-code/.mcp.json)
-- Verify: `claude mcp list` shows `drift`.
-
-### Antigravity
-
-- Open **Settings → MCP servers** in Antigravity and add a local server:
-  - **Command:** `node`
-  - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
-  - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
-- Step-by-step: [`examples/harness-configs/antigravity/`](examples/harness-configs/antigravity/)
-- Antigravity runs the server at session start, so Drift is active from the first
-  message. Reinstall by pulling and rebuilding this repo.
-
-### Codex App
-
-- In the Codex app, open the MCP servers settings (Plugins section) and add a
-  local server (step-by-step: [`examples/harness-configs/codex-app/`](examples/harness-configs/codex-app/)):
-  - **Command:** `node`
-  - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
-  - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
-
-### Codex CLI
-
-- Add the server to `~/.codex/config.toml`:
-
-  ```toml
-  [mcp_servers.drift]
-  command = "node"
-  args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
-  env = { DRIFT_REPO = "/abs/path/to/your/repo" }
-  ```
-
-- Ready-made file: [`examples/harness-configs/codex-cli/config.toml`](examples/harness-configs/codex-cli/config.toml)
-- Restart Codex; the six `drift_*` tools appear in the tool list.
-
-### Cursor
-
-- Add the `mcpServers` block to `.cursor/mcp.json` in your project.
-- Ready-made file: [`examples/harness-configs/cursor/mcp.json`](examples/harness-configs/cursor/mcp.json)
-- Enable it: **Cursor Settings → MCP → `drift` → Enable**.
-
-### Factory Droid
-
-- Open Droid's MCP server settings (or its `mcp_servers` config) and add a local
-  server pointing at `node /abs/path/to/drift/packages/drift-mcp/dist/index.js`
-  with `DRIFT_REPO` set to your repository (step-by-step:
-  [`examples/harness-configs/factory-droid/`](examples/harness-configs/factory-droid/)).
-
-### Gemini CLI
-
-- Add the `mcpServers` block to `.gemini/settings.json` (project) or
-  `~/.gemini/settings.json` (global).
-- Ready-made file: [`examples/harness-configs/gemini-cli/settings.json`](examples/harness-configs/gemini-cli/settings.json)
-- In a session, run `/mcp list` to confirm the connection, `/mcp reload` after
-  editing the file.
-
-### GitHub Copilot CLI
-
-- Register with the CLI (or add the block to `.github/mcp.json`):
-
-  ```bash
-  copilot mcp add drift \
-    -e DRIFT_REPO=/abs/path/to/your/repo \
-    -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
-  ```
-
-- Or use the ready-made [`examples/harness-configs/github-copilot-cli/mcp.json`](examples/harness-configs/github-copilot-cli/mcp.json)
-  (`.github/mcp.json`).
-
-### Kimi Code
-
-- Open Kimi Code's MCP settings and add a local server with the `mcpServers`
-  block from the top of this section (step-by-step:
-  [`examples/harness-configs/kimi-code/`](examples/harness-configs/kimi-code/)).
-
-### OpenCode
-
-- OpenCode uses its own config shape (note `environment`, not `env`). Add to
-  `opencode.json`:
-
-  ```json
-  {
-    "$schema": "https://opencode.ai/config.json",
-    "mcp": {
-      "drift": {
-        "type": "local",
-        "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
-        "environment": { "DRIFT_REPO": "/abs/path/to/your/repo" },
-        "enabled": true
-      }
-    }
-  }
-  ```
-
-- Ready-made file: [`examples/harness-configs/opencode/opencode.json`](examples/harness-configs/opencode/opencode.json)
-- Verify with `opencode mcp list`.
+Ready-made file: [`examples/harness-configs/opencode/opencode.json`](examples/harness-configs/opencode/opencode.json)
+Verify with `opencode mcp list`.
 
 ### Pi
 
-- Install the Pi MCP adapter, then set up inside a session:
+Install the Pi MCP adapter, then set up inside a session:
 
-  ```bash
-  pi install npm:pi-mcp-adapter
-  # inside a pi session:
-  /mcp setup
-  ```
+```bash
+pi install npm:pi-mcp-adapter
+# inside a pi session:
+/mcp setup
+```
 
-- Ready-made file: [`examples/harness-configs/pi/mcp.json`](examples/harness-configs/pi/mcp.json)
-- Or drop the `mcpServers` block into `.mcp.json` / `~/.pi/agent/mcp.json`.
+Or drop the `mcpServers` block into `.mcp.json` / `~/.pi/agent/mcp.json`:
+[`examples/harness-configs/pi/mcp.json`](examples/harness-configs/pi/mcp.json)
 
 ### VS Code
 
-- Add the `mcpServers` block to `.vscode/mcp.json` (native VS Code MCP support).
-  VS Code picks it up on window reload.
+Add the `mcpServers` block to `.vscode/mcp.json` (native VS Code MCP support):
+
+```bash
+cp examples/harness-configs/claude-code/.mcp.json .vscode/mcp.json
+```
+
+VS Code picks it up on window reload.
 
 ### CLI
 
