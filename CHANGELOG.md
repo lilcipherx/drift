@@ -53,6 +53,10 @@ All notable changes are tracked here (git-cliff style, kept manually).
   deps. `.gitignore` now un-ignores `packages/*/dist`; install instructions
   updated accordingly (`npm install` only).
 
+### Removed
+- Removed GitHub Actions from the repository: `.github/workflows/ci.yml` and
+  `release.yml` deleted, all workflow runs deleted — no CI, no failing checks.
+
 ## [0.2.1] — 2026-08-05
 
 ### Changed
