@@ -64,9 +64,11 @@ Every command accepts `--json` for machine-readable output and `--no-color`
 
 ### JSON output
 
-Successful commands print `{ "status": "ok", ... }` to **stdout**; errors print
-`{ "status": "error", "type", "message", "exitCode" }` to **stderr** (under
-`--json`). Example:
+Successful commands print `{ "status": "ok", ... }` to **stdout**; errors
+print `{ "status": "error", "type", "message", "exitCode" }` as JSON (under
+`--json`). Usage errors (missing/unknown args, unknown command) go to
+**stdout**; runtime errors (bad intent id, path escapes, syntax gate, …) go
+to **stderr** — consumers should merge both streams before parsing. Example:
 
 ```bash
 drift realize -p "Add login flow" --agent --model claude-3-5-sonnet --json
