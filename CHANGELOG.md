@@ -1,8 +1,10 @@
 # Changelog
 
-All notable changes are tracked here (git-cliff style, kept manually for v0.1.0).
+All notable changes are tracked here (git-cliff style, kept manually).
 
-## [Unreleased] — v0.2.0 (encryption at rest + GitHub App)
+## [Unreleased]
+
+## [0.2.0] — 2026-08-05
 
 ### Added
 - **`@drift/app` GitHub App** (PRD §16): `pull_request` webhook handler that
