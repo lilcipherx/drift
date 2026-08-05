@@ -264,6 +264,50 @@ test("symlink/junction pointing outside the repo is rejected by blame/context", 
   }
 });
 
+test("fuzz: special chars in paths/prompts and unknown-command stay machine-readable", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+
+  // --- prompts with special characters roundtrip (engine trims by design) ---
+  const prompts = [
+    "with $(sub) ${braces} and `backticks`",
+    "unicode Привет 中文 🚀😀 café",
+    "line one\nline two\nline three",
+    "tab\tseparated",
+  ];
+  for (let i = 0; i < prompts.length; i++) {
+    const prompt = prompts[i];
+    writeFileSync(join(repo, "src", `fuzz${i}.ts`), "export const f = 1;\n");
+    const realize = run(repo, ["realize", "-p", prompt, "--json"]);
+    assert.equal(realize.status, 0, realize.stderr);
+    assert.ok(JSON.parse(realize.stdout).intentId);
+    const log = parseJson(run(repo, ["log", "--limit", "1", "--json"]).stdout);
+    assert.equal(log.intents[0].prompt, prompt.trim());
+  }
+
+  // --- special file names: blame/context/log --file work ---
+  const weird = join(repo, "src", "weird name $(x) 🚀 unicode.ts");
+  writeFileSync(weird, "export function weirdFn() { return 1; }\n");
+  const rel = "src/weird name $(x) 🚀 unicode.ts";
+  assert.equal(run(repo, ["realize", "-p", "add weird file", "--json"]).status, 0);
+  const blame = parseJson(
+    run(repo, ["blame", rel, "--function", "weirdFn", "--json"]).stdout,
+  );
+  assert.equal(blame.intent.prompt, "add weird file");
+  const ctx = parseJson(run(repo, ["context", rel, "--json"]).stdout);
+  assert.equal(ctx.intents.length, 1);
+  const logF = parseJson(run(repo, ["log", "--file", rel, "--json"]).stdout);
+  assert.equal(logF.intents.length, 1);
+
+  // --- unknown command under --json: JSON error on stdout, not plain text ---
+  const unknown = run(repo, ["frobnicate", "--json"]);
+  assert.equal(unknown.status, 1);
+  const parsed = parseJson(unknown.stdout);
+  assert.equal(parsed.status, "error");
+  assert.match(parsed.message, /unknown command/);
+  assert.ok(!unknown.stdout.includes("Usage:"), "usage text must not leak into JSON stdout");
+});
+
 test("blame reports uncommitted changes", () => {
   const repo = makeRepo();
   run(repo, ["init"]);

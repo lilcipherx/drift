@@ -385,8 +385,19 @@ function run(argv: string[]): number {
       }
 
       default:
-        console.log(colorize(!noColor, "red", `unknown command: ${command}`));
-        console.log(USAGE);
+        if (json) {
+          console.log(
+            JSON.stringify({
+              status: "error",
+              type: "error",
+              message: `unknown command: ${command}`,
+              exitCode: EXIT.ERROR,
+            }),
+          );
+        } else {
+          console.log(colorize(!noColor, "red", `unknown command: ${command}`));
+          console.log(USAGE);
+        }
         return EXIT.ERROR;
     }
   } catch (err) {
