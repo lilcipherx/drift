@@ -11,6 +11,11 @@ All notable changes are tracked here (git-cliff style, kept manually).
 - README Quickstart now lists agent harnesses as anchor links (Claude Code,
   Cursor, Codex, Cline, Windsurf, VS Code / Copilot), each jumping to its own
   installation subsection with concrete MCP setup steps.
+- Quickstart expanded to the full harness list — Claude Code, Antigravity,
+  Codex App, Codex CLI, Cursor, Factory Droid, Gemini CLI, GitHub Copilot CLI,
+  Kimi Code, OpenCode, Pi — each with its own installation subsection
+  (per-harness MCP config shapes: TOML for Codex CLI, `environment` for
+  OpenCode, `copilot mcp add` for Copilot CLI, `pi-mcp-adapter` for Pi, …).
 
 ## [0.2.1] — 2026-08-05
 

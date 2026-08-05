@@ -18,12 +18,15 @@ the originating prompt, and lets a crashed agent resume from its last checkpoint
 
 ## Quickstart
 
-Give your coding agent Drift: [Claude Code](#claude-code),
-[Cursor](#cursor), [Codex](#codex), [Cline](#cline), [Windsurf](#windsurf),
-[VS Code / Copilot](#vs-code--copilot). Prefer no agent? Use the
-[CLI](#cli), the [GitHub App](#github-app), or the [GitHub Action](#github-action).
+Give your agent Drift: [Claude Code](#claude-code), [Antigravity](#antigravity),
+[Codex App](#codex-app), [Codex CLI](#codex-cli), [Cursor](#cursor),
+[Factory Droid](#factory-droid), [Gemini CLI](#gemini-cli),
+[GitHub Copilot CLI](#github-copilot-cli), [Kimi Code](#kimi-code),
+[OpenCode](#opencode), [Pi](#pi).
 
-Want the 5-minute "aha" first? Seed the [demo repo](#demo) and run `drift blame`.
+Prefer no agent? Use the [CLI](#cli), the [GitHub App](#github-app), the
+[GitHub Action](#github-action), or [VS Code](#vs-code). Want the 5-minute "aha"
+first? Seed the [demo repo](#demo) and run `drift blame`.
 
 ## How it works
 
@@ -51,7 +54,7 @@ And because these are MCP tools, your coding agent can use them directly —
 
 Installation differs by harness. If you use more than one, install Drift
 separately for each one. All harnesses talk to the same MCP server
-(`@drift/mcp`) with the same `mcpServers` block:
+(`@drift/mcp`). Most read the same `mcpServers` block:
 
 ```json
 {
@@ -64,6 +67,10 @@ separately for each one. All harnesses talk to the same MCP server
   }
 }
 ```
+
+Where a harness uses a different shape (TOML, OpenCode's `environment`), the
+difference is shown in that section. In every case: `DRIFT_REPO` points at the
+repository Drift should operate on, and the agent gets the six `drift_*` tools.
 
 ### Claude Code
 
@@ -81,19 +88,28 @@ separately for each one. All harnesses talk to the same MCP server
   ```
 
 - Ready-made example: [`examples/claude-code-integration/mcp.json`](examples/claude-code-integration/mcp.json)
-- Verify: `claude mcp list` shows `drift`. Your agent then calls
-  `drift_realize` instead of `git commit`.
+- Verify: `claude mcp list` shows `drift`.
 
-### Cursor
+### Antigravity
 
-- Add the same `mcpServers` block to `.cursor/mcp.json` in your project.
-- Enable it: **Cursor Settings → MCP → `drift` → Enable**.
-- Agent calls: `drift_realize`, `drift_context`, `drift_blame`, `drift_verify`,
-  `drift_replay`, `drift_log`.
+- Open **Settings → MCP servers** in Antigravity and add a local server:
+  - **Command:** `node`
+  - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
+  - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
+- Antigravity runs the server at session start, so Drift is active from the first
+  message. Reinstall by pulling and rebuilding this repo.
 
-### Codex
+### Codex App
 
-- Add the block to your Codex config (`~/.codex/config.toml`):
+- In the Codex app, open the MCP servers settings (Plugins section) and add a
+  local server:
+  - **Command:** `node`
+  - **Args:** `/abs/path/to/drift/packages/drift-mcp/dist/index.js`
+  - **Env:** `DRIFT_REPO=/abs/path/to/your/repo`
+
+### Codex CLI
+
+- Add the server to `~/.codex/config.toml`:
 
   ```toml
   [mcp_servers.drift]
@@ -104,20 +120,80 @@ separately for each one. All harnesses talk to the same MCP server
 
 - Restart Codex; the six `drift_*` tools appear in the tool list.
 
-### Cline
+### Cursor
 
-- Add the block to `cline_mcp_settings.json` (VS Code extension settings).
-- Set `DRIFT_REPO` to the repository you work in, approve the server, done.
+- Add the `mcpServers` block to `.cursor/mcp.json` in your project.
+- Enable it: **Cursor Settings → MCP → `drift` → Enable**.
 
-### Windsurf
+### Factory Droid
 
-- Add the block to `.codeium/windsurf/mcp_config.json`.
-- Restart Windsurf and enable the `drift` server in the MCP panel.
+- Open Droid's MCP server settings (or its `mcp_servers` config) and add a local
+  server pointing at `node /abs/path/to/drift/packages/drift-mcp/dist/index.js`
+  with `DRIFT_REPO` set to your repository.
 
-### VS Code / Copilot
+### Gemini CLI
 
-- Add the block to `.vscode/mcp.json` (native VS Code MCP support) or the
-  Copilot MCP config. VS Code picks it up on reload.
+- Add the `mcpServers` block to `.gemini/settings.json` (project) or
+  `~/.gemini/settings.json` (global).
+- In a session, run `/mcp list` to confirm the connection, `/mcp reload` after
+  editing the file.
+
+### GitHub Copilot CLI
+
+- Register with the CLI (or add the block to `.github/mcp.json`):
+
+  ```bash
+  copilot mcp add drift \
+    -e DRIFT_REPO=/abs/path/to/your/repo \
+    -- node /abs/path/to/drift/packages/drift-mcp/dist/index.js
+  ```
+
+- Or `.github/mcp.json` with `{ "mcpServers": { "drift": { "type": "local",
+  "command": "node", "args": ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
+  "env": { "DRIFT_REPO": "/abs/path/to/your/repo" } } } }`.
+
+### Kimi Code
+
+- Open Kimi Code's MCP settings and add a local server with the `mcpServers`
+  block from the top of this section.
+
+### OpenCode
+
+- OpenCode uses its own config shape (note `environment`, not `env`). Add to
+  `opencode.json`:
+
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "drift": {
+        "type": "local",
+        "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
+        "environment": { "DRIFT_REPO": "/abs/path/to/your/repo" },
+        "enabled": true
+      }
+    }
+  }
+  ```
+
+- Verify with `opencode mcp list`.
+
+### Pi
+
+- Install the Pi MCP adapter, then set up inside a session:
+
+  ```bash
+  pi install npm:pi-mcp-adapter
+  # inside a pi session:
+  /mcp setup
+  ```
+
+- Or drop the `mcpServers` block into `.mcp.json` / `~/.pi/agent/mcp.json`.
+
+### VS Code
+
+- Add the `mcpServers` block to `.vscode/mcp.json` (native VS Code MCP support).
+  VS Code picks it up on window reload.
 
 ### CLI
 
