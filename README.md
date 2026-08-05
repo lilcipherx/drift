@@ -57,6 +57,11 @@ separately for each one. All harnesses expose the same six tools:
 `drift_realize`, `drift_context`, `drift_replay`, `drift_blame`, `drift_verify`,
 `drift_log`.
 
+Every command below is backed by a real manifest in this repository
+(`.claude-plugin/plugin.json`, `.plugin/plugin.json`, `gemini-extension.json`,
+`plugin.json`, `.factory-plugin/`, `package.json` → `pi`) and the
+[drift-marketplace](https://github.com/lilcipherx/drift-marketplace) repo.
+
 ### Claude Code
 
 Drift is available via the [official Claude plugin marketplace](https://claude.com/plugins).

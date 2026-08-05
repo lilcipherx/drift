@@ -1,0 +1,19 @@
+{
+  "name": "drift",
+  "version": "0.2.1",
+  "description": "Intent-Driven Versioning — semantic commits, blame by intent, MCP tools for agents. Git tracks what changed; Drift tracks why.",
+  "author": {
+    "name": "lilcipherx",
+    "email": "lilcipherx@users.noreply.github.com",
+    "url": "https://github.com/lilcipherx"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/lilcipherx/drift",
+  "keywords": ["versioning", "intents", "git", "mcp", "ai"],
+  "mcpServers": {
+    "drift": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/packages/drift-mcp/dist/index.js"]
+    }
+  }
+}

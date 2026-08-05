@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "drift",
+  "description": "Intent-Driven Versioning for Antigravity — semantic commits, blame by intent, MCP tools for agents."
+}

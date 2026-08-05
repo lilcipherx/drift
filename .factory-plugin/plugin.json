@@ -1,0 +1,12 @@
+{
+  "name": "drift",
+  "description": "Intent-Driven Versioning for Factory Droid — semantic commits, blame by intent, MCP tools for agents.",
+  "version": "0.2.1",
+  "author": {
+    "name": "lilcipherx"
+  },
+  "homepage": "https://github.com/lilcipherx/drift",
+  "repository": "https://github.com/lilcipherx/drift",
+  "license": "MIT",
+  "keywords": ["versioning", "intents", "git", "mcp"]
+}

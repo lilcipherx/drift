@@ -10,6 +10,13 @@
   "engines": {
     "node": ">=24"
   },
+  "pi": {
+    "description": "Drift — Intent-Driven Versioning. Semantic commits, blame by intent, MCP tools for agents.",
+    "keywords": ["pi-package", "pi", "versioning", "intents", "mcp"],
+    "skills": [],
+    "prompts": [],
+    "extensions": []
+  },
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty false",

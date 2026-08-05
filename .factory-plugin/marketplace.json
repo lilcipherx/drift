@@ -1,0 +1,15 @@
+{
+  "name": "drift",
+  "description": "Drift plugins for Factory Droid — Intent-Driven Versioning.",
+  "owner": {
+    "name": "lilcipherx"
+  },
+  "plugins": [
+    {
+      "name": "drift",
+      "description": "Intent-Driven Versioning for Factory Droid — semantic commits, blame by intent.",
+      "version": "0.2.1",
+      "source": "https://github.com/lilcipherx/drift"
+    }
+  ]
+}

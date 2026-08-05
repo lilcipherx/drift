@@ -36,6 +36,17 @@ All notable changes are tracked here (git-cliff style, kept manually).
   `pi install git:github.com/lilcipherx/drift`.
 - Added `.opencode/INSTALL.md` (fetched by OpenCode's install instruction) and
   `docs/README.opencode.md`, `docs/README.kimi.md` harness docs.
+- **Real plugin manifests for every harness** so the README install commands
+  work: `.claude-plugin/plugin.json` (Claude Code, with MCP server),
+  `.plugin/plugin.json` (GitHub Copilot CLI), `gemini-extension.json` (Gemini
+  CLI), `plugin.json` + `mcp_config.json` (Antigravity), `.factory-plugin/`
+  plugin + marketplace (Factory Droid), `mcp.json` (Droid MCP servers), and a
+  `pi` key in the root `package.json` (Pi).
+- Published the [drift-marketplace](https://github.com/lilcipherx/drift-marketplace)
+  repo with `.claude-plugin/marketplace.json` (Claude Code) and
+  `.github/plugin/marketplace.json` (GitHub Copilot CLI) —
+  `/plugin marketplace add lilcipherx/drift-marketplace` and
+  `copilot plugin marketplace add lilcipherx/drift-marketplace` now resolve.
 
 ## [0.2.1] — 2026-08-05
 
