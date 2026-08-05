@@ -99,7 +99,8 @@ cp examples/harness-configs/claude-code/.mcp.json .mcp.json
 Verify with `claude mcp list` — you should see `drift` with its six tools.
 
 > The marketplace manifest lives at `.claude-plugin/marketplace.json` in this
-> repository (`source: github lilcipherx/drift` → `.claude-plugin/plugin.json`).
+> repository (github-source `lilcipherx/drift`, strict plugin →
+> `.claude-plugin/plugin.json` in the same repo).
 
 ### Antigravity
 
