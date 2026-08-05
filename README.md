@@ -14,7 +14,7 @@ the originating prompt, and lets a crashed agent resume from its last checkpoint
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-[![Tests](https://img.shields.io/badge/tests-69%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-83%20passing-brightgreen)](tests/)
 
 ## Quickstart
 
