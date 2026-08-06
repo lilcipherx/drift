@@ -153,6 +153,35 @@ export function refreshToken(expired: string): string {
   assert.equal(exported.intents.length, 1);
 });
 
+test("blame --function on a body-modified function resolves to the intent (PRD §4.2 acceptance)", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+
+  // modify ONLY the body — the signature line keeps its pre-Drift sha
+  writeFileSync(
+    join(repo, "src", "auth.ts"),
+    `export function verifyToken(token: string): boolean {
+  const parts = token.split(".");
+  return parts.length === 3 && parts[2].length > 10;
+}
+`,
+  );
+  const realize = run(repo, ["realize", "-p", "Fix race condition in token refresh", "--agent", "--model", "claude-3-5-sonnet", "--json"]);
+  assert.equal(realize.status, 0, realize.stderr);
+
+  // the function existed before Drift, so its SIGNATURE line is baseline —
+  // but the intent modified its body, so --function blame must attribute
+  const blame = parseJson(run(repo, ["blame", "src/auth.ts", "--function", "verifyToken", "--json"]).stdout);
+  assert.equal(blame.status, "ok");
+  assert.equal(blame.baseline, false, JSON.stringify(blame));
+  assert.ok(blame.intent, "intent must be resolved, got baseline: " + JSON.stringify(blame));
+  assert.equal(blame.intent.prompt, "Fix race condition in token refresh");
+  assert.equal(blame.intent.author.model, "claude-3-5-sonnet");
+  assert.equal(blame.intent.signatureValid, true);
+  // the resolved line is inside the function body (where the change landed)
+  assert.ok(blame.line >= 2, `resolved line ${blame.line} should be in the body`);
+});
+
 test("syntax errors are rejected and history stays clean (PRD §9.2)", () => {
   const repo = makeRepo();
   run(repo, ["init"]);

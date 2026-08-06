@@ -107,13 +107,35 @@ export function commit(repoRoot, message) {
 }
 /** Commit sha owning the given line of a file (porcelain blame). */
 export function blameLine(repoRoot, filePath, line) {
-    const res = execGit(repoRoot, ["blame", "-L", `${line},${line}`, "--porcelain", "--", filePath], true);
+    return blameLines(repoRoot, filePath, line, line).get(line) ?? "";
+}
+/**
+ * Commit sha owning each line in [startLine, endLine] of a file
+ * (`git blame -L start,end --line-porcelain`). The porcelain header repeats
+ * per line: `<sha> <origLine> <finalLine> [<count>]`, so final line → sha is
+ * parsed directly. Used by `blame --function` to attribute the intent that
+ * touched ANY line of a function's body, not just its signature line.
+ */
+export function blameLines(repoRoot, filePath, startLine, endLine) {
+    const res = execGit(repoRoot, [
+        "blame",
+        "-L",
+        `${startLine},${endLine}`,
+        "--line-porcelain",
+        "--",
+        filePath,
+    ], true);
     if (res.status !== 0) {
-        throw new DriftError(`git blame failed for ${filePath}:${line}: ${res.stderr.trim()}`);
+        throw new DriftError(`git blame failed for ${filePath}:${startLine}-${endLine}: ${res.stderr.trim()}`);
     }
-    const firstLine = res.stdout.split("\n")[0] ?? "";
-    const sha = firstLine.split(" ")[0] ?? "";
-    return /^[0-9a-f]{40}$/.test(sha) ? sha : "";
+    const out = new Map();
+    const headerRe = /^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$/;
+    for (const line of res.stdout.split("\n")) {
+        const m = headerRe.exec(line);
+        if (m)
+            out.set(Number(m[3]), m[1]);
+    }
+    return out;
 }
 export function checkout(repoRoot, sha) {
     execGit(repoRoot, ["checkout", sha]);

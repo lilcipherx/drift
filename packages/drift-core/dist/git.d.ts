@@ -29,6 +29,14 @@ export declare function readFileAt(repoRoot: string, path: string, ref: string):
 export declare function commit(repoRoot: string, message: string): string;
 /** Commit sha owning the given line of a file (porcelain blame). */
 export declare function blameLine(repoRoot: string, filePath: string, line: number): string;
+/**
+ * Commit sha owning each line in [startLine, endLine] of a file
+ * (`git blame -L start,end --line-porcelain`). The porcelain header repeats
+ * per line: `<sha> <origLine> <finalLine> [<count>]`, so final line → sha is
+ * parsed directly. Used by `blame --function` to attribute the intent that
+ * touched ANY line of a function's body, not just its signature line.
+ */
+export declare function blameLines(repoRoot: string, filePath: string, startLine: number, endLine: number): Map<number, string>;
 export declare function checkout(repoRoot: string, sha: string): void;
 export declare function gitLogMessages(repoRoot: string): {
     sha: string;

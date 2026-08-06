@@ -41,6 +41,7 @@ import { CONFIG_TEMPLATE, loadConfig, type DriftConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
 import {
   blameLine,
+  blameLines,
   checkout,
   commit,
   commitExists,
@@ -416,6 +417,7 @@ export class Drift {
     }
     let line = opts.line;
     let functionName: string | undefined;
+    let functionEndLine: number | undefined;
     if (opts.functionName) {
       const source = readFileSync(file, "utf8");
       const lang = detectLanguage(relative);
@@ -426,6 +428,7 @@ export class Drift {
         throw new DriftError(`Function "${opts.functionName}" not found in ${relative}`);
       }
       line = symbol.startLine;
+      functionEndLine = symbol.endLine;
       functionName = opts.functionName;
     }
     if (!line) throw new DriftError("blame requires --line N or --function NAME");
@@ -434,9 +437,36 @@ export class Drift {
       throw new DriftError(`Line ${line} is out of range (1..${totalLines})`);
     }
 
-    const sha = blameLine(this.repoRoot, relative, line);
-    if (!sha) {
-      throw new DriftError(`Could not blame ${relative}:${line}`);
+    let sha: string;
+    if (functionName) {
+      // Attribute the intent whose commit touched ANY line of the function
+      // body (PRD §7.3: map git blame sha → intent). The signature line often
+      // predates the modification, so walking the body span finds the intent
+      // that actually changed the function; untouched functions still resolve
+      // to "pre-Drift baseline".
+      const end = Math.min(functionEndLine ?? line, totalLines);
+      const lineShas = blameLines(this.repoRoot, relative, line, end);
+      let fallback = "";
+      let chosen = "";
+      for (let ln = end; ln >= line; ln--) {
+        const s = lineShas.get(ln);
+        if (!s) continue;
+        if (!fallback) fallback = s;
+        if (this.store.findByGitSha(s)) {
+          chosen = s;
+          line = ln;
+          break;
+        }
+      }
+      sha = chosen || fallback;
+      if (!sha) {
+        throw new DriftError(`Could not blame ${relative}:${line}`);
+      }
+    } else {
+      sha = blameLine(this.repoRoot, relative, line);
+      if (!sha) {
+        throw new DriftError(`Could not blame ${relative}:${line}`);
+      }
     }
     const committed = sha !== "0000000000000000000000000000000000000000";
     let intent: (IntentRecord & { signatureValid: boolean }) | null = null;
@@ -464,15 +494,15 @@ export class Drift {
         };
       }
     }
-    return {
-      file: relative,
-      line,
-      functionName,
-      gitSha: committed ? sha : "uncommitted",
-      committed,
-      intent,
-      baseline: committed && intent === null,
-    };
+  return {
+    file: relative,
+    line,
+    functionName,
+    gitSha: committed ? sha : "uncommitted",
+    committed,
+    intent,
+    baseline: committed && intent === null,
+  };
   }
 
   // --------------------------------------------------------------- context

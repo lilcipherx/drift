@@ -8,5 +8,5 @@ export type { DriftConfig } from "./config.js";
 export { IntentStore } from "./store.js";
 export type { IntentRecord, LogEntry, LogFilters } from "./store.js";
 export { redact, compilePatterns, DEFAULT_PATTERN_SOURCES } from "./redact.js";
-export { blameLine, commit, commitExists, currentHead, findRepoRoot, gitIdentity, readFileAt, stageAll, stagedNameStatus, } from "./git.js";
+export { blameLine, blameLines, commit, commitExists, currentHead, findRepoRoot, gitIdentity, readFileAt, stageAll, stagedNameStatus, } from "./git.js";
 //# sourceMappingURL=index.d.ts.map

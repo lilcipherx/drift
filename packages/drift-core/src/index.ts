@@ -31,6 +31,7 @@ export type { IntentRecord, LogEntry, LogFilters } from "./store.js";
 export { redact, compilePatterns, DEFAULT_PATTERN_SOURCES } from "./redact.js";
 export {
   blameLine,
+  blameLines,
   commit,
   commitExists,
   currentHead,

@@ -10,7 +10,7 @@ import { computeDelta, detectLanguage, isBinary, parseSymbols, ParseError, textD
 import { canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";
 import { CONFIG_TEMPLATE, loadConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
-import { blameLine, checkout, commit, commitExists, currentHead, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, stageAll, stagedNameStatus, unstage, } from "./git.js";
+import { blameLine, blameLines, checkout, commit, commitExists, currentHead, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, stageAll, stagedNameStatus, unstage, } from "./git.js";
 import { IntentStore } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
 export class Drift {
@@ -271,6 +271,7 @@ export class Drift {
         }
         let line = opts.line;
         let functionName;
+        let functionEndLine;
         if (opts.functionName) {
             const source = readFileSync(file, "utf8");
             const lang = detectLanguage(relative);
@@ -282,6 +283,7 @@ export class Drift {
                 throw new DriftError(`Function "${opts.functionName}" not found in ${relative}`);
             }
             line = symbol.startLine;
+            functionEndLine = symbol.endLine;
             functionName = opts.functionName;
         }
         if (!line)
@@ -290,9 +292,39 @@ export class Drift {
         if (line < 1 || line > totalLines) {
             throw new DriftError(`Line ${line} is out of range (1..${totalLines})`);
         }
-        const sha = blameLine(this.repoRoot, relative, line);
-        if (!sha) {
-            throw new DriftError(`Could not blame ${relative}:${line}`);
+        let sha;
+        if (functionName) {
+            // Attribute the intent whose commit touched ANY line of the function
+            // body (PRD §7.3: map git blame sha → intent). The signature line often
+            // predates the modification, so walking the body span finds the intent
+            // that actually changed the function; untouched functions still resolve
+            // to "pre-Drift baseline".
+            const end = Math.min(functionEndLine ?? line, totalLines);
+            const lineShas = blameLines(this.repoRoot, relative, line, end);
+            let fallback = "";
+            let chosen = "";
+            for (let ln = end; ln >= line; ln--) {
+                const s = lineShas.get(ln);
+                if (!s)
+                    continue;
+                if (!fallback)
+                    fallback = s;
+                if (this.store.findByGitSha(s)) {
+                    chosen = s;
+                    line = ln;
+                    break;
+                }
+            }
+            sha = chosen || fallback;
+            if (!sha) {
+                throw new DriftError(`Could not blame ${relative}:${line}`);
+            }
+        }
+        else {
+            sha = blameLine(this.repoRoot, relative, line);
+            if (!sha) {
+                throw new DriftError(`Could not blame ${relative}:${line}`);
+            }
         }
         const committed = sha !== "0000000000000000000000000000000000000000";
         let intent = null;
