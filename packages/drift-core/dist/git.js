@@ -129,7 +129,10 @@ export function blameLines(repoRoot, filePath, startLine, endLine) {
         throw new DriftError(`git blame failed for ${filePath}:${startLine}-${endLine}: ${res.stderr.trim()}`);
     }
     const out = new Map();
-    const headerRe = /^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$/;
+    // git can prefix boundary (root) commits with `^` in blame output on some
+    // versions — tolerate it so a missed line never turns a resolvable baseline
+    // into a thrown "Could not blame".
+    const headerRe = /^\^?([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$/;
     for (const line of res.stdout.split("\n")) {
         const m = headerRe.exec(line);
         if (m)

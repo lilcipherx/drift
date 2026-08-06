@@ -302,13 +302,16 @@ export class Drift {
             const end = Math.min(functionEndLine ?? line, totalLines);
             const lineShas = blameLines(this.repoRoot, relative, line, end);
             let fallback = "";
+            let fallbackLine = 0;
             let chosen = "";
             for (let ln = end; ln >= line; ln--) {
                 const s = lineShas.get(ln);
                 if (!s)
                     continue;
-                if (!fallback)
+                if (!fallback) {
                     fallback = s;
+                    fallbackLine = ln;
+                }
                 if (this.store.findByGitSha(s)) {
                     chosen = s;
                     line = ln;
@@ -319,6 +322,10 @@ export class Drift {
             if (!sha) {
                 throw new DriftError(`Could not blame ${relative}:${line}`);
             }
+            // Baseline case: report the line that actually owns the fallback sha
+            // instead of the function's start line.
+            if (!chosen && fallbackLine)
+                line = fallbackLine;
         }
         else {
             sha = blameLine(this.repoRoot, relative, line);
