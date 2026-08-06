@@ -4,6 +4,25 @@ All notable changes are tracked here (git-cliff style, kept manually).
 
 ## [Unreleased]
 
+### Fixed
+- `drift blame --function` now attributes the intent whose commit touched ANY
+  line of the function body (PRD §7.3), so a body-only edit of a pre-Drift
+  function resolves to its intent instead of "baseline" — the PRD §4.2
+  acceptance "aha" works end-to-end. Untouched functions still report
+  "pre-Drift baseline".
+
+### Added
+- `eval/` harness (PRD §22): scenarios (`syntax-error-retry`,
+  `realize-blame`), metrics (syntax-rejection rate, blame accuracy, replay
+  fidelity), recorded baseline (`eval/baseline.json`) and a >5% regression
+  gate. `npm run eval` / `npm run eval:record`.
+- `scripts/acceptance-mvs.sh` — repeatable PRD §4.2 acceptance run.
+
+### Docs
+- ADR-008: CI workflows intentionally not committed (Actions disabled per
+  maintainer); local gates replace them.
+- README: Evaluation section, test-count badges updated to 98.
+
 ## [0.3.0] — 2026-08-05
 
 ### Changed

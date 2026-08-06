@@ -1,0 +1,28 @@
+{
+  "name": "realize-blame",
+  "description": "Agent intent commit with AST delta, visible in log and resolvable by drift blame (PRD §4.2 aha).",
+  "steps": [
+    {
+      "tool": "drift_realize",
+      "input": {
+        "prompt": "Fix race condition in token refresh",
+        "files": ["src/auth.ts"],
+        "model": "claude-3-5-sonnet"
+      },
+      "mock_files": {
+        "src/auth.ts": "export function verifyToken(tok: string): boolean {\n  const parts = tok.split(\".\");\n  return parts.length === 3 && parts[2].length > 10;\n}\n"
+      },
+      "expect": { "status": "ok" }
+    },
+    {
+      "tool": "drift_log",
+      "input": { "limit": 10 },
+      "expect": { "status": "ok", "intents": 1 }
+    },
+    {
+      "tool": "drift_blame",
+      "input": { "file": "src/auth.ts", "functionName": "verifyToken" },
+      "expect": { "status": "ok", "baseline": false }
+    }
+  ]
+}

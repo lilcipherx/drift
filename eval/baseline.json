@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-06T07:13:51.899Z",
+  "toolchain": {
+    "node": "v24.18.0",
+    "git": "2.55.0.windows.3"
+  },
+  "scenariosPassed": 2,
+  "scenariosTotal": 2,
+  "scenarios": {
+    "realize-blame": {
+      "pass": true,
+      "steps": 3,
+      "failures": []
+    },
+    "syntax-error-retry": {
+      "pass": true,
+      "steps": 2,
+      "failures": []
+    }
+  },
+  "metrics": {
+    "syntaxRejectionRate": 1,
+    "blameAccuracy": 1,
+    "replayFidelity": 1,
+    "realizeOverheadMs": 1469
+  }
+}

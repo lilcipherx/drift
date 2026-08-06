@@ -24,7 +24,9 @@
     "test:unit": "node --test \"tests/unit/*.test.mjs\"",
     "test:integration": "node --test \"tests/integration/*.test.mjs\"",
     "test:mcp": "node --test \"tests/mcp/*.test.mjs\"",
-    "test:app": "node --test \"tests/app/*.test.mjs\""
+    "test:app": "node --test \"tests/app/*.test.mjs\"",
+    "eval": "npm run build && node eval/harness.mjs",
+    "eval:record": "npm run build && node eval/harness.mjs --record"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -14,7 +14,7 @@ the originating prompt, and lets a crashed agent resume from its last checkpoint
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-[![Tests](https://img.shields.io/badge/tests-83%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-98%20passing-brightgreen)](tests/)
 
 ## Quickstart
 
@@ -391,15 +391,30 @@ generated code.
   [SECURITY.md](SECURITY.md).
 - Keys are never committed (`.drift/keys/` is gitignored) except throwaway demo keys.
 
+## Evaluation
+
+The [eval harness](eval/harness.mjs) (PRD §22) drives the real CLI with mock
+file states — no LLM calls, no network — and records a baseline:
+
+```bash
+npm run eval           # run scenarios + compare against baseline (regression gate)
+npm run eval:record    # re-record eval/baseline.json
+```
+
+Metrics gated at >5% regression (PRD §22.3): **syntax-error rejection rate**
+(must be 100%), **blame accuracy**, **replay fidelity**. Scenarios live in
+[eval/scenarios/](eval/scenarios/).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The general flow:
 
 1. Fork the repository.
 2. Create a branch for your work.
-3. Keep `npm test` green (81 tests: unit, temp-git-repo integration, MCP
-   JSON-RPC e2e, GitHub App handler).
-4. Submit a PR using the template.
+3. Keep `npm test` green (98 tests: unit, temp-git-repo integration, MCP
+   JSON-RPC e2e, GitHub App handler + live webhook-server E2E).
+4. Keep the eval baseline green: `npm run eval` (PRD §22).
+5. Submit a PR using the template.
 
 Design decisions are tracked in [docs/adrs.md](docs/adrs.md) — note that the PRD
 originally chose Rust (ADR-003); this implementation ships TypeScript-first

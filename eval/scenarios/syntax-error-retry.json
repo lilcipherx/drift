@@ -1,0 +1,18 @@
+{
+  "name": "syntax-error-retry",
+  "description": "Broken code is rejected before it enters history; the fixed retry commits cleanly (PRD §9.2, §26.2).",
+  "steps": [
+    {
+      "tool": "drift_realize",
+      "input": { "prompt": "add fn", "files": ["a.ts"] },
+      "mock_files": { "a.ts": "export const x = ;" },
+      "expect": { "status": "error", "type": "syntax" }
+    },
+    {
+      "tool": "drift_realize",
+      "input": { "prompt": "add fn", "files": ["a.ts"] },
+      "mock_files": { "a.ts": "export const x = 1;" },
+      "expect": { "status": "ok" }
+    }
+  ]
+}

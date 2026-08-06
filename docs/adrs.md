@@ -54,3 +54,20 @@
   **object file**, never from SQLite rows.
 - **Justification:** SQLite re-serialization is not guaranteed byte-identical to
   what was signed (array ordering); the object file is what was actually signed.
+
+## ADR-008: CI workflows are not committed to the repository
+
+- **Problem:** the PRD (§36, launch checklist) specifies
+  `.github/workflows/{ci,release,eval}.yml`, but the account's Actions had to
+  be disabled (billing / failing runs on `main`), per the maintainer's explicit
+  instruction to remove CI and keep zero failing checks.
+- **Decision:** `.github/workflows/` is intentionally **not** committed.
+  Local validation is fully covered instead: `npm test` (98 tests),
+  `npm run eval` (scenario suite + baseline gate), `bash scripts/acceptance-mvs.sh`
+  (PRD §4.2 acceptance), and `npm run build` (typecheck). The workflows are
+  one `git commit` away when Actions is re-enabled — the checkpoints they
+  encoded are exactly the commands above.
+- **Justification:** the PRD's *intent* — a release pipeline that fails on
+  regression — is preserved by the eval regression gate and the local test
+  suite; committing workflow files to a disabled-Actions account would only
+  recreate the failing runs the maintainer asked to remove.
