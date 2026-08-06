@@ -18,10 +18,17 @@ All notable changes are tracked here (git-cliff style, kept manually).
   gate. `npm run eval` / `npm run eval:record`.
 - `scripts/acceptance-mvs.sh` — repeatable PRD §4.2 acceptance run.
 
+### Tests
+- `tests/app/abort-live.test.mjs`: live E2E for client disconnect during webhook
+  processing — abort after full body (mid-upstream-call), abort mid-body, and
+  RST-style socket destroy. Asserts the `res.destroyed` guards keep the server
+  alive, a fully-read delivery is still processed to completion, and no
+  uncaught exception / unhandled rejection fires.
+
 ### Docs
 - ADR-008: CI workflows intentionally not committed (Actions disabled per
   maintainer); local gates replace them.
-- README: Evaluation section, test-count badges updated to 98.
+- README: Evaluation section, test-count badges updated to 101.
 
 ## [0.3.0] — 2026-08-05
 
