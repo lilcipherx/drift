@@ -49,6 +49,13 @@ All notable changes are tracked here (git-cliff style, kept manually).
   with a clear error without `GITHUB_WEBHOOK_SECRET` and, with it, boots,
   answers `/health`, 404s non-POST `/webhook`, acks a bad signature as
   non-retryable, and releases its port on termination.
+- `scripts/verify-close-behavior.mjs`: live behavior check of the webhook
+  server's `close()` — happy-path webhook (comment + marker + check run),
+  in-flight webhook spared while `close()` runs mid-handler (response
+  delivered, idempotent PATCH by marker, comment not duplicated, close()
+  resolves promptly instead of waiting out the force grace, port released),
+  idempotent double `close()`, and zero uncaught exceptions / unhandled
+  rejections — driving the real built code with only the GitHub API mocked.
 
 ### Docs
 - ADR-008: CI workflows intentionally not committed (Actions disabled per
