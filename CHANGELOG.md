@@ -16,6 +16,11 @@ All notable changes are tracked here (git-cliff style, kept manually).
   shutdown forever. The server now owns a connection registry, releases idle
   connections immediately on `close()`, spares in-flight responses, and
   force-closes stragglers after a 5 s grace.
+- `drift-app` close() now resolves promptly after an in-flight request
+  completes: a socket spared mid-request becomes idle the moment its response
+  finishes and is released by a closing sweep (previously close() waited out
+  the whole force grace). Grace is configurable via `closeGraceMs`; close() is
+  idempotent (SIGINT+SIGTERM share one promise).
 - Documented (evidence-backed): on Windows, external SIGTERM/SIGINT delivery
   terminates Node without running JS handlers, so the graceful path is
   POSIX/console-ctrl only — `scripts/verify-app-start.sh` asserts this.
@@ -36,6 +41,10 @@ All notable changes are tracked here (git-cliff style, kept manually).
 - `tests/app/shutdown-live.test.mjs`: close() resolves while a request-less
   keep-alive socket is still open (red on the old bare-`server.close()`, green
   with the registry fix) and refuses new connections after closing.
+- `tests/app/shutdown-live.test.mjs` (TDD): spares an in-flight request
+  (response delivered, close() resolves promptly — not via the force timer)
+  and force-closes a request that never completes after `closeGraceMs`. Both
+  were watched red against the one-shot implementation before the sweep fix.
 - `scripts/verify-app-start.sh`: live check that `drift-app start` fails fast
   with a clear error without `GITHUB_WEBHOOK_SECRET` and, with it, boots,
   answers `/health`, 404s non-POST `/webhook`, acks a bad signature as

@@ -13,6 +13,8 @@ export interface ServerOptions extends WebhookDeps {
   log?: (line: string) => void;
   /** Max accepted webhook body size in bytes (default 1 MB). */
   maxBodyBytes?: number;
+  /** Grace for in-flight requests on close() before force-close (ms). */
+  closeGraceMs?: number;
 }
 
 // GitHub webhook payloads can reach several MB on busy PRs — keep a bounded
@@ -136,34 +138,59 @@ export async function createWebhookServer(opts: ServerOptions) {
   const addr = server.address();
   const actualPort = typeof addr === "object" && addr !== null ? addr.port : opts.port;
 
+  /** Release every connection that is not mid-request. Idempotent: safe to
+   *  re-run while closing, which is exactly what the sweep below does. */
+  const releaseIdle = () => {
+    server.closeIdleConnections();
+    for (const socket of connections) {
+      // `_httpMessage` is bound by ServerResponse.assignSocket as soon as
+      // request HEADERS are parsed — before the body is read or the handler
+      // runs — and nulled after the response finishes. So a mid-body /
+      // mid-handler webhook POST is spared; only request-less or
+      // already-finished sockets are destroyed.
+      if ((socket as unknown as { _httpMessage?: unknown })._httpMessage) continue;
+      socket.destroy();
+    }
+  };
+
+  const graceMs =
+    Number.isFinite(opts.closeGraceMs) && (opts.closeGraceMs ?? 0) >= 0
+      ? (opts.closeGraceMs as number)
+      : 5_000;
+  let closePromise: Promise<void> | null = null;
+
   return {
     server,
     port: actualPort,
-    close: () =>
-      new Promise<void>((resolve) => {
-        // Bare server.close() waits for EVERY open connection — an idle
-        // keep-alive or request-less client would block graceful shutdown
-        // forever. Release every connection that has no parsed request now,
-        // and force-close stragglers after a grace period so in-flight
-        // webhook handling can finish first.
-        server.close(() => {
-          clearTimeout(force);
-          resolve();
+    // Idempotent: repeated calls (e.g. SIGINT+SIGTERM) share one promise.
+    close: () => {
+      if (!closePromise) {
+        closePromise = new Promise<void>((resolve) => {
+          // Bare server.close() waits for EVERY open connection — an idle
+          // keep-alive or request-less client would block graceful shutdown
+          // forever. Release every connection with no parsed request now, and
+          // keep sweeping while closing: a socket spared because it had an
+          // in-flight request becomes idle the moment its response finishes,
+          // and must be released then — not after the whole grace period.
+          // (The sweep/force are declared below and referenced by this
+          // deferred callback, which Node never invokes synchronously.)
+          server.close(() => {
+            clearInterval(sweep);
+            clearTimeout(force);
+            resolve();
+          });
+          releaseIdle();
+          const sweep = setInterval(releaseIdle, 100);
+          sweep.unref();
+          // Ultimate bound: a request that never finishes must not block
+          // shutdown forever.
+          const force = setTimeout(() => {
+            server.closeAllConnections();
+          }, graceMs);
+          force.unref();
         });
-        server.closeIdleConnections();
-        for (const socket of connections) {
-          // `_httpMessage` is bound by ServerResponse.assignSocket as soon as
-          // request HEADERS are parsed — before the body is read or the
-          // handler runs — and nulled after the response finishes. So a
-          // mid-body / mid-handler webhook POST is spared; only request-less
-          // or already-finished sockets are destroyed.
-          if ((socket as unknown as { _httpMessage?: unknown })._httpMessage) continue;
-          socket.destroy();
-        }
-        const force = setTimeout(() => {
-          server.closeAllConnections();
-        }, 5_000);
-        force.unref();
-      }),
+      }
+      return closePromise;
+    },
   };
 }

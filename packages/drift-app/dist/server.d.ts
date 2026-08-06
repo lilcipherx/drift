@@ -10,6 +10,8 @@ export interface ServerOptions extends WebhookDeps {
     log?: (line: string) => void;
     /** Max accepted webhook body size in bytes (default 1 MB). */
     maxBodyBytes?: number;
+    /** Grace for in-flight requests on close() before force-close (ms). */
+    closeGraceMs?: number;
 }
 export declare function createWebhookServer(opts: ServerOptions): Promise<{
     server: import("http").Server<typeof IncomingMessage, typeof ServerResponse>;

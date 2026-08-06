@@ -14,7 +14,7 @@ the originating prompt, and lets a crashed agent resume from its last checkpoint
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-[![Tests](https://img.shields.io/badge/tests-103%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-105%20passing-brightgreen)](tests/)
 
 ## Quickstart
 
@@ -411,7 +411,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The general flow:
 
 1. Fork the repository.
 2. Create a branch for your work.
-3. Keep `npm test` green (103 tests: unit, temp-git-repo integration, MCP
+3. Keep `npm test` green (105 tests: unit, temp-git-repo integration, MCP
    JSON-RPC e2e, GitHub App handler + live webhook-server E2E + client-abort
    + graceful-shutdown robustness).
 4. Keep the eval baseline green: `npm run eval` (PRD §22).
