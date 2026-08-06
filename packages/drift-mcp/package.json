@@ -9,13 +9,15 @@
     "mcp": "dist/index.js",
     "drift-mcp": "dist/index.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b"
   },
   "dependencies": {
-    "@drift/cli": "0.1.0",
-    "@drift/core": "0.1.0",
+    "@drift/cli": "0.1.1",
+    "@drift/core": "0.1.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.23.8"
   }

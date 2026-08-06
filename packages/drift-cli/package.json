@@ -9,11 +9,13 @@
   "bin": {
     "drift": "dist/cli.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b"
   },
   "dependencies": {
-    "@drift/core": "0.1.0"
+    "@drift/core": "0.1.1"
   }
 }

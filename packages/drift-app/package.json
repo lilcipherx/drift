@@ -9,11 +9,14 @@
   "bin": {
     "drift-app": "dist/index.js"
   },
-  "files": ["dist", "app.yml"],
+  "files": [
+    "dist",
+    "app.yml"
+  ],
   "scripts": {
     "build": "tsc -b"
   },
   "dependencies": {
-    "@drift/core": "0.1.0"
+    "@drift/core": "0.1.1"
   }
 }
