@@ -70,13 +70,22 @@ separately for each one. All harnesses expose the same six tools:
 `drift_realize`, `drift_context`, `drift_replay`, `drift_blame`, `drift_verify`,
 `drift_log`.
 
+> **Status: the `@drift/*` npm packages are not published yet.** Every
+> section below leads with the **clone path** — it works right now from a
+> checkout of this repository. The `npx -y @drift/mcp` / `npx -y @drift/cli`
+> one-liners activate automatically once the packages land on npm; until
+> then they return a 404, so use the clone command shown first.
+
 Every command below is backed by a real manifest in this repository
 (`.claude-plugin/plugin.json`, `.plugin/plugin.json`,
 `.cursor-plugin/plugin.json`, `.codex-plugin/plugin.json`,
 `gemini-extension.json`, `plugin.json`, `.factory-plugin/`,
 `package.json` → `pi`) or a ready-made config in
-`examples/harness-configs/` — installation needs only **Node.js ≥ 24 and
-npm** (the MCP server runs via `npx -y @drift/mcp`, no clone needed).
+`examples/harness-configs/`. Today, installation needs **Node.js ≥ 24,
+npm and a clone of this repository** (the MCP server runs straight from
+`packages/drift-mcp/dist/index.js`; no build step needed). Once the
+`@drift/*` packages are published, the same configs work via
+`npx -y @drift/mcp` with no clone.
 
 ### Claude Code
 
@@ -87,7 +96,13 @@ Install as a plugin from the Drift marketplace (plugin-style, like Superpowers):
 /plugin install drift@drift
 ```
 
-Or add the Drift MCP server directly (project scope):
+Or add the Drift MCP server directly (project scope) — from a clone:
+
+```bash
+claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- node /path/to/drift/packages/drift-mcp/dist/index.js
+```
+
+Once the packages are published, the same command works via npx (no clone):
 
 ```bash
 claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
@@ -121,13 +136,22 @@ first message. Reinstall with the same command to update.
 In the Codex app, open **Settings → MCP servers** and add:
 
 - **Name**: `drift`
-- **Command**: `npx`
-- **Args**: `-y @drift/mcp`
+- **Command**: `node` (clone path) — or `npx` once the packages are published
+- **Args**: `/path/to/drift/packages/drift-mcp/dist/index.js` — or `-y @drift/mcp` after publication
 - **Env**: `DRIFT_REPO=/abs/path/to/your/repo`
 
 ### Codex CLI
 
-Add the Drift MCP server to `~/.codex/config.toml`:
+Add the Drift MCP server to `~/.codex/config.toml` (from a clone):
+
+```toml
+[mcp_servers.drift]
+command = "node"
+args = ["/path/to/drift/packages/drift-mcp/dist/index.js"]
+env = { DRIFT_REPO = "/abs/path/to/your/repo" }
+```
+
+Once published, the same server runs via npx (no clone):
 
 ```toml
 [mcp_servers.drift]
@@ -178,7 +202,13 @@ Then ask for `drift_blame` in chat.
 
 ### GitHub Copilot CLI
 
-Add the Drift MCP server:
+Add the Drift MCP server (from a clone):
+
+```bash
+copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- node /path/to/drift/packages/drift-mcp/dist/index.js
+```
+
+Once the packages are published, the same command works via npx (no clone):
 
 ```bash
 copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
@@ -245,18 +275,18 @@ VS Code picks it up on window reload.
 
 ### CLI
 
-Without cloning — the CLI is published to npm:
-
-```bash
-npx -y @drift/cli --help
-```
-
-From this repository:
+From a clone (works today):
 
 ```bash
 git clone https://github.com/lilcipherx/drift.git && cd drift
 npm install
 node packages/drift-cli/dist/cli.js --help
+```
+
+Once the CLI is published to npm, `npx` works without cloning:
+
+```bash
+npx -y @drift/cli --help
 ```
 
 On your own repository:
@@ -414,15 +444,19 @@ the drop-in point for a future tree-sitter implementation.
 
 ## Updating
 
-MCP servers launched via `npx -y @drift/mcp` pick up new versions automatically
-(`npx` always fetches the latest published release). Releases are tagged on the
-[releases page](https://github.com/lilcipherx/drift/releases) (`v0.1.0`,
-`v0.2.0`, `v0.2.1`, …). For the CLI from a checkout:
+Once published, MCP servers launched via `npx -y @drift/mcp` pick up new
+versions automatically (`npx` always fetches the latest published release).
+Until then, servers launched from a clone (the commands shown in
+[Installation](#installation)) track this checkout — update with
 
 ```bash
 git pull origin main
 npm install
 ```
+
+Releases are tagged on the
+[releases page](https://github.com/lilcipherx/drift/releases) (`v0.1.0`,
+`v0.2.0`, `v0.2.1`, …).
 
 Changelog: [CHANGELOG.md](CHANGELOG.md).
 

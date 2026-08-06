@@ -82,6 +82,12 @@ All notable changes are tracked here (git-cliff style, kept manually).
   for the dangling `@drift/cli` types path).
 
 ### Docs
+- README + `.opencode/INSTALL.md`: since the `@drift/*` npm packages are not
+  published yet, every installation section now leads with the **clone path**
+  (`node packages/drift-mcp/dist/index.js`, `node packages/drift-cli/dist/cli.js`)
+  and marks the `npx -y @drift/mcp` / `npx -y @drift/cli` one-liners as
+  activating once the packages land on npm — a fresh user no longer hits a
+  registry 404.
 - ADR-008: CI workflows intentionally not committed (Actions disabled per
   maintainer); local gates replace them.
 - README: Evaluation section, test-count badges updated to 101.

@@ -19,8 +19,17 @@ your `opencode.json` (note: OpenCode uses `environment`, not `env`):
 }
 ```
 
-The server runs from npm via `npx` — no clone needed. The only placeholder to
-replace:
+> **Status: `@drift/mcp` is not published to npm yet.** Until it is, point
+> the command at a checkout of this repository instead of `npx`:
+>
+> ```json
+> "command": ["node", "/path/to/drift/packages/drift-mcp/dist/index.js"]
+> ```
+>
+> The `npx -y @drift/mcp` form activates automatically once the package
+> lands on npm.
+
+The only placeholder to replace:
 
 | Placeholder | Replace with |
 | :--- | :--- |
