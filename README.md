@@ -1,6 +1,9 @@
-# Drift — Intent-Driven Versioning
+<p align="center">
+  <img src="docs/assets/drift-hero.png" width="420" alt="Drift — the robot that sees the why inside the code" />
+</p>
 
-> **Git tracks what changed. Drift tracks *why* it changed — and who (or what) decided.**
+<h1 align="center">Drift</h1>
+<p align="center"><em>Git tracks what changed. Drift tracks why.</em></p>
 
 Drift is a semantic version-control layer that wraps Git. Every commit becomes an
 **Intent**: the prompt that produced the change, the agent model behind it, the
