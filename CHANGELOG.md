@@ -24,6 +24,10 @@ All notable changes are tracked here (git-cliff style, kept manually).
   RST-style socket destroy. Asserts the `res.destroyed` guards keep the server
   alive, a fully-read delivery is still processed to completion, and no
   uncaught exception / unhandled rejection fires.
+- `scripts/verify-app-start.sh`: live check that `drift-app start` fails fast
+  with a clear error without `GITHUB_WEBHOOK_SECRET` and, with it, boots,
+  answers `/health`, 404s non-POST `/webhook`, acks a bad signature as
+  non-retryable, and releases its port on termination.
 
 ### Docs
 - ADR-008: CI workflows intentionally not committed (Actions disabled per
