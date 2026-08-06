@@ -107,6 +107,14 @@ export async function createWebhookServer(opts) {
             sendJson(res, 500, { error: "internal error" });
         }
     });
+    // Own the connection registry: closeIdleConnections() only releases sockets
+    // that completed a request — a client that connected but never sent one (or
+    // sent a partial one) is treated as active and would block shutdown forever.
+    const connections = new Set();
+    server.on("connection", (socket) => {
+        connections.add(socket);
+        socket.on("close", () => connections.delete(socket));
+    });
     await new Promise((resolve, reject) => {
         server.once("error", reject);
         server.listen(opts.port, opts.host ?? "127.0.0.1", () => resolve());
@@ -116,7 +124,32 @@ export async function createWebhookServer(opts) {
     return {
         server,
         port: actualPort,
-        close: () => new Promise((resolve) => server.close(() => resolve())),
+        close: () => new Promise((resolve) => {
+            // Bare server.close() waits for EVERY open connection — an idle
+            // keep-alive or request-less client would block graceful shutdown
+            // forever. Release every connection that has no parsed request now,
+            // and force-close stragglers after a grace period so in-flight
+            // webhook handling can finish first.
+            server.close(() => {
+                clearTimeout(force);
+                resolve();
+            });
+            server.closeIdleConnections();
+            for (const socket of connections) {
+                // `_httpMessage` is bound by ServerResponse.assignSocket as soon as
+                // request HEADERS are parsed — before the body is read or the
+                // handler runs — and nulled after the response finishes. So a
+                // mid-body / mid-handler webhook POST is spared; only request-less
+                // or already-finished sockets are destroyed.
+                if (socket._httpMessage)
+                    continue;
+                socket.destroy();
+            }
+            const force = setTimeout(() => {
+                server.closeAllConnections();
+            }, 5_000);
+            force.unref();
+        }),
     };
 }
 //# sourceMappingURL=server.js.map

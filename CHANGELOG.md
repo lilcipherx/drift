@@ -10,6 +10,15 @@ All notable changes are tracked here (git-cliff style, kept manually).
   function resolves to its intent instead of "baseline" — the PRD §4.2
   acceptance "aha" works end-to-end. Untouched functions still report
   "pre-Drift baseline".
+- `drift-app` graceful shutdown no longer hangs: `server.close()` waits for
+  every open connection, and `closeIdleConnections()` releases only sockets
+  that completed a request — a connected-but-request-less client blocked
+  shutdown forever. The server now owns a connection registry, releases idle
+  connections immediately on `close()`, spares in-flight responses, and
+  force-closes stragglers after a 5 s grace.
+- Documented (evidence-backed): on Windows, external SIGTERM/SIGINT delivery
+  terminates Node without running JS handlers, so the graceful path is
+  POSIX/console-ctrl only — `scripts/verify-app-start.sh` asserts this.
 
 ### Added
 - `eval/` harness (PRD §22): scenarios (`syntax-error-retry`,
@@ -24,6 +33,9 @@ All notable changes are tracked here (git-cliff style, kept manually).
   RST-style socket destroy. Asserts the `res.destroyed` guards keep the server
   alive, a fully-read delivery is still processed to completion, and no
   uncaught exception / unhandled rejection fires.
+- `tests/app/shutdown-live.test.mjs`: close() resolves while a request-less
+  keep-alive socket is still open (red on the old bare-`server.close()`, green
+  with the registry fix) and refuses new connections after closing.
 - `scripts/verify-app-start.sh`: live check that `drift-app start` fails fast
   with a clear error without `GITHUB_WEBHOOK_SECRET` and, with it, boots,
   answers `/health`, 404s non-POST `/webhook`, acks a bad signature as
