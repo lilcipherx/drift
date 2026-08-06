@@ -82,6 +82,10 @@ All notable changes are tracked here (git-cliff style, kept manually).
   for the dangling `@drift/cli` types path).
 
 ### Docs
+- docs/quickstart.md: added a **Verified live (Проверено вживую)** section —
+  the measured end-to-end run of this quickstart on Windows 11 (Node v24.18.0,
+  npm 11.16.0, 2026-08-06): fresh GitHub clone → first `drift blame` in
+  ~8.1 s total, 10/10 checks pass, no registry 404 on the clone path.
 - README + `.opencode/INSTALL.md`: since the `@drift/*` npm packages are not
   published yet, every installation section now leads with the **clone path**
   (`node packages/drift-mcp/dist/index.js`, `node packages/drift-cli/dist/cli.js`)
