@@ -49,3 +49,27 @@ test("every package version matches the monorepo root version", () => {
     assert.equal(manifest.version, rootVersion, `${pkg} version out of sync`);
   }
 });
+
+test("internal @drift/* dependencies stay pinned to the current version (fresh-clone install regression)", () => {
+  // Human E2E bug: the 0.1.0 → 0.1.1 bump left internal deps pinned at
+  // 0.1.0, so a fresh clone + npm install tried to fetch @drift/core@0.1.0
+  // from the registry (404) instead of linking the workspace package — the
+  // quickstart install broke end-to-end. Every internal dependency must
+  // match the monorepo version so npm links the workspace copy.
+  const rootVersion = JSON.parse(
+    readFileSync(join(ROOT, "package.json"), "utf8"),
+  ).version;
+  for (const pkg of PACKAGES) {
+    const manifest = JSON.parse(readFileSync(join(ROOT, pkg, "package.json"), "utf8"));
+    const deps = { ...(manifest.dependencies ?? {}) };
+    for (const [name, spec] of Object.entries(deps)) {
+      if (name.startsWith("@drift/")) {
+        assert.equal(
+          spec,
+          rootVersion,
+          `${pkg} depends on ${name}@${spec}, expected ${rootVersion} so npm links the workspace package`,
+        );
+      }
+    }
+  }
+});

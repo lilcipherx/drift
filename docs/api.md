@@ -131,7 +131,7 @@ behaviour matches the CLI exactly.
 **Start it:** `node packages/drift-mcp/dist/index.js` (from the checkout), or
 `npx -y @drift/mcp` once published. Point it at a repository with `DRIFT_REPO`
 (defaults to the server's working directory). It reports
-`serverInfo: { "name": "drift", "version": "0.1.0" }` and six tools:
+`serverInfo: { "name": "drift", "version": "<package version>" }` (matches the installed `@drift/mcp` package) and six tools:
 
 ### `drift_realize`
 
