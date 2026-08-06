@@ -1,6 +1,6 @@
 {
   "name": "@drift/mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drift MCP server — gives AI agents intent-driven versioning tools (PRD §14.2).",
   "license": "MIT",
   "type": "module",

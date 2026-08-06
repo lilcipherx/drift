@@ -26,7 +26,6 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-const VERSION = "0.1.0";
 const SERVER_NAME = "drift";
 
 // --- locate the CLI ---------------------------------------------------------
@@ -56,6 +55,15 @@ function findCli(): string {
   throw new Error(
     "Drift CLI not found. Build the workspace (npm run build) or install @drift/cli.",
   );
+}
+
+let VERSION = "0.0.0";
+try {
+  // dist/index.js → ../package.json (works in the monorepo and in the
+  // installed @drift/mcp under node_modules)
+  VERSION = (requireFromHere("../package.json") as { version?: string }).version ?? VERSION;
+} catch {
+  // packaged without package.json — fall back
 }
 
 const CLI = findCli();

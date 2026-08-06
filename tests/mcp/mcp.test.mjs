@@ -13,6 +13,13 @@ import { join, resolve } from "node:path";
 
 const MCP = resolve(process.cwd(), "packages", "drift-mcp", "dist", "index.js");
 
+// The server's version must come from the installed package.json (monorepo or
+// node_modules), never a hardcoded constant that drifts from the release.
+import { readFileSync } from "node:fs";
+const MCP_PKG_VERSION = JSON.parse(
+  readFileSync(resolve(process.cwd(), "packages", "drift-mcp", "package.json"), "utf8"),
+).version;
+
 function git(repo, args) {
   const res = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
   if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
@@ -104,6 +111,9 @@ test("initialize handshake", async () => {
     clientInfo: { name: "test-client", version: "1.0" },
   });
   assert.equal(result.serverInfo.name, "drift");
+  // Regression: serverInfo.version must track the package version, not a
+  // hardcoded constant (audit fix #3).
+  assert.equal(result.serverInfo.version, MCP_PKG_VERSION);
   assert.ok(result.capabilities.tools);
   client.notify("notifications/initialized", {});
 });

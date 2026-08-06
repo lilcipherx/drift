@@ -134,7 +134,16 @@ export class Drift {
     this.driftDir = join(repoRoot, ".drift");
     this.config = loadConfig(this.driftDir);
     this.redactionPatterns = compilePatterns(this.config.redaction.patterns);
-    this.store = IntentStore.open(join(this.driftDir, "drift.db"));
+    try {
+      this.store = IntentStore.open(join(this.driftDir, "drift.db"));
+    } catch (err) {
+      // A corrupted SQLite file surfaces as an opaque driver error; report it
+      // as a corrupt DAG (PRD §14.1 exit 5) instead of a generic error 1.
+      throw new DriftError(
+        `Drift database is corrupt or unreadable (${this.driftDir}/drift.db): ${err instanceof Error ? err.message : String(err)}. Restore it from a backup or run \`git clean -fdx .drift\` + \`drift init\` to start fresh.`,
+        EXIT.CORRUPT,
+      );
+    }
     const keys = this.loadKeys();
     this.privateKeyPem = keys.privateKeyPem;
     this.publicKeyPem = keys.publicKeyPem;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseToml, loadConfig } from "@drift/core";
+import { parseToml, loadConfig, redact, compilePatterns } from "@drift/core";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +33,16 @@ test("loadConfig defaults when no file", () => {
   assert.equal(cfg.encryption.enabled, false);
   assert.equal(cfg.encryption.key_provider, "env:DRIFT_MASTER_KEY");
   assert.ok(cfg.redaction.patterns.length > 0);
+});
+
+test("DEFAULT_CONFIG includes the Anthropic sk-ant- pattern (audit fix #2)", () => {
+  const cfg = loadConfig(mkdtempSync(join(tmpdir(), "drift-config-")));
+  const all = cfg.redaction.patterns.join("\n");
+  assert.ok(all.includes("sk-ant-"), "sk-ant- must be a default redaction pattern");
+  // and it actually matches an Anthropic-style key
+  const r = redact("key sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456", compilePatterns(cfg.redaction.patterns));
+  assert.equal(r.count, 1);
+  assert.ok(!r.text.includes("sk-ant-api03"));
 });
 
 test("loadConfig merges [encryption] section", () => {

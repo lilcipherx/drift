@@ -1,6 +1,6 @@
 {
   "name": "@drift/action",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drift GitHub Action metadata (the runnable action.yml lives at the repository root).",
   "license": "MIT",
   "files": ["action.yml"]

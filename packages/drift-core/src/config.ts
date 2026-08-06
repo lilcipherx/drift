@@ -23,6 +23,7 @@ export const DEFAULT_CONFIG: DriftConfig = {
     patterns: [
       "AKIA[0-9A-Z]{16}",
       "sk-[A-Za-z0-9_-]{20,}",
+      "sk-ant-[A-Za-z0-9_-]{20,}",
       "-----BEGIN [A-Z ]*PRIVATE KEY-----",
       "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}",
       "github_pat_[A-Za-z0-9_]{22,}",
@@ -49,6 +50,7 @@ fallback_to_text_on_error = true
 patterns = [
   "AKIA[0-9A-Z]{16}",
   "sk-[A-Za-z0-9_-]{20,}",
+  "sk-ant-[A-Za-z0-9_-]{20,}",
   "-----BEGIN [A-Z ]*PRIVATE KEY-----",
   "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}",
   "github_pat_[A-Za-z0-9_]{22,}",

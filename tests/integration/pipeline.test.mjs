@@ -495,6 +495,18 @@ test("log --file filters intents touching a file", () => {
   assert.equal(filtered.intents[0].prompt, "touch other");
 });
 
+test("corrupted .drift/drift.db → exit 5 (CORRUPT), not a generic error", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  const db = join(repo, ".drift", "drift.db");
+  writeFileSync(db, "this is not a sqlite database at all\n");
+  const res = run(repo, ["log", "--json"]);
+  assert.equal(res.status, 5, `expected exit 5, got ${res.status}: ${res.stderr}`);
+  assert.match(res.stdout + res.stderr, /corrupt|unreadable/i);
+  const parsed = parseJson(res.stdout + res.stderr);
+  assert.equal(parsed.type, "corrupt");
+});
+
 test("replay restores agent state and checkout", () => {
   const repo = makeRepo();
   run(repo, ["init"]);

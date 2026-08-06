@@ -1,6 +1,6 @@
 {
   "name": "@drift/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drift programmatic SDK: typed Drift client with Zod intent schemas (PRD §13.3).",
   "license": "MIT",
   "type": "module",

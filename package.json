@@ -1,6 +1,6 @@
 {
   "name": "drift-monorepo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Drift — Intent-Driven Versioning System. Git tracks what changed. Drift tracks why it changed and who (or what) decided.",
   "license": "MIT",

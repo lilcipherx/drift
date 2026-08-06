@@ -1,6 +1,6 @@
 {
   "name": "@drift/core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drift engine: intent store (SQLite), git wrapper, Ed25519 signing, secret redaction, and the realize/log/blame/verify pipelines.",
   "license": "MIT",
   "type": "module",

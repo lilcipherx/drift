@@ -57,6 +57,30 @@ All notable changes are tracked here (git-cliff style, kept manually).
   idempotent double `close()`, and zero uncaught exceptions / unhandled
   rejections — driving the real built code with only the GitHub API mocked.
 
+### Fixed (release audit)
+- `@drift/cli` package `types` pointed at `dist/index.d.ts`, which the build
+  never emits (only `cli.d.ts`) — a dangling types path for TS consumers.
+  Now `dist/cli.d.ts`.
+- The Anthropic `sk-ant-` key pattern existed in `redact.ts` defaults but was
+  missing from `config.ts` `DEFAULT_CONFIG`/template, so repos without a
+  custom `config.toml` did not redact Anthropic keys. Added to both.
+- A corrupted `.drift/drift.db` surfaced as a generic exit 1; it now reports
+  exit 5 (`corrupt`) with a recovery hint per PRD §14.1.
+- `@drift/mcp` `serverInfo.version` was a hardcoded `0.1.0` constant; it now
+  reads the real version from `package.json` (works in the monorepo and when
+  installed from npm), so it can never drift from the release.
+
+### Tests
+- `tests/unit/config.test.mjs`: `sk-ant-` must be a default pattern and
+  actually redact an Anthropic-style key.
+- `tests/integration/pipeline.test.mjs`: corrupted `drift.db` → exit 5
+  (`corrupt` type), not a generic error.
+- `tests/mcp/mcp.test.mjs`: `serverInfo.version` must equal the package
+  version (regression for the hardcoded constant).
+- `tests/unit/packaging.test.mjs`: every package `types`/`main`/`bin` target
+  must exist, and all package versions match the monorepo root (regression
+  for the dangling `@drift/cli` types path).
+
 ### Docs
 - ADR-008: CI workflows intentionally not committed (Actions disabled per
   maintainer); local gates replace them.

@@ -1,11 +1,11 @@
 {
   "name": "@drift/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drift CLI — intent-driven versioning. Git tracks what changed; Drift tracks why.",
   "license": "MIT",
   "type": "module",
   "main": "dist/cli.js",
-  "types": "dist/index.d.ts",
+  "types": "dist/cli.d.ts",
   "bin": {
     "drift": "dist/cli.js"
   },
