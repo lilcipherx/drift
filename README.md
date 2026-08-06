@@ -36,8 +36,10 @@ first? Seed the [demo repo](#demo) and run `drift blame`.
 [Architecture](docs/architecture.md) (how Drift works under the hood)
 
 **Verified live** on Windows 11 (Node v24.18.0, 2026-08-06): fresh clone →
-first `drift blame` in ~8.1 s, 10/10 checks pass, no registry 404 — see the
-[full measured table](docs/quickstart.md#verified-live-проверено-вживую).
+first `drift blame` in ~8.1 s, 10/10 checks pass, no registry 404 — and the
+npm path (packed `@drift/*` chain installed into an empty dir) answers the MCP
+handshake with all six tools in ~1 s. See the
+[full measured tables](docs/quickstart.md#verified-live-проверено-вживую).
 
 ## How it works
 

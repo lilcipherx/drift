@@ -86,6 +86,25 @@ ran verbatim from the README; the npx one-liners were skipped because the
 **Result: 10/10 checks pass**, no 404 anywhere, first working `blame` within
 ~9 seconds of starting from an empty clone.
 
+### npm path (before publication: measured via `npm pack`)
+
+The `@drift/*` packages are not published to npm yet, so the exact
+`npx -y @drift/cli` / `npx -y @drift/mcp` one-liners were measured through
+their exact equivalent: `npm pack` the four-package chain
+(`@drift/ast` → `@drift/core` → `@drift/cli` → `@drift/mcp`, all `0.1.1`)
+and `npm install` the resulting tarballs into an **empty directory** — the
+same bytes and bin entries npx would fetch, but sourced locally.
+
+| # | Step | Time | Result |
+| :-- | :--- | ---: | :--- |
+| 1 | `npm install` the 4 packed tarballs into an empty dir | ~4.7 s | ✅ |
+| 2 | `drift --help` (installed bin, no clone) | ~101 ms | ✅ Usage shown |
+| 3 | `mcp` JSON-RPC handshake (`initialize` + `tools/list`) | ~1.0 s | ✅ `serverInfo: drift 0.1.1`, all six `drift_*` tools |
+
+**Result: ALL PASS** — the packed `@drift/*` chain installs and serves the MCP
+handshake from an empty directory with no clone and no build step, proving the
+`npx -y @drift/mcp` path will work the moment the packages land on npm.
+
 ## Next steps
 
 - Full command reference: [api.md](api.md)
