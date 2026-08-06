@@ -23,8 +23,8 @@ working build.
    All manifests already target `npx -y @drift/mcp`; they start working the
    moment the chain is published via `bash scripts/publish-npm.sh` (needs an
    npm login/token on this machine). After publishing: re-run
-   `npx -y @drift/mcp handshake` from an empty dir and mark the README
-   "Verified live" table.
+   `npx -y @drift/mcp handshake` from an empty dir and record the result in
+   the README Installation section.
 2. **CI workflows** — deliberately not committed (ADR-008; Actions disabled on
    the account). When re-enabled, add `.github/workflows/{ci,release,eval}.yml`
    wrapping `npm test`, `npm run eval`, `scripts/acceptance-mvs.sh`.

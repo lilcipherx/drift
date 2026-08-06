@@ -61,6 +61,8 @@ All notable changes are tracked here (git-cliff style, kept manually).
 - ADR-008: CI workflows intentionally not committed (Actions disabled per
   maintainer); local gates replace them.
 - README: Evaluation section, test-count badges updated to 101.
+- README: removed the end-to-end verification results table (verification is
+  covered by the live suites in `tests/` and the scripts in `scripts/`).
 
 ## [0.3.0] — 2026-08-05
 
@@ -121,12 +123,13 @@ All notable changes are tracked here (git-cliff style, kept manually).
   packages are published to npm (only `DRIFT_REPO` must be set). CLI is
   available the same way: `npx -y @drift/cli`. `@drift/mcp` gains a `mcp` bin
   entry so npx resolves the executable by package name.
-- README gains a **“Verified live”** section documenting the real end-to-end
-  test (fresh clone + `npm install` + MCP handshake + CLI cycle + `claude mcp
-  add` executed for real, with results and dates) — including the npm path:
-  the packed `@drift/*` tarballs installed via `npm install` into an empty
-  directory answered `serverInfo: drift 0.1.0` with all six tools (`HANDSHAKE
-  OK`), proving `npx -y @drift/mcp` needs no clone.
+- README documented the real end-to-end verification: fresh clone + `npm
+  install` + MCP handshake + CLI cycle + `claude mcp add` (results and
+  dates), including the npm path — the packed `@drift/*` tarballs installed
+  via `npm install` into an empty directory answered `serverInfo: drift
+  0.1.0` with all six tools (`HANDSHAKE OK`), proving `npx -y @drift/mcp`
+  needs no clone. (That results table was later removed from the README;
+  the checks live on in `tests/` and `scripts/`.)
 - Fixed `@drift/cli` `main` field (`dist/index.js` → `dist/cli.js`) — the CLI
   package only builds `cli.js`, so the old `main` pointed at a file that does
   not exist (broke `import "@drift/cli"`).
