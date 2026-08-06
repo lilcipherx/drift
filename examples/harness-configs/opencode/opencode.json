@@ -3,7 +3,7 @@
   "mcp": {
     "drift": {
       "type": "local",
-      "command": ["npx", "-y", "@drift/mcp"],
+      "command": ["node", "/abs/path/to/drift/packages/drift-mcp/dist/index.js"],
       "environment": {
         "DRIFT_REPO": "/abs/path/to/your/repo"
       },

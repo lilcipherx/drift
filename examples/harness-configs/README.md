@@ -1,13 +1,19 @@
 # Harness configs
 
 Ready-to-use configuration files that wire the Drift MCP server
-(`@drift/mcp`) into 11 coding-agent harnesses.
+(`packages/drift-mcp/dist/index.js`) into 11 coding-agent harnesses.
 
-All examples launch the MCP server via `npx -y @drift/mcp` (fetched from npm —
-no clone needed). The only placeholder to replace:
+> **Status: the `@drift/*` npm packages are not published yet.** Every example
+> below leads with the **clone path** — `node /abs/path/to/drift/packages/drift-mcp/dist/index.js` —
+> which works right now from a checkout of this repository. The `npx -y @drift/mcp`
+> one-liners activate automatically once the packages land on npm; until then
+> they return a 404, so use the clone command shown first.
+
+The only placeholders to replace:
 
 | Placeholder | Replace with |
 | :--- | :--- |
+| `/abs/path/to/drift` | the directory where you checked out this repository |
 | `/abs/path/to/your/repo` | the repository Drift should operate on (`DRIFT_REPO`) |
 
 ## File-based harnesses
@@ -33,6 +39,24 @@ see each folder for the exact steps:
 | [Codex App](codex-app/README.md) | App settings → MCP servers → add local server |
 | [Factory Droid](factory-droid/README.md) | Droid MCP settings → add local server |
 | [Kimi Code](kimi-code/README.md) | Kimi Code MCP settings → add local server |
+
+## After publication (npm)
+
+Once the `@drift/*` packages are published, every config above can swap the
+server command to `npx -y @drift/mcp` (no clone, no local path). For example,
+the Claude Code block becomes:
+
+```json
+{
+  "mcpServers": {
+    "drift": {
+      "command": "npx",
+      "args": ["-y", "@drift/mcp"],
+      "env": { "DRIFT_REPO": "/abs/path/to/your/repo" }
+    }
+  }
+}
+```
 
 ## Verification
 

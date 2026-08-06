@@ -11,8 +11,8 @@
   "mcpServers": {
     "drift": {
       "type": "local",
-      "command": "npx",
-      "args": ["-y", "@drift/mcp"],
+      "command": "node",
+      "args": ["packages/drift-mcp/dist/index.js"],
       "env": {
         "DRIFT_REPO": "${DRIFT_REPO}"
       }

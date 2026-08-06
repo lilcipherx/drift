@@ -1,7 +1,15 @@
 # ~/.codex/config.toml — add the [mcp_servers.drift] block.
 # Restart Codex after editing; the six drift_* tools will appear.
 
+# Works right now from a checkout of the Drift repository
+# (the @drift/* packages are not published to npm yet):
 [mcp_servers.drift]
-command = "npx"
-args = ["-y", "@drift/mcp"]
+command = "node"
+args = ["/abs/path/to/drift/packages/drift-mcp/dist/index.js"]
 env = { DRIFT_REPO = "/abs/path/to/your/repo" }
+
+# Once the packages are published, the same server runs via npx (no clone):
+# [mcp_servers.drift]
+# command = "npx"
+# args = ["-y", "@drift/mcp"]
+# env = { DRIFT_REPO = "/abs/path/to/your/repo" }

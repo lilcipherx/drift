@@ -2,10 +2,9 @@
   "$schema": "https://json.schemastore.org/mcp.json",
   "mcpServers": {
     "drift": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "@drift/mcp"
+        "/abs/path/to/drift/packages/drift-mcp/dist/index.js"
       ],
       "env": {
         "DRIFT_REPO": "/path/to/your/repository"
