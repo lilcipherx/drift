@@ -35,6 +35,10 @@ first? Seed the [demo repo](#demo) and run `drift blame`.
 [API reference](docs/api.md) (CLI + MCP tools) ·
 [Architecture](docs/architecture.md) (how Drift works under the hood)
 
+**Verified live** on Windows 11 (Node v24.18.0, 2026-08-06): fresh clone →
+first `drift blame` in ~8.1 s, 10/10 checks pass, no registry 404 — see the
+[full measured table](docs/quickstart.md#verified-live-проверено-вживую).
+
 ## How it works
 
 It starts the moment you run `drift init`. Drift creates `.drift/` — a SQLite DAG,
