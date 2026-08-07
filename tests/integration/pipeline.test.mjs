@@ -483,6 +483,23 @@ test("deleted files produce a DELETED intent delta", () => {
   );
 });
 
+test("log --limit clamps negative values instead of returning unbounded rows", () => {
+  const repo = makeRepo();
+  run(repo, ["init"]);
+  for (let i = 0; i < 3; i++) {
+    writeFileSync(join(repo, "src", "auth.ts"), `export const v${i} = ${i};\n`);
+    assert.equal(run(repo, ["realize", "-p", `change ${i}`, "--json"]).status, 0);
+  }
+  // --limit 0 is clamped to 1 (documented safeLimit contract)
+  const lim0 = parseJson(run(repo, ["log", "--limit", "0", "--json"]).stdout);
+  assert.equal(lim0.status, "ok");
+  assert.equal(lim0.intents.length, 1, `--limit 0 should clamp to 1 row, got ${lim0.intents.length}`);
+  // --limit -3 must clamp too (a user typo must never return ALL rows)
+  const limNeg = parseJson(run(repo, ["log", "--limit", "-3", "--json"]).stdout);
+  assert.equal(limNeg.status, "ok");
+  assert.equal(limNeg.intents.length, 1, `--limit -3 should clamp to 1 row, got ${limNeg.intents.length}`);
+});
+
 test("log --file filters intents touching a file", () => {
   const repo = makeRepo();
   run(repo, ["init"]);

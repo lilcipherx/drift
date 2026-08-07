@@ -56,7 +56,9 @@ function parseArgs(argv: string[]): Args {
         flags.set(a.slice(2, eq), a.slice(eq + 1));
       } else {
         const next = argv[i + 1];
-        if (next !== undefined && !next.startsWith("-")) {
+        // A following token is this flag's value unless it looks like another
+        // flag. Negative numbers (`--limit -3`) ARE values, never flags.
+        if (next !== undefined && (!next.startsWith("-") || /^-\d/.test(next))) {
           flags.set(a.slice(2), next);
           i++;
         } else {
