@@ -62,9 +62,11 @@ If `doctor` reports corruption, never edit `.drift/` by hand — re-run
 
 Add `--json` for machine-readable output. Successful commands print
 `{ "status": "ok", ... }` to stdout; errors print
-`{ "status": "error", "type", "message", "exitCode" }`. `log --json` returns
-intents with `authorType` (`agent`/`human`), `model`, `prompt`, `gitSha`;
-`verify --json` returns `verifyStatus: "pass"|"fail"|"no-command"`.
+`{ "status": "error", "type", "message", "exitCode" }` (thrown errors go to
+stderr, usage errors to stdout; MCP merges both). `log --json` returns
+intents with `authorType` (`"AGENT"`/`"HUMAN"`, uppercase), `model`, `prompt`,
+`gitSha`; `verify --json` returns
+`verifyStatus: "pass"|"fail"|"no-command"`.
 
 ## Environment
 
@@ -88,7 +90,8 @@ Copilot, Gemini, …), the same operations are exposed as six tools:
 | `drift_verify` | `drift verify` |
 | `drift_log` | `drift log` |
 
-Tools return structured JSON errors (`{ "status": "error", "type", ... }`),
+Tools return structured JSON errors (every tool: `{ "status": "error",
+"details" }`; `drift_realize` additionally carries `type` and `exitCode`),
 never crash the server — hostile input (path traversal `../`, empty prompts)
 is rejected with a clean error.
 
