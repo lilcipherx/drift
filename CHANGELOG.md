@@ -57,6 +57,14 @@ All notable changes are tracked here (git-cliff style, kept manually).
   idempotent double `close()`, and zero uncaught exceptions / unhandled
   rejections — driving the real built code with only the GitHub API mocked.
 
+### Docs
+- `skills/drift/SKILL.md` expanded: MCP tool table (6 `drift_*` tools),
+  exit-code contract (0–5), `--json` output shapes, `DRIFT_REPO` /
+  `DRIFT_MASTER_KEY` / `NO_COLOR` env vars, doctor/export workflow, and
+  security defaults (redaction, path containment, telemetry off).
+- Test-count references refreshed to 110/110 (`README` badge + CONTRIBUTING
+  wording, `AUDIT.md`, `NEXT_STEPS.md`).
+
 ### Fixed (release audit)
 - `@drift/cli` package `types` pointed at `dist/index.d.ts`, which the build
   never emits (only `cli.d.ts`) — a dangling types path for TS consumers.

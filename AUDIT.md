@@ -1,6 +1,6 @@
 # Audit Ledger
 
-Release audit (final): every tracked file reviewed. Source files read line-by-line; configs/manifests/docs inspected; dist rebuilt from fixed sources and re-verified by the full suite + live CLI/MCP/edge/security runs. Live verification: npm test 109/109, eval gate passed, MVS acceptance passed, CLI E2E 24/24, MCP E2E all pass, edge+security 31/31, action.yml simulated. ACCEPTED-RISK entries are the only non-fixed ones.
+Release audit (final): every tracked file reviewed. Source files read line-by-line; configs/manifests/docs inspected; dist rebuilt from fixed sources and re-verified by the full suite + live CLI/MCP/edge/security runs. Live verification: npm test 110/110, eval gate passed, MVS acceptance passed, CLI E2E 24/24, MCP E2E all pass, edge+security 31/31, action.yml simulated. ACCEPTED-RISK entries are the only non-fixed ones.
 
 ## File coverage (100%)
 
@@ -223,7 +223,7 @@ Release audit (final): every tracked file reviewed. Source files read line-by-li
 
 ## Verification (real runs)
 
-- `npm test`: 109/109 pass
+- `npm test`: 110/110 pass
 - `npm run eval`: gate passed (syntaxRejectionRate=1, blameAccuracy=1, replayFidelity=1)
 - `scripts/acceptance-mvs.sh`: PRD §4.2 acceptance passed
 - CLI E2E (24 checks): init/realize/log/blame/context/verify/replay/doctor/export, exit codes 2/3/4/5, `--json` shapes

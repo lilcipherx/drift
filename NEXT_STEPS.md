@@ -14,7 +14,7 @@ working build.
 - **Eval harness (PRD §22)** — `eval/harness.mjs` + `eval/scenarios/*.json` +
   recorded `eval/baseline.json`; metrics: syntax-rejection 100%, blame
   accuracy 1.0, replay fidelity 1.0; >5% regression gate. `npm run eval`.
-- **Tests**: 98/98 green (`npm test`).
+- **Tests**: 110/110 green (`npm test`).
 
 ## Remaining roadmap (PRD §27, §31)
 
