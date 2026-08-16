@@ -64,9 +64,15 @@ parse pre-state (HEAD) → stage source (never .drift private paths)
    → insert DAG rows (git SHA recorded only in the local private DB) → update head
 ```
 
-If `git commit` fails (e.g. an identity or pre-commit-hook error) the
-newly generated manifest is removed and only the manifest is unstaged — the
-user's source changes stay staged for a safe retry.
+If ANY step before the commit lands fails (staging, AST/syntax analysis,
+redaction, private-object writing, signing, manifest writing, public-file
+staging, `git commit` itself — e.g. missing identity or a failing
+pre-commit hook) the byte-for-byte index snapshot taken at the start is
+RESTORED EXACTLY: partially staged hunks, intent-to-add, staged renames /
+deletions and index flags all survive, and only the files this operation
+generated are removed. A successful commit is never rolled back; a
+post-commit local-DB failure leaves the commit and its manifest in place and
+reports the recoverable indexing problem (`drift doctor` reindexes).
 
 ## Storage
 
@@ -193,17 +199,29 @@ provenance-integrity semantics is shared by every consumer:
   fields enumerated: unknown top-level / `agent` / `files` fields are
   REJECTED (a field that is not in the schema can never silently join the
   signed payload). Raw byte size is enforced BEFORE `JSON.parse`
-  (`MANIFEST_MAX_BYTES` = 256 KiB; public key bounded; per-PR audit bounded
-  at 200 manifests / 50 MiB total). Signature verification runs over the
-  canonical original payload; sanitization only affects rendering.
+  (`MANIFEST_MAX_BYTES` = 256 KiB; public key bounded). The App audit is
+  PR-scoped via the paginated changed-files API: limits apply ONLY to public
+  provenance CHANGED by the current PR (200 files / 50 MiB changed content),
+  never to accumulated history — a repository with millions of unchanged
+  historical manifests still allows an ordinary source-only PR, and an
+  incomplete changed-files listing is reported as an incomplete audit.
+  Signature verification runs over the canonical original payload;
+  sanitization only affects rendering.
+- **Immutable PR trust inputs (Action)** — base key from
+  `pull_request.base.sha`, head key + head manifests from
+  `pull_request.head.sha` (`git show <sha>:<path>`). `HEAD` and the working
+  tree are NEVER used for trust: a synthetic merge checkout, a mutated
+  worktree or an earlier workflow step cannot influence the result, and
+  missing history fails safely with a `fetch-depth: 0` message.
 - **Append-only manifests with atomic introduction** — an existing manifest
-  may never be modified, deleted or renamed (compared by exact blob content,
-  never by filename presence). A new manifest is legitimate only when its
-  introducing commit (the first PR commit containing the file) carries
-  exactly one matching `Drift-Intent:` trailer, the id was not already
-  present on the base branch (replay), the id is referenced by exactly one
-  commit (ambiguous otherwise), and the PR-head blob is byte-identical to
-  the introduced blob (added-then-modified is a violation).
+  may never be modified, deleted or renamed. A new manifest is legitimate
+  only when its introducing commit (the first PR commit containing the file)
+  carries exactly one matching `Drift-Intent:` trailer, the id was not
+  already present on the base branch (replay), the id is referenced by
+  exactly one commit (ambiguous otherwise), and the PR-head blob is
+  byte-identical to the introduced blob (added-then-modified is a
+  violation). Both integrations evaluate the manifest at the immutable
+  introduction/head commits.
 - **Trust conclusions** — one shared policy maps manifest states and
   integrity violations to `success` / `neutral` / `failure` for the Check
   Run and the Action's exit code.
@@ -241,11 +259,22 @@ provenance-integrity semantics is shared by every consumer:
   fingerprint, so formatting-only PEM differences never register as a key
   replacement.
 - **Index safety:** `drift realize` snapshots the real git index file
-  byte-for-byte before touching anything and restores it exactly on any
-  pre-commit failure (partial hunks, intent-to-add, renames, deletions,
-  assume-unchanged/skip-worktree flags survive). The snapshot is discarded
-  on success and never leaks: no `drift-idx-*` backup remains after success,
-  failure, or repeated runs on a persistent self-hosted runner.
+  byte-for-byte before touching anything and restores it exactly on ANY
+  failure before the commit lands — including a failed `git commit` (missing
+  identity, failing pre-commit hooks) — so partial hunks, intent-to-add,
+  renames, deletions and assume-unchanged/skip-worktree flags survive.
+  Generated public files are rolled back to their pre-operation state;
+  successful commits and post-commit local-DB failures are never rolled
+  back. The snapshot is discarded on success and never leaks: no
+  `drift-idx-*` backup remains after success, failure, or repeated runs on a
+  persistent self-hosted runner.
+- **Immutable PR inputs (Action):** trust decisions use ONLY
+  `pull_request.base.sha` / `pull_request.head.sha` git objects — never
+  `HEAD` or the working tree, so a synthetic merge checkout, a mutated
+  worktree or an earlier workflow step cannot influence the result; missing
+  history fails safely with a `fetch-depth: 0` message. An initial
+  trust-root bootstrap is visible and neutral; replacement/removal are
+  blocking failures.
 - **Shell execution (opt-in):** `drift verify <id>` is informational by
   default — it validates the manifest, reports the signature/trust state and
   shows the recorded command WITHOUT executing it. A recorded verification
