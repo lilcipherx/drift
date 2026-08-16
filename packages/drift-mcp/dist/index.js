@@ -112,7 +112,11 @@ server.registerTool("drift_realize", {
     title: "Drift Realize",
     description: "Commit changes with semantic intent tracking. Use instead of `git commit`. Rejects broken syntax before commit (never pollutes history). Prompts are redacted for secrets.",
     inputSchema: {
-        prompt: z.string().describe("What you changed and why (the intent)"),
+        prompt: z.string().describe("What you changed and why (the intent) — stays PRIVATE by default"),
+        summary: z
+            .string()
+            .optional()
+            .describe("Safe PUBLIC summary — appears in git history, manifests, PR comments. Redacted and sanitized. Never derived from the prompt."),
         files: z.array(z.string()).optional().describe("Optional file paths to include (default: all changes)"),
         model: z.string().optional().describe("Model identifier, e.g. claude-3-5-sonnet"),
         agentState: z.string().optional().describe("base64 JSON cognitive state to checkpoint for replay"),
@@ -120,6 +124,8 @@ server.registerTool("drift_realize", {
     },
 }, async (args) => {
     const cliArgs = ["realize", "-p", String(args.prompt ?? ""), "--agent"];
+    if (args.summary)
+        cliArgs.push("--summary", String(args.summary));
     if (Array.isArray(args.files))
         cliArgs.push(...args.files.map(String));
     if (args.model)

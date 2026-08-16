@@ -24,7 +24,7 @@ Git tracks what changed. Drift tracks why.
 Usage:
   drift init                       Initialize .drift metadata for this repository
   drift status                     Show repository state and the next step
-  drift realize -p "prompt" [files...] [--model m] [--agent] [--state b64] [--verify-cmd cmd] [--no-ast]
+  drift realize -p "prompt" [--summary "safe public text"] [files...] [--model m] [--agent] [--state b64] [--verify-cmd cmd] [--no-ast]
                                    Commit changes with semantic intent (rejects broken syntax)
   drift log [--author x] [--model m] [--file f] [--limit n] [--json]
   drift blame <file> --line N | --function name [--json]
@@ -38,6 +38,8 @@ Usage:
 Options:
   --json       machine-readable output
   --no-color   disable ANSI colors
+  --summary TEXT   public summary for the intent (realize). Redacted, sanitized
+                   and length-limited; never derived from the prompt.
   --include-private-prompt   ALSO output the full local prompt (log/blame/context)
                              — sensitive; never use in CI or on public surfaces
 `;
@@ -176,6 +178,8 @@ function run(argv) {
                     console.log(colorize(!noColor, "green", "✓ Drift repository"));
                     console.log(`  repo:        ${result.repoRoot}`);
                     console.log(`  intents:     ${result.intents ?? 0}`);
+                    console.log(`    public:    ${result.publicIntents ?? 0} (committed provenance)`);
+                    console.log(`    local:     ${result.localIntents ?? 0} (private store)`);
                     if (result.lastIntent) {
                         console.log(`  last intent: ${result.lastIntent.id} (${new Date(result.lastIntent.timestamp).toISOString().slice(0, 19).replace("T", " ")})`);
                     }
@@ -197,6 +201,7 @@ function run(argv) {
                 const drift = Drift.fromCwd(process.cwd());
                 const result = drift.realize({
                     prompt,
+                    summary: stringFlag(flags, "summary") ?? undefined,
                     files: positional,
                     model: stringFlag(flags, "model"),
                     author: stringFlag(flags, "author"),
