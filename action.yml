@@ -5,6 +5,9 @@ inputs:
   command:
     description: "drift subcommand to run against the repo (log | doctor | verify <intent-id>)"
     default: "log"
+  comment:
+    description: "Post (or update in place) a Drift intent-summary comment on the PR. Requires GITHUB_TOKEN; skipped automatically on non-PR runs or repos without Drift intents."
+    default: "true"
 runs:
   using: "composite"
   steps:
@@ -28,3 +31,12 @@ runs:
         exit $DRIFT_EXIT
       env:
         DRIFT_COMMAND: ${{ inputs.command }}
+    # Idempotent provenance summary: posts once, then PATCHes the same
+    # marker comment on every synchronize/force-push. Never spams.
+    - name: "Post Drift PR summary comment"
+      if: ${{ inputs.comment == 'true' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        DRIFT_CLI: ${{ github.action_path }}/packages/drift-cli/dist/cli.js
+      run: node "$GITHUB_ACTION_PATH/scripts/pr-comment.mjs"

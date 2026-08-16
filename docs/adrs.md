@@ -55,19 +55,22 @@
 - **Justification:** SQLite re-serialization is not guaranteed byte-identical to
   what was signed (array ordering); the object file is what was actually signed.
 
-## ADR-008: CI workflows are not committed to the repository
+## ADR-008: CI workflows
 
 - **Problem:** the PRD (§36, launch checklist) specifies
-  `.github/workflows/{ci,release,eval}.yml`, but the account's Actions had to
-  be disabled (billing / failing runs on `main`), per the maintainer's explicit
-  instruction to remove CI and keep zero failing checks.
-- **Decision:** `.github/workflows/` is intentionally **not** committed.
-  Local validation is fully covered instead: `npm test` (98 tests),
-  `npm run eval` (scenario suite + baseline gate), `bash scripts/acceptance-mvs.sh`
-  (PRD §4.2 acceptance), and `npm run build` (typecheck). The workflows are
-  one `git commit` away when Actions is re-enabled — the checkpoints they
-  encoded are exactly the commands above.
-- **Justification:** the PRD's *intent* — a release pipeline that fails on
-  regression — is preserved by the eval regression gate and the local test
-  suite; committing workflow files to a disabled-Actions account would only
-  recreate the failing runs the maintainer asked to remove.
+  `.github/workflows/{ci,release,eval}.yml`; the account's Actions were
+  disabled at one point (billing / failing runs on `main`), and the
+  maintainer asked for zero failing checks.
+- **Decision (2026-08-16, amended):** `.github/workflows/ci.yml` **is now
+  committed** — the owner direction moved to "real CI for external
+  contributors". It runs on `push` to `main` and `pull_request` on a
+  `ubuntu-latest` + `windows-latest` × Node 24 matrix: `npm ci` →
+  `npm run build` (typecheck) → `npm test` (118 tests) → `npm run eval`
+  (scenario suite + regression gate) → `bash scripts/acceptance-mvs.sh`
+  (PRD §4.2 acceptance) → an npm-pack smoke test (packs the four-package
+  chain into an empty dir and runs the installed `drift version`, no
+  registry). Every step uses commands that are verified green locally.
+- **Justification:** OSS contributors need a visible green check; the eval
+  regression gate and test suite are the substance, CI is their public face.
+  If the account's Actions are ever disabled again, the same commands still
+  run locally via `npm test` / `npm run eval` / `scripts/acceptance-mvs.sh`.
