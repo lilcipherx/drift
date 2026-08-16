@@ -100,6 +100,7 @@ export function validateManifest(json, { expectedId } = {}) {
   }
   if (typeof json.summary !== "string") push("summary", "expected a string");
   else if (json.summary.length > MANIFEST_SUMMARY_MAX) push("summary", "too long");
+  else if (json.summary.trim().length === 0) push("summary", "must not be empty or whitespace-only");
   else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(json.summary)) push("summary", "control characters");
   if (typeof json.timestamp !== "number" || !Number.isInteger(json.timestamp) || json.timestamp < 0) {
     push("timestamp", "expected a non-negative integer");
@@ -121,14 +122,23 @@ export function validateManifest(json, { expectedId } = {}) {
       push("agent", "expected an object");
     } else {
       if (typeof json.agent.type !== "string" || json.agent.type.length === 0 || json.agent.type.length > 20) push("agent.type", "invalid");
+      else if (sv === 2 && json.agent.type !== "HUMAN" && json.agent.type !== "AGENT") push("agent.type", `unsupported agent type "${json.agent.type}"`);
       if (typeof json.agent.identifier !== "string" || json.agent.identifier.length > MANIFEST_META_MAX) push("agent.identifier", "invalid");
+      else if (json.agent.identifier.trim().length === 0) push("agent.identifier", "must not be empty");
+      else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(json.agent.identifier)) push("agent.identifier", "control characters");
       for (const key of Object.keys(json.agent)) {
         if (key !== "type" && key !== "identifier") push(`agent.${key}`, "unknown field");
       }
     }
   }
-  if (json.model !== undefined && (typeof json.model !== "string" || json.model.length > MANIFEST_META_MAX)) push("model", "invalid");
-  if (json.verification !== undefined && (typeof json.verification !== "string" || json.verification.length > MANIFEST_VERIFY_MAX)) push("verification", "invalid");
+  if (json.model !== undefined) {
+    if (typeof json.model !== "string" || json.model.length > MANIFEST_META_MAX) push("model", "invalid");
+    else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(json.model)) push("model", "control characters");
+  }
+  if (json.verification !== undefined) {
+    if (typeof json.verification !== "string" || json.verification.length > MANIFEST_VERIFY_MAX) push("verification", "invalid");
+    else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(json.verification)) push("verification", "control characters");
+  }
   if (json.files !== undefined) {
     if (!Array.isArray(json.files)) push("files", "expected an array");
     else if (json.files.length > MANIFEST_FILES_MAX) push("files", "too many entries");
@@ -138,8 +148,12 @@ export function validateManifest(json, { expectedId } = {}) {
         return;
       }
       if (typeof f.path !== "string" || f.path.length === 0 || f.path.length > MANIFEST_FILE_PATH_MAX) push(`files[${i}].path`, "invalid");
+      else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(f.path)) push(`files[${i}].path`, "control characters");
       if (typeof f.mutationType !== "string" || !MUTATION_ENUM.has(f.mutationType)) push(`files[${i}].mutationType`, "unsupported");
-      if (f.summary !== undefined && (typeof f.summary !== "string" || f.summary.length > MANIFEST_FILE_SUMMARY_MAX)) push(`files[${i}].summary`, "invalid");
+      if (f.summary !== undefined) {
+        if (typeof f.summary !== "string" || f.summary.length > MANIFEST_FILE_SUMMARY_MAX) push(`files[${i}].summary`, "invalid");
+        else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(f.summary)) push(`files[${i}].summary`, "control characters");
+      }
       for (const key of Object.keys(f)) {
         if (key !== "path" && key !== "mutationType" && key !== "summary") push(`files[${i}].${key}`, "unknown field");
       }
@@ -155,16 +169,8 @@ export function validateManifest(json, { expectedId } = {}) {
   return errors.length > 0 ? fail() : { ok: true, value: json };
 }
 
-/** Read + strictly validate one manifest. Never throws on hostile files. */
-export function readManifest(repoRoot, id) {
-  const path = join(repoRoot, ".drift", "public", "intents", `${id}.json`);
-  if (!existsSync(path)) return { manifest: null, errors: null };
-  let raw;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return { manifest: null, errors: [{ field: "$file", message: "manifest file unreadable" }] };
-  }
+/** Strictly validate the raw text of one manifest. Never throws. */
+function validateManifestRaw(raw, id) {
   if (Buffer.byteLength(raw, "utf8") > MANIFEST_MAX_BYTES) {
     return { manifest: null, errors: [{ field: "$file", message: "manifest exceeds maximum size" }] };
   }
@@ -176,6 +182,32 @@ export function readManifest(repoRoot, id) {
   }
   const result = validateManifest(parsed, { expectedId: id });
   return result.ok ? { manifest: result.value, errors: null } : { manifest: null, errors: result.errors };
+}
+
+/** Read + strictly validate one manifest from the WORKING TREE. */
+export function readManifest(repoRoot, id) {
+  const path = join(repoRoot, ".drift", "public", "intents", `${id}.json`);
+  if (!existsSync(path)) return { manifest: null, errors: null };
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return { manifest: null, errors: [{ field: "$file", message: "manifest file unreadable" }] };
+  }
+  return validateManifestRaw(raw, id);
+}
+
+/**
+ * Read + strictly validate one manifest from an IMMUTABLE git ref
+ * (`git show <sha>:<path>`). Pull-request trust decisions must never depend
+ * on the working tree (which a synthetic merge checkout, a mutated worktree
+ * or an earlier workflow step can change): the PR-head commit is the only
+ * accepted source.
+ */
+export function readManifestAt(repoRoot, sha, id, gitImpl = git) {
+  const res = gitImpl(repoRoot, ["show", `${sha}:.drift/public/intents/${id}.json`]);
+  if (res.status !== 0) return { manifest: null, errors: null }; // absent at that ref
+  return validateManifestRaw(res.stdout, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +362,12 @@ export function getFileAt(repoRoot, ref, path, gitImpl = git) {
   return res.stdout;
 }
 
+/** Whether a git ref/commit exists in this clone (`git cat-file -e`). */
+export function refExists(repoRoot, sha, gitImpl = git) {
+  if (typeof sha !== "string" || sha.length === 0) return false;
+  return gitImpl(repoRoot, ["cat-file", "-e", `${sha}^{commit}`]).status === 0;
+}
+
 /** Key-order-stable JSON stringify (mirrors @drift/core canonicalJson). */
 export function canonicalJson(value) {
   const sort = (v) => {
@@ -449,7 +487,7 @@ export function trustRootIdentity(publicKeyPem) {
  * never used, because in legacy `full`-mode commits the subject may contain a
  * complete private prompt.
  */
-export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManifestImpl = readManifest }) {
+export function intentsFromCommits({ repoRoot, headSha, commits, gitImpl = git, readManifestImpl }) {
   const ids = [];
   const seen = new Set();
   const intro = new Map(); // intent id -> sha (first PR commit referencing it)
@@ -468,7 +506,12 @@ export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManif
 
   const intents = [];
   for (const id of ids) {
-    const loaded = readManifestImpl(repoRoot, id);
+    // In the Action, manifests are read from the IMMUTABLE pull-request HEAD
+    // commit — never from the working tree (synthetic merge HEAD / mutated
+    // worktree / earlier workflow steps must not influence trust).
+    const manifestReader =
+      readManifestImpl ?? (headSha ? (root, intentId) => readManifestAt(root, headSha, intentId, gitImpl) : readManifest);
+    const loaded = manifestReader(repoRoot, id);
     const manifest = loaded?.manifest ?? null;
     const malformed = Boolean(loaded && Array.isArray(loaded.errors) && loaded.errors.length > 0);
     intents.push({
@@ -678,16 +721,32 @@ export function hasProvenanceError({ intents, keyChange, audit }) {
 /**
  * Build the summary comment body. Returns null when there is nothing to say
  * (no intents, no trust-root change, no provenance-integrity violations).
+ * `keyChange` is the FULL trust-root state — "none" | "bootstrap" |
+ * "replaced" | "removed" — never reduced to a boolean, so an initial
+ * bootstrap stays visible (and neutral) while replacement/removal render the
+ * blocking warning.
  */
 export function buildSummary(intents, { keyChange, audit } = {}) {
   const hasIntents = Array.isArray(intents) && intents.length > 0;
   const integrityIssues =
     audit &&
     (audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0);
-  if (!hasIntents && !keyChange && !integrityIssues) return null;
+  const keyState = keyChange ?? "none";
+  const blockingKey = keyState === "replaced" || keyState === "removed";
+  const bootstrapping = keyState === "bootstrap";
+  if (!hasIntents && !blockingKey && !bootstrapping && !integrityIssues) return null;
   const lines = [SUMMARY_MARKER];
-  if (keyChange) {
+  if (blockingKey) {
     lines.push(TRUST_ROOT_WARNING);
+    if (!hasIntents && !integrityIssues) return lines.join("\n");
+    lines.push("", "---", "");
+  }
+  if (bootstrapping) {
+    lines.push("## Drift — initial trust-root bootstrap");
+    lines.push("");
+    lines.push(
+      "This pull request introduces the first Drift public signing key (`.drift/public/key.pem`). The introduced key is recorded but NOT blindly trusted — provenance on this PR is classified as an unverified bootstrap. Establish trust through the documented key process before relying on future provenance.",
+    );
     if (!hasIntents && !integrityIssues) return lines.join("\n");
     lines.push("", "---", "");
   }
@@ -896,26 +955,38 @@ async function main() {
 
   const failOnError = process.env.FAIL_ON_COMMENT_ERROR === "true";
   // `fail-on-provenance-error` (default true): a non-zero exit for invalid or
-  // tampered provenance, set only AFTER the safe step summary and comment are
-  // written. Neutral states never fail the workflow by default.
+  // tampered provenance, applied INDEPENDENTLY of the comment and of the
+  // GITHUB_TOKEN — a missing token must never bypass the provenance failure.
   const failOnProvenanceError = process.env.FAIL_ON_PROVENANCE_ERROR !== "false";
   const repoRoot = process.env.DRIFT_REPO || process.cwd();
 
-  // 2. PR commit range — never the last N repo-wide intents.
+  // 2. PR commit range — never the last N repo-wide intents. Both event SHAs
+  // must exist in this clone: trust decisions are made ONLY from the
+  // immutable pull_request.base.sha / pull_request.head.sha git objects.
+  if (!refExists(repoRoot, event.baseSha) || !refExists(repoRoot, event.headSha)) {
+    console.error("pr-comment: base/head SHAs from the pull_request event are missing in this checkout");
+    appendStepSummary(
+      "_Drift: could not find the pull-request base/head commits in this checkout. Make sure `actions/checkout` uses `fetch-depth: 0` (and `ref: ${{ github.event.pull_request.head.sha }}` where needed) so the immutable event SHAs are available._",
+    );
+    process.exitCode = 1;
+    return;
+  }
   const range = prCommitShas(repoRoot, event.baseSha, event.headSha);
   if (!range.ok || range.shas.length === 0) {
     console.log(`pr-comment: cannot compute PR commit range (${range.reason}) — skipping`);
     appendStepSummary(
       `_Drift: could not compute the pull-request commit range (${range.reason}). Make sure \`actions/checkout\` uses \`fetch-depth: 0\` so base history is available._`,
     );
+    process.exitCode = 1;
     return;
   }
 
-  // 3. Trust-root evaluation FIRST — a key-only PR (no intents at all) must
-  // still surface a blocking trust-root warning instead of exiting through
-  // the "no intents" path.
+  // 3. Trust-root evaluation FIRST from IMMUTABLE event SHAs only — never
+  // `HEAD` and never the working tree (a synthetic merge checkout, a mutated
+  // worktree or an earlier workflow step must not influence trust). A key-only
+  // PR (no intents at all) must still surface its full key-change state.
   const baseKey = getFileAt(repoRoot, event.baseSha, ".drift/public/key.pem");
-  const headKey = getFileAt(repoRoot, "HEAD", ".drift/public/key.pem");
+  const headKey = getFileAt(repoRoot, event.headSha, ".drift/public/key.pem");
   // Canonical trust-root comparison: SPKI-DER fingerprints, never PEM text —
   // the same key with LF/CRLF or whitespace formatting differences must not
   // register as a replacement.
@@ -925,12 +996,13 @@ async function main() {
   if (!baseId && headId) keyChange = "bootstrap";
   else if (baseId && !headId) keyChange = "removed";
   else if (baseId && headId && baseId !== headId) keyChange = "replaced";
-  const hasKeyChange = keyChange === "replaced" || keyChange === "removed";
 
-  // 4. intents from PR commits only, with per-intent signature/trust states.
-  const intents = intentsFromCommits({ repoRoot, commits: range.shas });
+  // 4. intents from PR commits only; manifests read at the immutable HEAD
+  // commit (`readManifestAt`), so uncommitted working-tree mutations are
+  // ignored for signature/trust classification.
+  const intents = intentsFromCommits({ repoRoot, headSha: event.headSha, commits: range.shas });
   for (const intent of intents) {
-    const loaded = readManifest(repoRoot, intent.id);
+    const loaded = readManifestAt(repoRoot, event.headSha, intent.id);
     intent.signatureState = signatureStateFor(loaded.manifest, {
       baseKey,
       headKey,
@@ -938,47 +1010,60 @@ async function main() {
     });
   }
 
-  // 4b. Provenance integrity: scan the WHOLE `.drift/public/` diff, not just
-  // trailer-derived intents — tampering with existing manifests (modified /
-  // deleted / renamed), orphan additions, replays and ambiguous associations
-  // must be visible even when the PR has zero ordinary intents.
+  // 4b. Provenance integrity: scan the WHOLE `.drift/public/` diff between the
+  // immutable event SHAs, not just trailer-derived intents — tampering with
+  // existing manifests (modified / deleted / renamed), orphan additions,
+  // replays and ambiguous associations must be visible even when the PR has
+  // zero ordinary intents.
   const audit = auditPublicProvenance({ repoRoot, baseSha: event.baseSha, headSha: event.headSha, commits: range.shas });
 
-  // 5. The body always carries the trust-root warning for key changes; for a
-  // key-only PR the warning IS the body.
-  const body = buildSummary(intents, { keyChange: hasKeyChange, audit });
+  // 5. The provenance error is computed EARLY and applied at the very end,
+  // after the safe step summary and any comment work — never skipped by a
+  // missing token.
+  const provenanceError = hasProvenanceError({ intents, keyChange, audit });
+
+  // 6. The body always carries the trust-root state; for a key-only PR the
+  // warning/bootstrap section IS the body.
+  const body = buildSummary(intents, { keyChange, audit });
   if (!body) {
     console.log("pr-comment: no Drift intents, no trust-root change and no provenance violations on this PR — nothing to summarize");
     appendStepSummary("_Drift: no Drift intents on this PR — nothing to summarize._");
+    if (failOnProvenanceError && provenanceError) {
+      console.error("pr-comment: provenance error detected — failing the workflow (set fail-on-provenance-error: false to only report)");
+      process.exitCode = 1;
+    }
     return;
   }
 
-  // 6. The safe summary ALWAYS lands in the step summary — before any token
+  // 7. The safe summary ALWAYS lands in the step summary — before any token
   // check, so a missing/read-only GITHUB_TOKEN never suppresses it.
   appendStepSummary(body);
 
-  // 7. Comment (idempotent), degrading gracefully on fork/read-only tokens.
+  // 8. Comment (idempotent), degrading gracefully on fork/read-only tokens.
+  // The comment is optional: its failure is recorded independently of the
+  // provenance failure policy.
   const token = process.env.GITHUB_TOKEN ?? "";
-  if (!token) {
-    console.log("pr-comment: GITHUB_TOKEN not set — step summary written, comment skipped");
-    return;
-  }
-  try {
-    const result = await upsertComment({ token, repo: event.repo, issueNumber: event.prNumber, body });
-    console.log(`pr-comment: ${result.action} comment #${result.id}`);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`pr-comment: warning: could not ${message}`);
-    if (failOnError) {
-      console.error("pr-comment: FAIL_ON_COMMENT_ERROR is set — exiting non-zero");
-      process.exitCode = 1;
+  let commentError = null;
+  if (token) {
+    try {
+      const result = await upsertComment({ token, repo: event.repo, issueNumber: event.prNumber, body });
+      console.log(`pr-comment: ${result.action} comment #${result.id}`);
+    } catch (err) {
+      commentError = err instanceof Error ? err.message : String(err);
+      console.error(`pr-comment: warning: could not ${commentError}`);
     }
+  } else {
+    console.log("pr-comment: GITHUB_TOKEN not set — step summary written, comment skipped");
   }
 
-  // 8. Composite-Action failure policy: fail the workflow when Drift detected
-  // invalid or tampered provenance (default). The summary and comment were
-  // already generated above, so the failure is loud AND visible.
-  if (failOnProvenanceError && hasProvenanceError({ intents, keyChange, audit })) {
+  // 9. Independent failure policies. A comment failure never suppresses the
+  // provenance failure and vice versa; the provenance failure applies even
+  // when no token was available.
+  if (failOnError && commentError) {
+    console.error("pr-comment: FAIL_ON_COMMENT_ERROR is set — exiting non-zero");
+    process.exitCode = 1;
+  }
+  if (failOnProvenanceError && provenanceError) {
     console.error("pr-comment: provenance error detected — failing the workflow (set fail-on-provenance-error: false to only report)");
     process.exitCode = 1;
   }
