@@ -15,24 +15,39 @@ concurrency:
   cancel-in-progress: true
 
 # ---------------------------------------------------------------------------
-# Trust boundary (docs/SELF_HOSTED_ARM64_AUDIT.md):
+# Trust boundary (docs/SELF_HOSTED_ARM64_AUDIT.md, scripts/ci-trust-policy.mjs):
 #
 # The `test-linux-arm64` job runs on a PERSISTENT self-hosted Oracle Cloud
 # runner (Ubuntu 24.04, ARM64, 2 OCPU / 12 GB). Persistent runners are not
-# ephemeral, so untrusted fork code must never execute there. That job is
-# therefore gated to trusted events: push to main, manual dispatch, or pull
-# requests whose head repo IS this repository. External fork PRs run the same
-# validation on an ephemeral GitHub-hosted runner (`test-linux-fork`), and
-# Windows coverage stays on GitHub-hosted runners (`test-windows`).
+# ephemeral, so untrusted code must never execute there. A same-repository
+# condition alone is NOT sufficient: Dependabot / Renovate / other bot PRs and
+# untrusted author associations would slip through. The gate therefore allows:
+#   - push to trusted protected branches;
+#   - workflow_dispatch (requires write access to dispatch);
+#   - same-repository pull_request authored by a real User (not a bot) whose
+#     author_association is OWNER | MEMBER | COLLABORATOR and whose login is
+#     not a known bot.
+# Everything else (external forks, Dependabot, other bots, untrusted same-repo
+# PRs) runs the IDENTICAL validation on an ephemeral GitHub-hosted Linux
+# runner (`test-linux-untrusted`), so dependency PRs never silently skip
+# validation. Windows coverage stays on GitHub-hosted runners. `pull_request_target`
+# is NEVER used to execute untrusted code.
 # ---------------------------------------------------------------------------
 
 jobs:
   test-linux-arm64:
     name: test (Linux ARM64, node 24)
     runs-on: [self-hosted, Linux, ARM64]
-    if: >
+    if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User' &&
+       (github.event.pull_request.author_association == 'OWNER' ||
+        github.event.pull_request.author_association == 'MEMBER' ||
+        github.event.pull_request.author_association == 'COLLABORATOR') &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.event.pull_request.user.login != 'renovate[bot]' &&
+       github.event.pull_request.user.login != 'github-actions[bot]')
     timeout-minutes: 30
     steps:
       # checkout/setup-node v7 run on the Node 24 action runtime (Node 20 was
@@ -84,15 +99,24 @@ jobs:
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
 
-  # Fork PR fallback: identical validation on an ephemeral GitHub-hosted
-  # runner so external contributors still get full CI. Never runs on the
-  # persistent self-hosted machine.
-  test-linux-fork:
-    name: test (Linux x64, node 24, fork PR)
+  # Untrusted-PR fallback: identical validation on an ephemeral GitHub-hosted
+  # runner so external forks, Dependabot and other bot PRs, and untrusted
+  # same-repo author associations still get full CI. Never runs on the
+  # persistent self-hosted machine. This is the exact De Morgan negation of
+  # the ARM64 gate (scripts/ci-trust-policy.mjs).
+  test-linux-untrusted:
+    name: test (Linux x64, node 24, untrusted PR)
     runs-on: ubuntu-latest
-    if: >
+    if: >-
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name != github.repository
+      (github.event.pull_request.head.repo.full_name != github.repository ||
+       github.event.pull_request.user.type != 'User' ||
+       (github.event.pull_request.author_association != 'OWNER' &&
+        github.event.pull_request.author_association != 'MEMBER' &&
+        github.event.pull_request.author_association != 'COLLABORATOR') ||
+       github.event.pull_request.user.login == 'dependabot[bot]' ||
+       github.event.pull_request.user.login == 'renovate[bot]' ||
+       github.event.pull_request.user.login == 'github-actions[bot]')
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -139,6 +163,39 @@ jobs:
           test -x node_modules/.bin/drift
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
+
+  # Stable aggregate gate for branch protection: exactly ONE of the two Linux
+  # routing jobs must have run (the other must have been skipped), proving the
+  # trust boundary routed the event correctly. Runs on GitHub-hosted
+  # infrastructure and NEVER checks out or executes PR code.
+  test-linux:
+    name: test-linux (aggregate gate)
+    runs-on: ubuntu-latest
+    needs: [test-linux-arm64, test-linux-untrusted]
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Verify exactly one Linux job ran and one was skipped
+        shell: bash
+        run: |
+          set -euo pipefail
+          arm64="${{ needs.test-linux-arm64.result }}"
+          hosted="${{ needs.test-linux-untrusted.result }}"
+          ran=0
+          skipped=0
+          for r in "$arm64" "$hosted"; do
+            case "$r" in
+              success) ran=$((ran + 1)) ;;
+              skipped) skipped=$((skipped + 1)) ;;
+              *) ;;
+            esac
+          done
+          echo "arm64=$arm64 hosted=$hosted"
+          if [ "$ran" -ne 1 ] || [ "$skipped" -ne 1 ]; then
+            echo "::error::Linux routing is broken: expected exactly one success and one skip (arm64=$arm64, hosted=$hosted)"
+            exit 1
+          fi
+          echo "Linux trust-boundary routing verified: exactly one job ran, one was skipped."
 
   # Windows coverage stays on GitHub-hosted runners: the project has no
   # Windows self-hosted runner, and ephemeral hosted runners are safe for
