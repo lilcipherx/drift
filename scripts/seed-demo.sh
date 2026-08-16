@@ -49,6 +49,7 @@ export function verifyToken(token: string): boolean {
 }
 EOF
 cli realize -p "Add TokenPayload interface for JWT validation" \
+  --summary "Add TokenPayload interface for JWT validation" \
   --agent --model "claude-3-5-sonnet" \
   --verify-cmd "npm test" >/dev/null
 
@@ -72,6 +73,7 @@ export function refreshToken(expired: string): Promise<string> {
 }
 EOF
 cli realize -p "Fix race condition in token refresh by de-duplicating in-flight refreshes" \
+  --summary "Fix race condition in token refresh" \
   --agent --model "claude-3-5-sonnet" >/dev/null
 
 # 5. human intent #3 (a reviewer's follow-up)
@@ -97,7 +99,8 @@ export function clearRefreshCache(): void {
   refreshInFlight = null;
 }
 EOF
-cli realize -p "Add clearRefreshCache for tests" --author "Drift Demo" >/dev/null
+cli realize -p "Add clearRefreshCache for tests" \
+  --summary "Add clearRefreshCache for tests" --author "Drift Demo" >/dev/null
 
 # 3b. README for the checked-out example
 cat > README.md <<'EOF'
