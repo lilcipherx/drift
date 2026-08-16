@@ -135,7 +135,11 @@ test("drift_realize commits with intent", async () => {
   writeFileSync(join(repo, "src", "util.ts"), "export const n = 1;\nexport const answer = () => 42;\n");
   const result = await client.request("tools/call", {
     name: "drift_realize",
-    arguments: { prompt: "Add answer constant via MCP", model: "deepseek-v4" },
+    arguments: {
+      prompt: "Add answer constant via MCP",
+      summary: "Add answer constant via MCP",
+      model: "deepseek-v4",
+    },
   });
   const text = result.content[0].text;
   const data = JSON.parse(text);

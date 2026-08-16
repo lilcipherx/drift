@@ -84,6 +84,8 @@ export function refreshToken(expired: string): string {
     "realize",
     "-p",
     "Fix race condition in token refresh",
+    "--summary",
+    "Fix race condition in token refresh",
     "--agent",
     "--model",
     "claude-3-5-sonnet",
@@ -171,7 +173,17 @@ test("blame --function on a body-modified function resolves to the intent (PRD �
 }
 `,
   );
-  const realize = run(repo, ["realize", "-p", "Fix race condition in token refresh", "--agent", "--model", "claude-3-5-sonnet", "--json"]);
+  const realize = run(repo, [
+    "realize",
+    "-p",
+    "Fix race condition in token refresh",
+    "--summary",
+    "Fix race condition in token refresh",
+    "--agent",
+    "--model",
+    "claude-3-5-sonnet",
+    "--json",
+  ]);
   assert.equal(realize.status, 0, realize.stderr);
 
   // the function existed before Drift, so its SIGNATURE line is baseline —
@@ -315,9 +327,12 @@ test("fuzz: special chars in paths/prompts and unknown-command stay machine-read
     const realize = run(repo, ["realize", "-p", prompt, "--json"]);
     assert.equal(realize.status, 0, realize.stderr);
     assert.ok(JSON.parse(realize.stdout).intentId);
-    // summary is the FIRST LINE only; the full prompt needs the explicit flag
+    // no explicit summary: the public summary is a GENERIC non-prompt fallback
+    // (ADR-009) — never prompt text, whatever its shape; the full prompt is
+    // reachable only via the explicit private flag
     const log = parseJson(run(repo, ["log", "--limit", "1", "--json"]).stdout);
-    assert.equal(log.intents[0].summary, prompt.trim().split("\n")[0]);
+    assert.ok(log.intents[0].summary.startsWith("Drift intent "), `generic fallback expected, got ${log.intents[0].summary}`);
+    assert.ok(!log.intents[0].summary.includes(prompt.trim().split("\n")[0]), "fallback must not contain prompt text");
     assert.ok(!("prompt" in log.intents[0]));
     const logFull = parseJson(run(repo, ["log", "--limit", "1", "--json", "--include-private-prompt"]).stdout);
     assert.equal(logFull.intents[0].prompt, prompt.trim());
@@ -327,7 +342,7 @@ test("fuzz: special chars in paths/prompts and unknown-command stay machine-read
   const weird = join(repo, "src", "weird name $(x) 🚀 unicode.ts");
   writeFileSync(weird, "export function weirdFn() { return 1; }\n");
   const rel = "src/weird name $(x) 🚀 unicode.ts";
-  assert.equal(run(repo, ["realize", "-p", "add weird file", "--json"]).status, 0);
+  assert.equal(run(repo, ["realize", "-p", "add weird file", "--summary", "add weird file", "--json"]).status, 0);
   const blame = parseJson(
     run(repo, ["blame", rel, "--function", "weirdFn", "--json"]).stdout,
   );
@@ -362,13 +377,22 @@ test("redaction: secrets in prompts never hit git history", () => {
   const repo = makeRepo();
   run(repo, ["init"]);
   writeFileSync(join(repo, "src", "auth.ts"), "export const a = 1;\n");
-  const realize = run(repo, ["realize", "-p", "use sk-abc123DEF456ghi789JKL0123456789 in config", "--json"]);
+  const realize = run(repo, [
+    "realize",
+    "-p",
+    "use sk-abc123DEF456ghi789JKL0123456789 in config",
+    "--summary",
+    "use sk-abc123DEF456ghi789JKL0123456789 in config",
+    "--json",
+  ]);
   assert.equal(realize.status, 0, realize.stderr);
   const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
   assert.ok(!log.intents[0].prompt.includes("sk-abc123"));
   assert.ok(log.intents[0].prompt.includes("[REDACTED]"));
-  // the public summary is redacted too
+  // the PUBLIC summary is redacted too (a secret in --summary can never
+  // reach git history, manifests or PR comments)
   assert.ok(!log.intents[0].summary.includes("sk-abc123"));
+  assert.ok(log.intents[0].summary.includes("[REDACTED]"), "public summary must be redacted");
 });
 
 test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY without key", () => {
@@ -389,7 +413,7 @@ test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY with
   const state = Buffer.from(JSON.stringify({ step: 1, goal: "top secret" })).toString("base64");
   const realize = run(
     repo,
-    ["realize", "-p", "super secret prompt: rotate the token", "--agent", "--state", state, "--json"],
+    ["realize", "-p", "super secret prompt: rotate the token", "--summary", "super secret prompt: rotate the token", "--agent", "--state", state, "--json"],
     env,
   );
   assert.equal(realize.status, 0, realize.stderr);
@@ -524,7 +548,7 @@ test("log --file filters intents touching a file", () => {
   writeFileSync(join(repo, "src", "auth.ts"), "export const a = () => 1;\n");
   run(repo, ["realize", "-p", "touch auth"]);
   writeFileSync(join(repo, "src", "other.ts"), "export const o = () => 2;\n");
-  run(repo, ["realize", "-p", "touch other"]);
+  run(repo, ["realize", "-p", "touch other", "--summary", "touch other"]);
   const filtered = parseJson(run(repo, ["log", "--file", "src/other.ts", "--json"]).stdout);
   assert.equal(filtered.intents.length, 1);
   assert.equal(filtered.intents[0].summary, "touch other");
@@ -552,6 +576,8 @@ test("prompt modes: default commit-summary keeps the full prompt out of git hist
     "realize",
     "-p",
     prompt,
+    "--summary",
+    "Fix race condition in token refresh",
     "--agent",
     "--model",
     "claude-3-5-sonnet",
@@ -627,9 +653,14 @@ test("prompt modes: secrets are redacted before the summary reaches the commit m
   const repo = makeRepo();
   run(repo, ["init"]);
   writeFileSync(join(repo, "src", "auth.ts"), "export const d = () => 4;\n");
+  // a secret placed in the PUBLIC summary must be redacted before it reaches
+  // the commit message — the explicit summary is the ONLY prompt-adjacent text
+  // that may appear publicly, and even that is redacted + sanitized (ADR-009)
   const realize = run(repo, [
     "realize",
     "-p",
+    "Use key sk-abc123DEF456ghi789JKL0123456789 in the config now",
+    "--summary",
     "Use key sk-abc123DEF456ghi789JKL0123456789 in the config now",
     "--json",
   ]);
@@ -655,7 +686,7 @@ test("drift status: friendly state report and graceful degradation before init",
   // initialized
   run(repo, ["init"]);
   writeFileSync(join(repo, "src", "auth.ts"), "export const e = () => 5;\n");
-  assert.equal(run(repo, ["realize", "-p", "first intent", "--json"]).status, 0);
+  assert.equal(run(repo, ["realize", "-p", "first intent", "--summary", "first intent", "--json"]).status, 0);
   const st = parseJson(run(repo, ["status", "--json"]).stdout);
   assert.equal(st.status, "ok");
   assert.equal(st.initialized, true);
@@ -678,6 +709,8 @@ test("blame human output is self-explanatory (Why / Generated by / Intent / Comm
   const realize = run(repo, [
     "realize",
     "-p",
+    "Add the why function",
+    "--summary",
     "Add the why function",
     "--agent",
     "--model",

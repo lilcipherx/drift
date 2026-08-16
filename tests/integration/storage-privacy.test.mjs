@@ -3,11 +3,14 @@
  *
  *  1. `.drift/.gitignore` ignores the private store; `git add .` can never
  *     stage prompts, the database, objects or keys.
- *  2. A unique secret marker in a raw prompt never reaches git history,
- *     tracked files, or default JSON under the safe default mode.
+ *  2. A one-line raw prompt NEVER becomes the public summary: an explicit
+ *     `--summary` is separate, and without one a generic non-prompt fallback
+ *     is used. A unique secret marker in a one-line raw prompt never reaches
+ *     git history, tracked files, or default JSON under the safe default mode.
  *  3. `none` mode persists the marker nowhere.
- *  4. A fresh clone (no private DB) still serves `log`/`blame` from the
- *     committed public manifests without crashing.
+ *  4. Committed public manifests are canonical: a fresh clone (no private DB)
+ *     serves `log`/`blame`/`verify`, and `drift init` in a clone must NOT let
+ *     the newly created empty local store shadow the public intents.
  *  5. `drift doctor` detects legacy tracked private files and reports safe
  *     untrack commands.
  */
@@ -28,7 +31,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const CLI = resolve(process.cwd(), "packages", "drift-cli", "dist", "cli.js");
-const MARKER = "DRIFT_PRIVATE_SECRET_7f2c91";
+// Part 7 markers — one per scenario, all on ONE-LINE raw prompts.
+const MARKER = "DRIFT_PRIVATE_SECRET_ONE_LINE_91f2";
+const MARKER_NO_SUMMARY = "DRIFT_PRIVATE_SECRET_NO_SUMMARY_47ac";
+const MARKER_NONE = "DRIFT_PRIVATE_SECRET_NONE_3f8a";
 
 function run(repo, args, env = {}) {
   const res = spawnSync(process.execPath, [CLI, ...args], {
@@ -142,35 +148,48 @@ test("the root .gitignore of the repo itself is never touched by drift init", ()
 });
 
 // ------------------------------------------------------------ secret markers
-test("secret marker never enters git history, tracked files, or default JSON (commit-summary mode)", () => {
+test("one-line prompt + explicit public summary: the raw prompt never enters git history, tracked files, or default JSON", () => {
   const repo = makeRepo();
   assert.equal(run(repo, ["init"]).status, 0);
-  const prompt = `first line summary\n\nsecond line with ${MARKER} and secrets sk-abc123DEF456ghi789JKL0123456789`;
-  realizeWithMarker(repo, prompt);
+  // Part 7 Test A — a ONE-LINE raw prompt (the whole prompt could be
+  // sensitive) plus a separate PUBLIC summary.
+  const prompt = `Implement authentication using ${MARKER}`;
+  const summary = "Improve authentication handling";
+  writeFileSync(join(repo, "src", "a.ts"), `export const a = ${Date.now()};\n`);
+  const res = run(repo, ["realize", "-p", prompt, "--summary", summary, "--json"]);
+  assert.equal(res.status, 0, res.stderr);
   git(repo, ["add", "-A"]);
   git(repo, ["commit", "-m", "intent"]);
 
-  // 1. git history (patch + messages)
+  // the safe public summary IS public — present in history, log and manifest
+  const messages = git(repo, ["log", "--all", "--format=%B"]);
+  assert.ok(messages.includes("Intent: Improve authentication handling"), messages);
+  // but the raw prompt marker is absent from EVERY public/tracked surface
   assert.ok(!git(repo, ["log", "--all", "-p"]).includes(MARKER), "marker leaked into git history patch");
   assert.ok(!git(repo, ["log", "--all", "--format=%B"]).includes(MARKER), "marker leaked into commit messages");
-  // 2. working tree grep (tracked content)
+  assert.ok(!git(repo, ["show", "HEAD"]).includes(MARKER), "marker leaked into git show HEAD");
   const grep = spawnSync("git", ["grep", "-n", MARKER, "--", "."], { cwd: repo, encoding: "utf8" });
   assert.equal(grep.status, 1, "marker must not be found by git grep");
-  // 3. HEAD tree
   assert.ok(!git(repo, ["ls-tree", "-r", "HEAD"]).includes(MARKER), "marker leaked into the HEAD tree");
-  // 4. tracked .drift files
-  const trackedDrift = git(repo, ["ls-files", "--", ".drift"]).split("\n").filter(Boolean);
-  for (const f of trackedDrift) {
+  for (const f of git(repo, ["ls-files"]).split("\n").filter(Boolean)) {
+    assert.ok(!readFileSync(join(repo, f), "utf8").includes(MARKER), `marker leaked into tracked file ${f}`);
+  }
+  // every tracked .drift/public file is clean
+  for (const f of git(repo, ["ls-files", "--", ".drift"]).split("\n").filter(Boolean)) {
     const content = readFileSync(join(repo, f), "utf8");
     assert.ok(!content.includes(MARKER), `marker leaked into tracked file ${f}`);
-    assert.ok(!content.includes("sk-abc123"), `secret leaked into tracked file ${f}`);
   }
-  // 5. default JSON
+
+  // default CLI outputs: safe summary, no prompt, no marker
   const log = JSON.parse(run(repo, ["log", "--json"]).stdout);
-  assert.equal(log.intents[0].summary, "first line summary");
+  assert.equal(log.intents[0].summary, "Improve authentication handling");
   assert.ok(!("prompt" in log.intents[0]), "default log JSON must not contain the prompt");
+  assert.ok(!JSON.stringify(log).includes(MARKER), "marker leaked into default log JSON");
+  const ctx = JSON.parse(run(repo, ["context", "src/a.ts", "--json"]).stdout);
+  assert.ok(!JSON.stringify(ctx).includes(MARKER), "marker leaked into default context JSON");
   const blame = JSON.parse(run(repo, ["blame", "src/a.ts", "--line", "1", "--json"]).stdout);
-  assert.ok(!JSON.stringify(blame).includes(MARKER), "default blame JSON must not contain the marker");
+  assert.equal(blame.intent.summary, "Improve authentication handling");
+  assert.ok(!JSON.stringify(blame).includes(MARKER), "marker leaked into default blame JSON");
 
   // the marker MAY exist only in the ignored private store
   assert.ok(existsSync(join(repo, ".drift", "drift.db")), "private DB exists locally");
@@ -181,42 +200,76 @@ test("secret marker never enters git history, tracked files, or default JSON (co
   assert.ok(anyPrivate, "marker may live in the IGNORED private objects — that is the design");
 });
 
+test("one-line prompt without a summary: generic non-prompt fallback, marker absent everywhere", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  // Part 7 Test B — no explicit summary at all.
+  const prompt = `Refactor payment validation using ${MARKER_NO_SUMMARY}`;
+  writeFileSync(join(repo, "src", "a.ts"), `export const a = ${Date.now()};\n`);
+  const res = run(repo, ["realize", "-p", prompt, "--json"]);
+  assert.equal(res.status, 0, res.stderr);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-m", "intent"]);
+
+  // generic fallback derived only from non-prompt metadata
+  const log = JSON.parse(run(repo, ["log", "--json"]).stdout);
+  assert.ok(
+    log.intents[0].summary.startsWith("Drift intent "),
+    `generic fallback expected, got: ${log.intents[0].summary}`,
+  );
+  assert.ok(!log.intents[0].summary.includes("Refactor payment"), "fallback must not contain prompt text");
+
+  // commit subject is the generic fallback, never prompt text
+  const messages = git(repo, ["log", "--all", "--format=%B"]);
+  assert.ok(messages.includes("Intent: Drift intent "), messages);
+  assert.ok(!messages.includes("Refactor payment validation"), "prompt text must not appear in commit messages");
+
+  // marker absent from every public surface
+  assert.ok(!git(repo, ["log", "--all", "-p"]).includes(MARKER_NO_SUMMARY));
+  assert.ok(!git(repo, ["log", "--all", "--format=%B"]).includes(MARKER_NO_SUMMARY));
+  const grep = spawnSync("git", ["grep", "-n", MARKER_NO_SUMMARY, "--", "."], { cwd: repo, encoding: "utf8" });
+  assert.equal(grep.status, 1);
+  assert.ok(!git(repo, ["ls-tree", "-r", "HEAD"]).includes(MARKER_NO_SUMMARY));
+  assert.ok(!JSON.stringify(log).includes(MARKER_NO_SUMMARY), "marker leaked into default log JSON");
+});
+
 test("secret marker is absent everywhere under none mode", () => {
   const repo = makeRepo();
   assert.equal(run(repo, ["init"]).status, 0);
   const configPath = join(repo, ".drift", "config.toml");
   writeFileSync(configPath, readFileSync(configPath, "utf8") + "\n[prompts]\nmode = \"none\"\n");
-  const prompt = `secret ${MARKER} that must persist nowhere`;
+  const prompt = `secret ${MARKER_NONE} that must persist nowhere`;
   realizeWithMarker(repo, prompt);
   git(repo, ["add", "-A"]);
   git(repo, ["commit", "-m", "intent"]);
 
-  assert.ok(!git(repo, ["log", "--all", "-p"]).includes(MARKER));
-  assert.ok(!git(repo, ["log", "--all", "--format=%B"]).includes(MARKER));
-  const grep = spawnSync("git", ["grep", "-n", MARKER, "--", "."], { cwd: repo, encoding: "utf8" });
+  assert.ok(!git(repo, ["log", "--all", "-p"]).includes(MARKER_NONE));
+  assert.ok(!git(repo, ["log", "--all", "--format=%B"]).includes(MARKER_NONE));
+  const grep = spawnSync("git", ["grep", "-n", MARKER_NONE, "--", "."], { cwd: repo, encoding: "utf8" });
   assert.equal(grep.status, 1);
-  assert.ok(!git(repo, ["ls-tree", "-r", "HEAD"]).includes(MARKER));
+  assert.ok(!git(repo, ["ls-tree", "-r", "HEAD"]).includes(MARKER_NONE));
 
   // private DB + objects must also be clean in none mode (marker absent
   // from EVERY file under .drift, tracked or not)
   const allDriftFiles = collectFiles(join(repo, ".drift"));
   assert.ok(allDriftFiles.length > 0, "there must be .drift files to inspect");
   for (const abs of allDriftFiles) {
-    assert.ok(!readFileSync(abs, "utf8").includes(MARKER), `marker leaked into ${abs}`);
+    assert.ok(!readFileSync(abs, "utf8").includes(MARKER_NONE), `marker leaked into ${abs}`);
   }
-  // summary is empty too
+  // summary is empty too (none mode persists nothing derived from the prompt)
   const log = JSON.parse(run(repo, ["log", "--json"]).stdout);
   assert.equal(log.intents[0].summary, "");
 });
 
 // -------------------------------------------------------------- fresh clone
-test("fresh clone serves log/blame from public manifests without the private DB and without crashing", () => {
+test("fresh clone serves log/blame from public manifests; an empty local store cannot shadow them", () => {
   const origin = makeRepo();
   assert.equal(run(origin, ["init"]).status, 0);
-  // multi-line prompt: the marker lives in the SECOND line so it stays private
-  const markerPrompt = `Safe first line summary\n\n${MARKER} stays private in the second line`;
+  // one-line private raw prompt + separate safe public summary (Part 5)
+  const prompt = `Implement auth using ${MARKER}`;
+  const summary = "Implement authentication";
   writeFileSync(join(origin, "src", "a.ts"), `export const a = ${Date.now()};\n`);
-  const realize = run(origin, ["realize", "-p", markerPrompt, "--json"]);
+  const realize = run(origin, ["realize", "-p", prompt, "--summary", summary, "--json"]);
   assert.equal(realize.status, 0, realize.stderr);
   // commit the intent + public provenance (the private store stays untracked)
   git(origin, ["add", "-A"]);
@@ -228,41 +281,79 @@ test("fresh clone serves log/blame from public manifests without the private DB 
   git(bare, ["clone", "-q", bare, clone]);
   // the private DB must NOT exist in the clone
   assert.ok(!existsSync(join(clone, ".drift", "drift.db")), "clone must not contain the private DB");
+  // committed public provenance exists in the clone
+  assert.ok(existsSync(join(clone, ".drift", "public", "intents")), "public manifests must be cloned");
+  assert.ok(existsSync(join(clone, ".drift", "public", "key.pem")), "committed public key must be cloned");
 
-  // log works (public manifests), prompt unavailable, no crash
+  // log works BEFORE init (public manifests only), no crash
+  const logBefore = JSON.parse(run(clone, ["log", "--json"]).stdout);
+  assert.equal(logBefore.status, "ok");
+  assert.equal(logBefore.intents.length, 1);
+  assert.equal(logBefore.intents[0].summary, "Implement authentication");
+
+  // verify-intent BEFORE init verifies against the committed public key
+  const sigBefore = JSON.parse(run(clone, ["verify-intent", logBefore.intents[0].id, "--json"]).stdout);
+  assert.equal(sigBefore.status, "ok");
+  assert.equal(sigBefore.ok, true, sigBefore.detail);
+
+  // REGRESSION: `drift init` in a clone creates an empty local store that
+  // must NOT shadow the committed public manifests. It must create only the
+  // missing private dirs/keys and leave public provenance untouched.
+  const initClone = run(clone, ["init"]);
+  assert.equal(initClone.status, 0, initClone.stderr);
+  assert.ok(existsSync(join(clone, ".drift", "keys", "ed25519.pem")), "init must create the signing key in a clone");
+
+  // log still lists the committed public intent after init
   const log = JSON.parse(run(clone, ["log", "--json"]).stdout);
   assert.equal(log.status, "ok");
-  assert.equal(log.intents.length, 1);
-  assert.equal(log.intents[0].summary, "Safe first line summary");
+  assert.equal(log.intents.length, 1, "an empty private store must not hide committed public intents");
+  assert.equal(log.intents[0].summary, "Implement authentication");
   assert.ok(!("prompt" in log.intents[0]), "prompt unavailable in a clone");
   assert.ok(log.intents[0].id.startsWith("did_"), "intent id available");
   assert.ok(log.intents[0].gitSha, "commit available");
-
-  // the marker must not exist anywhere in the clone
   assert.ok(!JSON.stringify(log).includes(MARKER), "marker leaked into clone log");
   assert.ok(!git(clone, ["ls-tree", "-r", "HEAD"]).includes(MARKER));
+
+  // public manifests were not rewritten or removed by init
+  const manifestDir = join(clone, ".drift", "public", "intents");
+  const manifestNames = readdirSync(manifestDir).filter((f) => f.endsWith(".json"));
+  assert.equal(manifestNames.length, 1);
+  const manifest = JSON.parse(readFileSync(join(manifestDir, manifestNames[0]), "utf8"));
+  assert.equal(manifest.summary, "Implement authentication");
+  assert.ok(manifest.signature, "manifest still signed");
+
+  // SECOND init is idempotent: the same public intent stays visible
+  assert.equal(run(clone, ["init"]).status, 0);
+  const log2 = JSON.parse(run(clone, ["log", "--json"]).stdout);
+  assert.equal(log2.intents.length, 1, "second init must keep public intents visible");
+  assert.equal(log2.intents[0].summary, "Implement authentication");
 
   // blame works and resolves the manifest
   const blame = JSON.parse(run(clone, ["blame", "src/a.ts", "--line", "1", "--json"]).stdout);
   assert.equal(blame.status, "ok");
   assert.ok(blame.intent, "blame resolves via the public manifest");
-  assert.equal(blame.intent.summary, "Safe first line summary");
+  assert.equal(blame.intent.summary, "Implement authentication");
   assert.ok(!JSON.stringify(blame).includes(MARKER), "marker leaked into clone blame");
 
-  // verify-intent works against the committed public key
-  const sig = JSON.parse(run(clone, ["verify-intent", log.intents[0].id, "--json"]).stdout);
-  assert.equal(sig.status, "ok");
-  assert.equal(sig.ok, true);
-
-  // status works and never crashes
+  // status reports merged counts without the shadow bug
   const status = JSON.parse(run(clone, ["status", "--json"]).stdout);
   assert.equal(status.initialized, true);
-  assert.equal(status.intents, 1);
-  assert.equal(status.lastIntent.summary, "Safe first line summary");
+  assert.equal(status.intents, 1, "status must count committed public intents even with an empty store");
+  assert.equal(status.publicIntents, 1);
+  assert.equal(status.localIntents, 0);
+  assert.equal(status.lastIntent.summary, "Implement authentication");
 
   // doctor works in read-only mode
   const doctor = JSON.parse(run(clone, ["doctor", "--json"]).stdout);
   assert.equal(doctor.status, "ok");
+
+  // after init the signing key was regenerated (it never leaves the origin
+  // machine) — the OLD signature must NOT be reported valid against the new
+  // key. Truthful state: it no longer verifies. This is the documented
+  // key-rotation limitation of ADR-009.
+  const sigAfter = JSON.parse(run(clone, ["verify-intent", log.intents[0].id, "--json"]).stdout);
+  assert.equal(sigAfter.ok, false, "a regenerated local key must never validate an old signature");
+  assert.equal(sigAfter.detail, "invalid", "old signature no longer verifies against the rotated key");
 });
 
 // ------------------------------------------------------- legacy detection
