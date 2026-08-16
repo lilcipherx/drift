@@ -157,15 +157,18 @@ agnostic for consumers. The example in `docs/installation.md` uses
 
 ## 9. Evidence and remaining risks
 
-- The classification of `test-linux-arm64` as `MOVE_TO_SELF_HOSTED` is
-  **static** plus **locally tested on Windows/x64** (the same commands pass
-  here) — it has **not** been verified on the actual ARM64 runner.
-- Remaining risk: the runner host must have Node 24 + git installed (§7);
-  until a real workflow run executes on the ARM64 box, "verified on ARM64"
-  must not be claimed. Trigger the check with the `workflow_dispatch`
-  instructions in §10.
-- If the ARM64 run exposes an issue (e.g. a transitive dependency with a
-  hidden platform requirement), fall back to `ubuntu-latest` for
+- The classification of `test-linux-arm64` as `MOVE_TO_SELF_HOSTED` was
+  **static** plus **locally tested on Windows/x64** before the first push.
+- **Verified on ARM64 self-hosted runner** — workflow run
+  https://github.com/lilcipherx/drift/actions/runs/31941092554 (PR #7,
+  2026-08-16): the `test (Linux ARM64, node 24)` job ran on the persistent
+  Oracle runner (`instance-20260816-0446`, labels `self-hosted`/`Linux`/
+  `ARM64`, status `online`) and completed **success** in ~1m25s — `npm ci`,
+  `tsc -b`, the full 147-test suite, eval gate, MVS acceptance and the
+  package smoke test all passed on the ARM64 host. Node 24 is present (§7).
+- Remaining risk: low. The same toolchain is pure JavaScript; the only
+  environment-sensitive input (Node 24) is now confirmed on the host. If a
+  future ARM64 run exposes an issue, fall back to `ubuntu-latest` for
   `test-linux-arm64` until resolved — the fork/Windows jobs are unaffected.
 
 ## 10. Triggering a manual run
