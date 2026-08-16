@@ -5,283 +5,56 @@
 <h1 align="center">Drift</h1>
 <p align="center"><em>Git tracks what changed. Drift tracks why.</em></p>
 
-Drift is a semantic version-control layer that wraps Git. Every commit becomes an
-**Intent**: the prompt that produced the change, the agent model behind it, the
-AST-level mutations, an optional checkpoint of the agent's cognitive state, and a
-cryptographic Ed25519 signature — all linked into an auditable, replayable graph.
-
-Built for the AI era. When more than 80% of code is generated, text diffs are
-useless for review: they show *what* changed, never *why*. Drift rejects broken
-syntax before it enters history, answers *"why does this function exist?"* with
-the originating prompt, and lets a crashed agent resume from its last checkpoint.
+Drift adds a **provenance layer to Git for AI-generated code**. Every commit
+becomes an *Intent* — the prompt that produced the change, the model behind it,
+and the verification that approved it — signed, stored, and traceable months
+later.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-[![Tests](https://img.shields.io/badge/tests-110%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-123%20passing-brightgreen)](tests/)
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)](.github/workflows/ci.yml)
 
-## Quickstart
+---
 
-Give your agent Drift: [Claude Code](#claude-code), [Antigravity](#antigravity),
-[Codex App](#codex-app), [Codex CLI](#codex-cli), [Cursor](#cursor),
-[Factory Droid](#factory-droid), [Gemini CLI](#gemini-cli),
-[GitHub Copilot CLI](#github-copilot-cli), [Kimi Code](#kimi-code),
-[OpenCode](#opencode), [Pi](#pi).
-
-Prefer no agent? Use the [CLI](#cli), the [GitHub App](#github-app), the
-[GitHub Action](#github-action), or [VS Code](#vs-code). Want the 5-minute "aha"
-first? Seed the [demo repo](#demo) and run `drift blame`.
-
-**Documentation:** [Quickstart](docs/quickstart.md) (5-minute start) ·
-[API reference](docs/api.md) (CLI + MCP tools) ·
-[Architecture](docs/architecture.md) (how Drift works under the hood)
-
-**Verified live** on Windows 11 (Node v24.18.0, 2026-08-06): fresh clone →
-first `drift blame` in ~8.1 s, 10/10 checks pass, no registry 404 — and the
-npm path (packed `@drift/*` chain installed into an empty dir) answers the MCP
-handshake with all six tools in ~1 s. See the
-[full measured tables](docs/quickstart.md#verified-live-проверено-вживую).
-
-## How it works
-
-It starts the moment you run `drift init`. Drift creates `.drift/` — a SQLite DAG,
-a config, and a per-repo Ed25519 keypair — and from then on every commit becomes
-an intent.
-
-When you (or your agent) run `drift realize -p "<prompt>"`, Drift *doesn't* just
-commit. It parses the change semantically, **rejects the commit if the syntax is
-broken** (exit 2 — broken code never enters history), redacts secrets from your
-prompt, computes an AST delta (ADDED / MODIFIED / DELETED / MOVED / RENAMED),
-signs the intent, and stores it content-addressed in `.drift/objects/` before
-committing with a `Drift-Intent:` trailer.
-
-After that, `drift blame` can walk any line or function back to the prompt that
-created it, `drift context` hydrates the last intents for a file so an agent
-grounds itself before editing, and `drift verify` re-runs the recorded
-verification command. A crashed agent runs `drift replay --checkout` and resumes
-exactly where it left off.
-
-And because these are MCP tools, your coding agent can use them directly —
-`drift_realize` instead of `git commit`.
-
-Deeper reading: the full command reference lives in
-[docs/api.md](docs/api.md) (CLI flags, exit codes, JSON schemas, MCP tool
-inputs), and [docs/architecture.md](docs/architecture.md) explains the
-storage model, encryption at rest, the webhook app, and the security
-boundaries.
-
-## Installation
-
-Installation differs by harness. If you use more than one, install Drift
-separately for each one. All harnesses expose the same six tools:
-`drift_realize`, `drift_context`, `drift_replay`, `drift_blame`, `drift_verify`,
-`drift_log`.
-
-> **Status: the `@drift/*` npm packages are not published yet.** Every
-> section below leads with the **clone path** — it works right now from a
-> checkout of this repository. The `npx -y @drift/mcp` / `npx -y @drift/cli`
-> one-liners activate automatically once the packages land on npm; until
-> then they return a 404, so use the clone command shown first.
-
-Every command below is backed by a real manifest in this repository
-(`.claude-plugin/plugin.json`, `.plugin/plugin.json`,
-`.cursor-plugin/plugin.json`, `.codex-plugin/plugin.json`,
-`gemini-extension.json`, `plugin.json`, `.factory-plugin/`,
-`package.json` → `pi`) or a ready-made config in
-`examples/harness-configs/`. Today, installation needs **Node.js ≥ 24,
-npm and a clone of this repository** (the MCP server runs straight from
-`packages/drift-mcp/dist/index.js`; no build step needed). Once the
-`@drift/*` packages are published, the same configs work via
-`npx -y @drift/mcp` with no clone.
-
-### Claude Code
-
-Install as a plugin from the Drift marketplace (plugin-style, like Superpowers):
-
-```text
-/plugin marketplace add lilcipherx/drift
-/plugin install drift@drift
-```
-
-Or add the Drift MCP server directly (project scope) — from a clone:
+## The 30-second demo
 
 ```bash
-claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- node /path/to/drift/packages/drift-mcp/dist/index.js
+git clone https://github.com/lilcipherx/drift.git && cd drift
+npm install
+bash scripts/seed-demo.sh && cd examples/demo-repo
+
+node ../../packages/drift-cli/dist/cli.js blame src/auth.ts --function refreshToken
 ```
 
-Once the packages are published, the same command works via npx (no clone):
+Real output:
 
-```bash
-claude mcp add drift --env DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
+```
+src/auth.ts:16 (refreshToken)
+
+  Why:
+    Fix race condition in token refresh by de-duplicating in-flight refreshes
+
+  Generated by:
+    AGENT @ Drift Demo (model: claude-3-5-sonnet)
+
+  Intent:
+    did_910ac75de855a684937f8cc016976442
+
+  Commit:
+    fa20f02884a910f26e3f869ceaf6b89fa7e8207f  signature: valid
 ```
 
-Or copy the ready-made config:
+Months from now, that function answers *why it exists, who (or what) created
+it, and that the claim is cryptographically signed.*
 
-```bash
-cp examples/harness-configs/claude-code/.mcp.json .mcp.json
-```
+---
 
-Verify with `claude mcp list` — you should see `drift` with its six tools.
+## Install
 
-> The marketplace manifest lives at `.claude-plugin/marketplace.json` in this
-> repository (github-source `lilcipherx/drift`, strict plugin →
-> `.claude-plugin/plugin.json` in the same repo).
+Two ways to get the CLI + MCP server:
 
-### Antigravity
-
-Install Drift as a plugin from this repository:
-
-```bash
-agy plugin install https://github.com/lilcipherx/drift
-```
-
-Antigravity runs the plugin's session-start hook, so Drift is active from the
-first message. Reinstall with the same command to update.
-
-### Codex App
-
-In the Codex app, open **Settings → MCP servers** and add:
-
-- **Name**: `drift`
-- **Command**: `node` (clone path) — or `npx` once the packages are published
-- **Args**: `/path/to/drift/packages/drift-mcp/dist/index.js` — or `-y @drift/mcp` after publication
-- **Env**: `DRIFT_REPO=/abs/path/to/your/repo`
-
-### Codex CLI
-
-Add the Drift MCP server to `~/.codex/config.toml` (from a clone):
-
-```toml
-[mcp_servers.drift]
-command = "node"
-args = ["/path/to/drift/packages/drift-mcp/dist/index.js"]
-env = { DRIFT_REPO = "/abs/path/to/your/repo" }
-```
-
-Once published, the same server runs via npx (no clone):
-
-```toml
-[mcp_servers.drift]
-command = "npx"
-args = ["-y", "@drift/mcp"]
-env = { DRIFT_REPO = "/abs/path/to/your/repo" }
-```
-
-Restart Codex, then ask for `drift_blame` / `drift_context` in any session.
-
-### Cursor
-
-Copy the ready-made config and enable MCP servers in Cursor settings:
-
-```bash
-cp examples/harness-configs/cursor/mcp.json .cursor/mcp.json
-```
-
-Then ask for `drift_blame` in chat.
-
-### Factory Droid
-
-- Register the marketplace:
-
-  ```bash
-  droid plugin marketplace add https://github.com/lilcipherx/drift
-  ```
-
-- Install the plugin:
-
-  ```bash
-  droid plugin install drift@drift
-  ```
-
-### Gemini CLI
-
-- Install the extension:
-
-  ```bash
-  gemini extensions install https://github.com/lilcipherx/drift
-  ```
-
-- Update later:
-
-  ```bash
-  gemini extensions update drift
-  ```
-
-### GitHub Copilot CLI
-
-Add the Drift MCP server (from a clone):
-
-```bash
-copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- node /path/to/drift/packages/drift-mcp/dist/index.js
-```
-
-Once the packages are published, the same command works via npx (no clone):
-
-```bash
-copilot mcp add drift -e DRIFT_REPO=/abs/path/to/your/repo -- npx -y @drift/mcp
-```
-
-Or copy the ready-made config to `.github/mcp.json` and restart Copilot.
-
-### Kimi Code
-
-Drift is available in Kimi Code's plugin marketplace.
-
-- Open Kimi Code's plugin manager:
-
-  ```text
-  /plugins
-  ```
-
-- Go to `Marketplace` > `Drift` and install it.
-
-- Or install directly from this repository:
-
-  ```text
-  /plugins install https://github.com/lilcipherx/drift
-  ```
-
-- Detailed docs: [docs/README.kimi.md](docs/README.kimi.md)
-
-### OpenCode
-
-OpenCode uses its own plugin install; install Drift separately even if you
-already use it in another harness.
-
-- Tell OpenCode:
-
-  ```text
-  Fetch and follow instructions from https://raw.githubusercontent.com/lilcipherx/drift/main/.opencode/INSTALL.md
-  ```
-
-- Detailed docs: [docs/README.opencode.md](docs/README.opencode.md)
-
-### Pi
-
-Install Drift as a Pi package from this repository:
-
-```bash
-pi install git:github.com/lilcipherx/drift
-```
-
-For local development, run Pi with this checkout loaded as a temporary package:
-
-```bash
-pi -e /path/to/drift
-```
-
-### VS Code
-
-Add the Drift MCP server to `.vscode/mcp.json` (native VS Code MCP support):
-
-```bash
-cp examples/harness-configs/claude-code/.mcp.json .vscode/mcp.json
-```
-
-VS Code picks it up on window reload.
-
-### CLI
-
-From a clone (works today):
+**From a checkout (works today):**
 
 ```bash
 git clone https://github.com/lilcipherx/drift.git && cd drift
@@ -289,191 +62,131 @@ npm install
 node packages/drift-cli/dist/cli.js --help
 ```
 
-Once the CLI is published to npm, `npx` works without cloning:
+**From npm (once the `@drift/*` packages are published):**
 
 ```bash
-npx -y @drift/cli --help
+npx -y @drift/cli --help            # CLI
+npx -y @drift/mcp                   # MCP server for agents
 ```
 
-On your own repository:
+Per-harness install for **11 agents** (Claude Code, Antigravity, Codex App/CLI,
+Cursor, Factory Droid, Gemini CLI, GitHub Copilot CLI, Kimi Code, OpenCode,
+Pi, VS Code): see **[docs/installation.md](docs/installation.md)**. The
+[GitHub Action](docs/installation.md#github-action-ci-check--pr-comment) runs
+`drift log`/`doctor`/`verify` in CI and posts the PR summary comment.
+
+---
+
+## 60-second quickstart
 
 ```bash
-node /path/to/drift/packages/drift-cli/dist/cli.js init
+cd /path/to/your/repo
+node /abs/path/to/drift/packages/drift-cli/dist/cli.js init     # 1. create .drift/
 # … edit a file …
-node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "Fix race condition in token refresh" --agent --model claude-3-5-sonnet
-node /path/to/drift/packages/drift-cli/dist/cli.js log
+node /abs/path/to/drift/packages/drift-cli/dist/cli.js realize -p "Add login flow with validation" --agent --model claude-3-5-sonnet
+node /abs/path/to/drift/packages/drift-cli/dist/cli.js status    # 2. what's recorded?
+node /abs/path/to/drift/packages/drift-cli/dist/cli.js blame src/auth.ts --function login   # 3. why does this exist?
 ```
 
-### GitHub App
+`realize` is `git commit` for the AI era: it **rejects broken syntax before it
+enters history** (exit 2), redacts secrets from your prompt, computes an AST
+delta, signs the intent, and commits with a `Drift-Intent:` trailer. The full
+[5-minute quickstart](docs/quickstart.md) has the measured end-to-end walk.
 
-Install `@drift/app` to get intent summaries on every pull request:
+---
 
-- Reads `Drift-Intent:` trailers from PR commits, hydrates the intent objects from
-  `.drift/objects/` at the PR head, and posts a **semantic summary comment** —
-  review the intent, not 2,000 lines of diff. Comments are idempotent: the app
-  updates its own marker comment in place, so they never accumulate.
-- Runs as a webhook server: `drift-app start` (see `packages/drift-app/app.yml`
-  for the app manifest, `scripts/webhook-proxy.sh` for local debugging).
+## On GitHub — the PR summary
 
-### GitHub Action
+When Drift is used in a repository, every pull request gets a compact
+provenance summary (posted by the GitHub App or the Action, updated in place —
+never spammed):
 
-Check intent health in CI:
+> ## 🤖 Drift intent summary
+>
+> 1 intent on this PR · 1 author
+>
+> ### Intent `did_910a…`
+>
+> **Author:** `claude-code` (AGENT) · **Model:** `claude-3-5-sonnet` · **Signature:** ✍ Ed25519
+>
+> > Add retry handling to the payment webhook with exponential backoff and a dead-letter queue for permanent failures.
+>
+> | File | Change |
+> | --- | --- |
+> | `src/webhooks/payment.ts` | **MODIFIED** — add retryWebhook() with backoff |
+> | `src/webhooks/signature.ts` | **MODIFIED** — verify signature before enqueue |
+> | `src/webhooks/process.ts` | **ADDED** — add processPaymentEvent() handler |
 
-```yaml
-- uses: lilcipherx/drift@v0.3.0
-  with:
-    command: log     # or: doctor / verify <intent-id>
-```
+Review the intent, not 2,000 lines of diff.
 
-## Demo
+---
 
-The 5-minute "aha" — a real Drift history, generated by the CLI itself:
+## Why Drift?
 
-```bash
-bash scripts/seed-demo.sh
-cd examples/demo-repo
+Git tells you *what* changed — a text diff. As more code is generated by AI,
+reviewing thousands of lines of diff tells you nothing about *why* they exist,
+*what* the model was asked to do, or *how* the change was verified.
 
-node ../../packages/drift-cli/dist/cli.js log
-node ../../packages/drift-cli/dist/cli.js blame src/auth.ts --function refreshToken
-```
+Drift records exactly that, at commit time:
 
-`blame` prints the prompt, model and a **valid signature** for the function:
+- **Intent** — the prompt: what was asked and why.
+- **Provenance** — who (human) or what (agent + model) produced it.
+- **Verification** — the recorded command that approved it (`drift verify`).
+- **Signature** — Ed25519-signed and content-addressed, so the record is
+  tamper-evident (`drift verify-intent`).
+- **Recovery** — a crashed agent resumes from its last checkpoint
+  (`drift replay --checkout`).
 
-```
-src/auth.ts:12 (refreshToken)
-  AGENT @ Drift Demo
-  model:   claude-3-5-sonnet
-  prompt:  Fix race condition in token refresh by de-duplicating in-flight refreshes
-  intent:  did_2941b4547b4ed505a7c37190247768a7
-  commit:  087c492f…  signature: valid
-```
+---
 
-## The Basic Workflow
+## How it works
 
-1. **init** — Creates `.drift/` (SQLite DAG, config, Ed25519 keypair). Never rewrites
-   history; deleting `.drift/` leaves a fully functional git repo.
+1. **`drift init`** creates `.drift/` — a SQLite intent store, a config, and a
+   per-repo Ed25519 key. Git history is never rewritten.
+2. **`drift realize`** stages, syntax-checks, redacts, AST-diffs, signs, stores
+   the intent in `.drift/objects/`, and commits with a `Drift-Intent:` trailer.
+3. **`drift blame` / `drift context`** map any line or function back to the
+   intent that created it.
+4. **`drift verify`** re-runs the recorded verification command.
+5. **`drift doctor`** checks store integrity and repairs orphans (`--fix`).
 
-2. **realize** — Commit with intent. Syntax gate (exit 2), secret redaction,
-   AST delta, Ed25519 signature, `Drift-Intent:` trailer. This is `git commit` for
-   the AI era.
+Deeper: [docs/architecture.md](docs/architecture.md) (storage, crypto, the
+GitHub App) and [docs/api.md](docs/api.md) (every command, flag, exit code and
+MCP tool).
 
-3. **log** — Timeline of intents: id, author (agent vs human), model, prompt.
+---
 
-4. **blame / context** — `blame --line|--function` walks a symbol back to its
-   originating prompt; `context <file>` hydrates the last N intents for grounding.
+## Security & privacy
 
-5. **verify** — Re-runs the recorded verification command for an intent and checks
-   the Ed25519 signature against the object file (never against DB rows).
+- **Prompts never leak into git history by default.** `[prompts] mode` in
+  `.drift/config.toml`: `commit-summary` (default — full prompt only in the
+  local, gitignored `.drift/` store; the commit carries a safe `Intent:` /
+  `Model:` / `Verification:` summary), `full` (opt-in, legacy), `none`
+  (prompt stored nowhere).
+- **Secrets are redacted** (AWS, OpenAI, GitHub, Slack, JWT, PEM, …) before
+  any storage.
+- **Encryption at rest** (optional): `[encryption] enabled = true` +
+  `DRIFT_MASTER_KEY` → AES-256-GCM for prompts and agent state.
+- **No telemetry, no network** — the CLI works fully offline.
+- Full threat model: [SECURITY.md](SECURITY.md).
 
-6. **replay** — Restore a checkpointed agent state; `--checkout` resets the
-   worktree. Crash recovery for agents.
-
-7. **doctor** — DAG integrity, signature checks, orphan cleanup, encryption-key
-   check when encryption is enabled.
-
-**The agent checks the intent before any task.** Mandatory for anyone touching
-generated code.
-
-## What's Inside
-
-### Core
-| Package | What it does |
-| :--- | :--- |
-| **`@drift/cli`** | The `drift` CLI — `init`, `realize`, `log`, `blame`, `context`, `verify`, `replay`, `doctor`, `export` |
-| **`@drift/core`** | Intent store (SQLite DAG), git wrapper, Ed25519 signatures, secret redaction, AES-256-GCM encryption at rest |
-| **`@drift/ast`** | Semantic parser (TypeScript/JavaScript, Python) + AST deltas with a real syntax gate |
-
-### Agent integration
-| Package | What it does |
-| :--- | :--- |
-| **`@drift/mcp`** | MCP server — six tools for Claude Code / Codex / Cline, delegates to the CLI |
-| **`@drift/sdk`** | Typed SDK + Zod intent schemas |
-| **`@drift/app`** | GitHub App — `pull_request` webhook that posts idempotent intent-summary comments |
-
-### Review & CI
-| Package | What it does |
-| :--- | :--- |
-| **`@drift/action`** | GitHub Action (composite) — `log` / `doctor` / `verify` in CI |
-
-## Philosophy
-
-- **Semantics over text** — diffs show what; intents show why. Always.
-- **Broken code never enters history** — the syntax gate is the front door.
-- **Evidence over claims** — every intent is signed; every claim is verifiable.
-- **Security by default** — secrets redacted, telemetry off, no network calls,
-  optional AES-256-GCM encryption at rest (v0.2.0+).
-- **Simplicity** — zero native dependencies, strict git compatibility, no
-  rewriting of history.
-
-## Security
-
-- Every intent is **Ed25519-signed**; verification uses the object-file canonical
-  JSON, so signature checks never need the master key.
-- Prompts are **regex-redacted** for secrets (AWS, OpenAI, GitHub, Slack, JWT,
-  PEM, …) before any storage.
-- **Encryption at rest (v0.2.0):** `[encryption] enabled = true` + `DRIFT_MASTER_KEY`
-  encrypts `prompt` and `agentState` with AES-256-GCM (AAD-bound to the intent id).
-  Note: the commit message keeps the plaintext prompt by design (PRD §9.1) — see
-  [SECURITY.md](SECURITY.md).
-- Keys are never committed (`.drift/keys/` is gitignored) except throwaway demo keys.
-
-## Evaluation
-
-The [eval harness](eval/harness.mjs) (PRD §22) drives the real CLI with mock
-file states — no LLM calls, no network — and records a baseline:
-
-```bash
-npm run eval           # run scenarios + compare against baseline (regression gate)
-npm run eval:record    # re-record eval/baseline.json
-```
-
-Metrics gated at >5% regression (PRD §22.3): **syntax-error rejection rate**
-(must be 100%), **blame accuracy**, **replay fidelity**. Scenarios live in
-[eval/scenarios/](eval/scenarios/).
+---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The general flow:
+Contributors welcome — see [CONTRIBUTING.md](CONTRIBUTING.md), the
+[good-first-issue list](docs/GOOD_FIRST_ISSUES.md), and our
+[Code of Conduct](CODE_OF_CONDUCT.md). Design decisions are tracked in
+[docs/adrs.md](docs/adrs.md).
 
-1. Fork the repository.
-2. Create a branch for your work.
-3. Keep `npm test` green (110 tests: unit, temp-git-repo integration, MCP
-   JSON-RPC e2e, GitHub App handler + live webhook-server E2E + client-abort
-   + graceful-shutdown robustness).
-4. Keep the eval baseline green: `npm run eval` (PRD §22).
-5. Submit a PR using the template.
+**Documentation:** [quickstart](docs/quickstart.md) · [installation](docs/installation.md) · [API reference](docs/api.md) · [architecture](docs/architecture.md) · [changelog](CHANGELOG.md)
 
-Design decisions are tracked in [docs/adrs.md](docs/adrs.md) — note that the PRD
-originally chose Rust (ADR-003); this implementation ships TypeScript-first
-(ADR-006) for a zero-native-dependency MVS. The `drift-ast` parser interface is
-the drop-in point for a future tree-sitter implementation.
-
-## Updating
-
-Once published, MCP servers launched via `npx -y @drift/mcp` pick up new
-versions automatically (`npx` always fetches the latest published release).
-Until then, servers launched from a clone (the commands shown in
-[Installation](#installation)) track this checkout — update with
-
-```bash
-git pull origin main
-npm install
-```
-
-Releases are tagged on the
-[releases page](https://github.com/lilcipherx/drift/releases) (`v0.1.0`,
-`v0.2.0`, `v0.2.1`, …).
-
-Changelog: [CHANGELOG.md](CHANGELOG.md).
+**Verified live** on Windows 11 (Node v24.18.0, 2026-08-06): fresh clone →
+first `drift blame` in ~8.1 s, 10/10 checks pass, no registry 404; the packed
+`@drift/*` chain answers the MCP handshake with all six tools in ~1 s — see
+the [measured tables](docs/quickstart.md#verified-live-проверено-вживую).
 
 ## License
 
 MIT — see [LICENSE](LICENSE). Security notes: [SECURITY.md](SECURITY.md).
-
-## Community
-
-- **Repository**: [github.com/lilcipherx/drift](https://github.com/lilcipherx/drift)
-- **Issues**: [github.com/lilcipherx/drift/issues](https://github.com/lilcipherx/drift/issues)
-- **Releases**: [github.com/lilcipherx/drift/releases](https://github.com/lilcipherx/drift/releases)
-- **Documentation**: [quickstart](docs/quickstart.md) · [API reference](docs/api.md) · [architecture](docs/architecture.md) · [`examples/demo-repo`](examples/demo-repo)
-- **Code of Conduct**: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+Issues & releases: [github.com/lilcipherx/drift](https://github.com/lilcipherx/drift).

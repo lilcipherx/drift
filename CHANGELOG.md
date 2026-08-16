@@ -81,6 +81,16 @@ All notable changes are tracked here (git-cliff style, kept manually).
   security defaults (redaction, path containment, telemetry off).
 - Test-count references refreshed to 110/110 (`README` badge + CONTRIBUTING
   wording, `AUDIT.md`, `NEXT_STEPS.md`).
+- **README redesigned** around user value: 30-second demo with real `blame`
+  output, 60-second quickstart, real PR-summary sample, "Why Drift?",
+  Security & privacy (incl. prompt modes). The 11-harness install matrix
+  moved to `docs/installation.md`; badge + PR template counts refreshed to
+  123.
+- **docs/OSS_AUDIT.md** — full open-source audit (architecture, what works,
+  gaps, critical problems, priorities) + same-day follow-up.
+- **docs/NPM_RELEASE.md** — owner checklist for the first npm publication.
+- **docs/GOOD_FIRST_ISSUES.md** — 12 sized tasks for external contributors;
+  CONTRIBUTING.md rewritten; bug/feature issue templates added.
 
 ### Fixed (release audit)
 - `@drift/cli` package `types` pointed at `dist/index.d.ts`, which the build

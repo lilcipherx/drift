@@ -21,10 +21,13 @@ can drop the `node packages/drift-cli/dist/cli.js` prefix below.)
 ```bash
 cd /path/to/your/repo
 node /path/to/drift/packages/drift-cli/dist/cli.js init
+node /path/to/drift/packages/drift-cli/dist/cli.js status   # what was created + next step
 ```
 
 This creates `.drift/` — a SQLite DAG store, `config.toml`, and a per-repo
-Ed25519 signing key. Nothing in your git history is touched.
+Ed25519 signing key. Nothing in your git history is touched. `status` is the
+first-run compass: it reports the intent count, prompt mode, encryption
+state and the exact next command.
 
 ## 3. Make a change with intent
 
@@ -37,7 +40,10 @@ node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "Add login flow wi
 `realize` stages the change, checks the syntax (broken code → exit 2, **no
 commit**), redacts secrets from your prompt, computes the AST delta, signs the
 intent, stores it in `.drift/objects/`, and commits with a `Drift-Intent: <id>`
-trailer.
+trailer. **By default the full prompt stays in the local `.drift/` store** —
+the git commit message carries only a safe `Intent:` / `Model:` /
+`Verification:` summary (see `[prompts] mode` in
+[api.md](api.md#configuration-driftconfigtoml)).
 
 ## 4. See the "why"
 
@@ -109,5 +115,7 @@ handshake from an empty directory with no clone and no build step, proving the
 
 - Full command reference: [api.md](api.md)
 - How Drift works under the hood: [architecture.md](architecture.md)
-- Configuring encryption at rest, redaction, and the AST parser:
-  [api.md](api.md#configuration-driftconfigtoml)
+- Installing into 11 coding-agent harnesses:
+  [installation.md](installation.md)
+- Configuring encryption at rest, redaction, prompt modes, and the AST
+  parser: [api.md](api.md#configuration-driftconfigtoml)
