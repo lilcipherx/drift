@@ -174,14 +174,15 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # REQUIRED: the Action computes the PR commit range
       - uses: lilcipherx/drift@main     # development-only; pin a release tag once one exists
         with:
-          command: log                 # or: doctor / verify <intent-id>
+          operation: log               # allowlist: log | doctor | status | verify-intent (informational only)
           comment: 'true'              # post (or update) the Drift summary on the PR
           fail-on-comment-error: 'false'
+          fail-on-provenance-error: 'true'  # fail the job on invalid/tampered provenance
 ```
 
 **Permissions.** The Action only reads the repository (`contents: read`).

@@ -90,3 +90,45 @@ prompts are exported only with the explicit `drift export
 --include-private-prompt` flag, which marks the output
 `"containsPrivatePrompts": true`, warns on stderr, and **refuses to write
 inside the git repository** unless `--allow-repository-output` is given.
+
+## Public provenance integrity (pull requests)
+
+Committed public manifests are **append-only** in pull requests and are
+audited by content, never by filename presence:
+
+- an existing manifest that is modified, deleted or renamed on a PR is an
+  **integrity violation**;
+- a new manifest is legitimate only when its introducing commit carries
+  exactly one matching `Drift-Intent:` trailer, the id does not already exist
+  on the base branch (replay), the id is referenced by exactly one commit
+  (ambiguous otherwise), and the PR-head blob is byte-identical to the
+  introduced blob (added-then-modified is a violation);
+- an unchanged manifest (byte-identical on base and head) is never reported
+  as modified.
+
+These rules are enforced by the GitHub App (Check Run conclusion) and the
+composite GitHub Action (`fail-on-provenance-error`, default `true`, exits
+non-zero AFTER the safe step summary and comment are generated). Neutral
+states — valid bootstrap, unsigned/unverifiable/missing legacy manifests, no
+intents — never fail by default.
+
+## Cross-component key identity and validation
+
+- **Canonical key identity:** one implementation (`signingKeyIdFor`) hashes
+  the canonical **SPKI DER** bytes of the Ed25519 public key (SHA-256, first
+  16 hex chars) in Core, the Action and the App. Textual PEM is never hashed,
+  so LF/CRLF and whitespace differences can never change a key's identity or
+  masquerade as a key replacement.
+- **Strict bounded parsing:** manifest JSON is bounded to 256 KiB before
+  `JSON.parse`; unknown top-level / `agent` / `files` fields are rejected
+  (they cannot silently join the signed payload). The per-PR audit is bounded
+  (200 manifests / 50 MiB total) and oversized files are reported as
+  malformed — never loaded whole, never echoed.
+- **Comment ownership:** the App updates a comment only when
+  `performed_via_github_app.id` equals the configured Drift App id (never an
+  arbitrary positive id; an unavailable App id means no comment is owned);
+  the Action updates only `github-actions[bot]` (type `Bot`) comments. The
+  two integrations never edit each other's markers.
+- **Index safety:** `drift realize` snapshots the real git index file
+  byte-for-byte and restores it exactly on any pre-commit failure; snapshots
+  are discarded on success and never leak as `drift-idx-*` temp backups.

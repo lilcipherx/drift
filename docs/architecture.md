@@ -161,16 +161,52 @@ allows unsigned requests. On `pull_request` `opened` / `synchronize` /
    `<!-- drift:app-summary:v2 -->`, sanitized, `summary` only).
 
 The summary is **idempotent**: the App PATCHes its own marker comment in
-place (a comment is only updated when GitHub attests the App authored it via
-`performed_via_github_app.id` — user-authored spoofed markers are never
-touched, and the App never edits the Action's `<!-- drift:action-summary:v2
--->` comment). The Action posts as `github-actions[bot]` and follows the
-same ownership rule in reverse.
+place — a comment is updated ONLY when GitHub attests this App authored it
+(`performed_via_github_app.id` must equal the configured Drift App id; an
+arbitrary positive id is never accepted, and an absent configured App id
+means no comment is treated as owned). User-authored spoofed markers are
+never touched, and the App never edits the Action's
+`<!-- drift:action-summary:v2 -->` comment. The Action posts as
+`github-actions[bot]` and follows the same ownership rule in reverse.
 
 The GitHub **Action** (`scripts/pr-comment.mjs`) uses the same public-manifest
 source and integrity audit but is scoped to **only the PR's commits**
 (`merge-base(base,head)..head`) and degrades gracefully on forks (step
-summary + warning, no `pull_request_target`).
+summary + warning, no `pull_request_target`). By default the composite
+Action **fails the workflow** on invalid/tampered provenance
+(`fail-on-provenance-error`, default `true`) — the safe step summary and PR
+comment are always generated before the non-zero exit; neutral states
+(bootstrap, unsigned/unverifiable/missing manifests, no intents) never fail.
+
+## Cross-component trust contract (Core ⇄ Action ⇄ App)
+
+One canonical implementation of public-key identity, manifest validation and
+provenance-integrity semantics is shared by every consumer:
+
+- **Key identity** — `signingKeyIdFor` hashes the canonical **SPKI DER** bytes
+  of the Ed25519 public key (SHA-256, first 16 hex chars). PEM text is never
+  hashed, so LF/CRLF line endings and harmless surrounding whitespace can
+  never change a key's identity. The same function drives V2 `signingKeyId`,
+  signature-state checks, base/head trust-root comparison, key import and
+  signer status in Core, the Action and the App.
+- **Strict bounded validation** — one schema for V1/V2 with the exact allowed
+  fields enumerated: unknown top-level / `agent` / `files` fields are
+  REJECTED (a field that is not in the schema can never silently join the
+  signed payload). Raw byte size is enforced BEFORE `JSON.parse`
+  (`MANIFEST_MAX_BYTES` = 256 KiB; public key bounded; per-PR audit bounded
+  at 200 manifests / 50 MiB total). Signature verification runs over the
+  canonical original payload; sanitization only affects rendering.
+- **Append-only manifests with atomic introduction** — an existing manifest
+  may never be modified, deleted or renamed (compared by exact blob content,
+  never by filename presence). A new manifest is legitimate only when its
+  introducing commit (the first PR commit containing the file) carries
+  exactly one matching `Drift-Intent:` trailer, the id was not already
+  present on the base branch (replay), the id is referenced by exactly one
+  commit (ambiguous otherwise), and the PR-head blob is byte-identical to
+  the introduced blob (added-then-modified is a violation).
+- **Trust conclusions** — one shared policy maps manifest states and
+  integrity violations to `success` / `neutral` / `failure` for the Check
+  Run and the Action's exit code.
 
 ## Git compatibility contract
 
@@ -201,7 +237,15 @@ summary + warning, no `pull_request_target`).
 - **PR trust root:** manifests in a pull request are verified against the
   BASE-branch `.drift/public/key.pem`. A PR that replaces the key is flagged
   prominently and its provenance marked unverified — the replacement key is
-  never silently trusted.
+  never silently trusted. Base/head key comparison uses the canonical SPKI
+  fingerprint, so formatting-only PEM differences never register as a key
+  replacement.
+- **Index safety:** `drift realize` snapshots the real git index file
+  byte-for-byte before touching anything and restores it exactly on any
+  pre-commit failure (partial hunks, intent-to-add, renames, deletions,
+  assume-unchanged/skip-worktree flags survive). The snapshot is discarded
+  on success and never leaks: no `drift-idx-*` backup remains after success,
+  failure, or repeated runs on a persistent self-hosted runner.
 - **Shell execution (opt-in):** `drift verify <id>` is informational by
   default — it validates the manifest, reports the signature/trust state and
   shows the recorded command WITHOUT executing it. A recorded verification

@@ -121,6 +121,16 @@ never appears in a PR comment. The comment is scoped to **this PR's commits**
 (immutable base/head SHAs) and updated in place, never duplicated. Review the
 intent, not 2,000 lines of diff.
 
+Public provenance is **append-only and integrity-audited**: the App and the
+Action compare manifest content (never filename presence), require every new
+manifest to be introduced in the same commit as its `Drift-Intent:` trailer,
+and flag modified/deleted/renamed/orphan/replayed manifests as violations.
+The composite Action fails the workflow on tampered provenance by default
+(`fail-on-provenance-error: true`), after generating the safe summary and
+comment. Key identity is canonical — an SPKI-DER fingerprint shared by Core,
+the Action and the App, so formatting differences can never change a key's
+identity. See [SECURITY.md](SECURITY.md) for the full trust contract.
+
 ---
 
 ## Why Drift?

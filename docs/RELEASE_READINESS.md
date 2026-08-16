@@ -27,6 +27,7 @@ compatible). Every command below was **run**, not assumed._
 | Demo | `bash scripts/seed-demo.sh` → demo-repo log/blame | ✅ seeded in ~2 s; blame resolves the intent with a valid signature |
 | CI workflow | `.github/workflows/ci.yml` — trusted Linux on `[self-hosted, Linux, ARM64]`, fork PRs on `ubuntu-latest`, Windows on `windows-latest` (all Node 24) | ✅ configured with exactly the commands above (needs Actions enabled + the ARM64 runner reachable — see blockers) |
 | PR comment script | `scripts/pr-comment.mjs` (unit-tested) | ✅ PR-scoped trailers → public manifests → sanitized summary; PATCHes by marker (no duplicates); 403/401 on forks → step summary + warning, exit 0 unless `fail-on-comment-error` |
+| Provenance integrity | Action + App audits | ✅ append-only (modified/deleted/renamed/orphan/replay/ambiguous/post-introduction mutation are violations; unchanged manifests are content-compared, never false-flagged); `fail-on-provenance-error` (default true) fails the job AFTER the safe summary/comment; neutral states never fail |
 
 ## Remaining blockers (external — need the owner)
 
