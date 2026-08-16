@@ -35,11 +35,13 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # checkout/setup-node v7 run on the Node 24 action runtime (Node 20 was
+      # deprecated on GitHub Actions in 2026) and support linux-arm64.
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           # No `cache: npm` here on purpose: the npm cache key does not include
@@ -93,11 +95,11 @@ jobs:
       github.event.pull_request.head.repo.full_name != github.repository
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -146,11 +148,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
