@@ -110,7 +110,10 @@ export interface LogEntry {
   authorType: "HUMAN" | "AGENT";
   authorId: string;
   model: string | null;
+  /** Full (redacted) prompt. Private: only surfaced with an explicit opt-in flag. */
   prompt: string;
+  /** Safe public summary (ADR-009) — safe to commit, clone, and render. */
+  summary?: string;
   timestamp: number;
   files: { path: string; mutationType: MutationType; summary: string | null }[];
 }

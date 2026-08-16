@@ -99,11 +99,31 @@ export function clearRefreshCache(): void {
 EOF
 cli realize -p "Add clearRefreshCache for tests" --author "Drift Demo" >/dev/null
 
-# 4. demo keys are throwaway — commit them so the demo works out of the box
-git add -f .drift
-git commit -qm "chore: seed drift intents"
+# 3b. README for the checked-out example
+cat > README.md <<'EOF'
+# Drift demo repository
+
+A real Drift history you can walk through in two minutes. Only public
+provenance (`.drift/public/`, `config.toml`, `.gitignore`) is committed —
+see the copy at the repository root for the full walkthrough.
+EOF
+
+# 4. ADR-009: commit ONLY the public provenance (config + ignore + public/).
+#    The SQLite DB, content-addressed objects and the signing key stay
+#    untracked — `git add .` can never stage them (see .drift/.gitignore).
+git add README.md .drift/config.toml .drift/.gitignore .drift/public
+git commit -qm "chore: seed drift intents (public provenance)"
+
+# 5. sanity: prove `git add .` cannot stage private Drift data
+if git check-ignore -q .drift/drift.db && git check-ignore -q .drift/keys/ed25519.pem; then
+  echo "✓ private .drift data is gitignored"
+else
+  echo "ERROR: private .drift data is not ignored" >&2
+  exit 1
+fi
 
 echo ""
 echo "✓ Demo repo seeded at examples/demo-repo"
 echo "  try:   cd examples/demo-repo && node ../../packages/drift-cli/dist/cli.js log"
 echo "  or:    node ../../packages/drift-cli/dist/cli.js blame src/auth.ts --function refreshToken"
+echo "  note:  .drift/drift.db, objects/ and keys/ are present locally but gitignored"

@@ -1,4 +1,6 @@
-export { Drift } from "./engine.js";
+export { Drift, ensureDriftGitignore } from "./engine.js";
+export { PublicStore, buildPublicSummary, sanitizePublicText, PUBLIC_FILES_MAX, PUBLIC_SUMMARY_MAX, } from "./public.js";
+export { DRIFT_INTENT_ID_RE, extractDriftIntentIds, parseGitTrailers } from "./trailers.js";
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export { ENCRYPTION_MARKER, canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";
 export { DEFAULT_CONFIG, loadConfig, parseToml } from "./config.js";

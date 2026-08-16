@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "did_523e92bc2d6f60ef1e6fe8bd4a734735",
+  "summary": "Fix race condition in token refresh by de-duplicating in-flight refreshes",
+  "model": "claude-3-5-sonnet",
+  "agent": {
+    "type": "AGENT",
+    "identifier": "Drift Demo"
+  },
+  "files": [
+    {
+      "path": "src/auth.ts",
+      "mutationType": "MOVED",
+      "summary": "function \"verifyToken\" moved from line 6 to 8"
+    },
+    {
+      "path": "src/auth.ts",
+      "mutationType": "ADDED",
+      "summary": "function \"refreshToken\" added (line 12)"
+    }
+  ],
+  "commit": "dbbfc34214ec05cadbd378a5017ca91792af4e2e",
+  "timestamp": 1786844458935,
+  "signature": "9QJQUg71pj8RhXoHO2gNLq8rAWTsWwGJW9HntHf6URvtw3vJIg54FS+Ty/pK0yt0+D40rDk4phTVhae4f3r2DA=="
+}

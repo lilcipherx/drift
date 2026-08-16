@@ -74,3 +74,13 @@
   regression gate and test suite are the substance, CI is their public face.
   If the account's Actions are ever disabled again, the same commands still
   run locally via `npm test` / `npm run eval` / `scripts/acceptance-mvs.sh`.
+
+## ADR-009: Public/private provenance separation
+
+- **Decision:** public **signed manifests** in `.drift/public/intents/` are the
+  canonical public provenance source; raw prompts, `drift.db`, `objects/`, and
+  `keys/` stay private and are gitignored. Full text in
+  [`docs/adrs/009-public-private-provenance.md`](adrs/009-public-private-provenance.md).
+- **Justification:** trailers alone cannot carry the summary/model/files the
+  Action and App need after a fresh clone; committed private objects were the
+  actual prompt-leak path.

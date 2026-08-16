@@ -29,6 +29,7 @@ export interface BlameResult {
     committed: boolean;
     intent: (IntentRecord & {
         signatureValid: boolean;
+        summary: string;
     }) | null;
     baseline: boolean;
 }
@@ -76,17 +77,27 @@ export interface DriftStatus {
     lastIntent?: {
         id: string;
         timestamp: number;
-        prompt: string;
+        summary: string;
     } | null;
 }
 export declare class Drift {
     readonly repoRoot: string;
     readonly driftDir: string;
     readonly config: DriftConfig;
+    /**
+     * Private SQLite intent store. `null` in public-only mode (fresh clone,
+     * ADR-009): read commands then serve from the committed public manifests.
+     */
     private store;
+    private publicStore;
     private privateKeyPem;
     private publicKeyPem;
     private redactionPatterns;
+    private readonly publicOnly;
+    /**
+     * @param opts.forceStore open the private store even when drift.db is
+     *   absent (used by `init`, which creates it).
+     */
     private constructor();
     /** DRIFT_MASTER_KEY → 32-byte AES key, or null when not set (PRD §17.2). */
     private getMasterKey;
@@ -105,6 +116,8 @@ export declare class Drift {
     }): InitResult;
     private loadKeys;
     close(): void;
+    /** The private store, or a clear error naming the command that needs it. */
+    private requireStore;
     get publicKey(): string;
     /**
      * First-run friendly status: always succeeds as a read, reports whether the
@@ -119,6 +132,8 @@ export declare class Drift {
         file?: string;
         limit?: number;
     }): LogEntry[];
+    /** Safe public summary for an intent: manifest first, then derived. */
+    summaryFor(id: string, localPrompt: string): string;
     blame(filePath: string, opts?: {
         line?: number;
         functionName?: string;
@@ -131,10 +146,22 @@ export declare class Drift {
     doctor(opts?: {
         fix?: boolean;
     }): DoctorResult;
+    /** Private Drift paths that git does NOT ignore. */
+    private untrackPrivateDriftFiles;
+    /** Tracked files under .drift that are NOT in the public allow-list. */
+    private trackedPrivateDriftFiles;
+    /** Tracked .drift JSON files whose content carries a `prompt` field. */
+    private trackedPromptBearingObjects;
     exportJson(): string;
     verifyIntentSignature(intentId: string): {
         ok: boolean;
         detail: string;
     };
 }
+/**
+ * Ensure `.drift/.gitignore` contains the ADR-009 rules. Idempotent and
+ * non-destructive: existing lines are kept, missing rules are appended as a
+ * block (the negation order within the block is preserved).
+ */
+export declare function ensureDriftGitignore(driftDir: string): void;
 //# sourceMappingURL=engine.d.ts.map

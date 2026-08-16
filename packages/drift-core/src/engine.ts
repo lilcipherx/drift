@@ -23,6 +23,7 @@ import {
   textDelta,
   validateSyntax,
   type ASTDelta,
+  type MutationType,
   type SymbolInfo,
 } from "@drift/ast";
 import {
@@ -57,6 +58,15 @@ import {
 } from "./git.js";
 import { IntentStore, type IntentRecord, type LogEntry } from "./store.js";
 import { compilePatterns, redact, type RedactResult } from "./redact.js";
+import {
+  buildPublicSummary,
+  PUBLIC_FILES_MAX,
+  PublicStore,
+  sanitizePublicText,
+  type PublicIntentView,
+  type UnsignedPublicIntentView,
+} from "./public.js";
+import { extractDriftIntentIds } from "./trailers.js";
 
 export interface RealizeOptions {
   prompt: string;
@@ -82,7 +92,7 @@ export interface BlameResult {
   functionName?: string;
   gitSha: string;
   committed: boolean;
-  intent: (IntentRecord & { signatureValid: boolean }) | null;
+  intent: (IntentRecord & { signatureValid: boolean; summary: string }) | null;
   baseline: boolean;
 }
 
@@ -132,36 +142,55 @@ export interface DriftStatus {
   gitBranch?: string | null;
   gitHead?: string | null;
   gitDirty?: boolean;
-  lastIntent?: { id: string; timestamp: number; prompt: string } | null;
+  lastIntent?: { id: string; timestamp: number; summary: string } | null;
 }
 
 export class Drift {
   readonly repoRoot: string;
   readonly driftDir: string;
   readonly config: DriftConfig;
-  private store: IntentStore;
+  /**
+   * Private SQLite intent store. `null` in public-only mode (fresh clone,
+   * ADR-009): read commands then serve from the committed public manifests.
+   */
+  private store: IntentStore | null;
+  private publicStore: PublicStore;
   private privateKeyPem: string;
   private publicKeyPem: string;
   private redactionPatterns: RegExp[];
+  private readonly publicOnly: boolean;
 
-  private constructor(repoRoot: string) {
+  /**
+   * @param opts.forceStore open the private store even when drift.db is
+   *   absent (used by `init`, which creates it).
+   */
+  private constructor(repoRoot: string, opts: { forceStore?: boolean } = {}) {
     this.repoRoot = repoRoot;
     this.driftDir = join(repoRoot, ".drift");
     this.config = loadConfig(this.driftDir);
     this.redactionPatterns = compilePatterns(this.config.redaction.patterns);
-    try {
-      this.store = IntentStore.open(join(this.driftDir, "drift.db"));
-    } catch (err) {
-      // A corrupted SQLite file surfaces as an opaque driver error; report it
-      // as a corrupt DAG (PRD §14.1 exit 5) instead of a generic error 1.
-      throw new DriftError(
-        `Drift database is corrupt or unreadable (${this.driftDir}/drift.db): ${err instanceof Error ? err.message : String(err)}. Restore it from a backup or run \`git clean -fdx .drift\` + \`drift init\` to start fresh.`,
-        EXIT.CORRUPT,
-      );
+    this.publicStore = new PublicStore(this.driftDir);
+    const dbPath = join(this.driftDir, "drift.db");
+    this.publicOnly = !opts.forceStore && !existsSync(dbPath);
+    if (this.publicOnly) {
+      this.store = null;
+      this.privateKeyPem = "";
+      this.publicKeyPem = this.publicStore.publicKey() ?? "";
+    } else {
+      try {
+        this.store = IntentStore.open(dbPath);
+      } catch (err) {
+        // A corrupted SQLite file surfaces as an opaque driver error; report it
+        // as a corrupt DAG (PRD §14.1 exit 5) instead of a generic error 1.
+        throw new DriftError(
+          `Drift database is corrupt or unreadable (${this.driftDir}/drift.db): ${err instanceof Error ? err.message : String(err)}. Restore it from a backup or run \`git clean -fdx .drift\` + \`drift init\` to start fresh.`,
+          EXIT.CORRUPT,
+        );
+      }
+      const keys = this.loadKeys();
+      this.privateKeyPem = keys.privateKeyPem;
+      this.publicKeyPem = keys.publicKeyPem;
     }
-    const keys = this.loadKeys();
-    this.privateKeyPem = keys.privateKeyPem;
-    this.publicKeyPem = keys.publicKeyPem;
   }
 
   // ---------------------------------------------------------- encryption
@@ -213,15 +242,16 @@ export class Drift {
     const root = findRepoRoot(cwd, process.env.DRIFT_REPO);
     if (!root) throw new DriftError("Not inside a git repository");
     const driftDir = join(root, ".drift");
-    if (!existsSync(driftDir)) {
+    const firstTime = !existsSync(driftDir);
+    if (firstTime) {
       mkdirSync(join(driftDir, "objects"), { recursive: true });
       mkdirSync(join(driftDir, "keys"), { recursive: true });
+      mkdirSync(join(driftDir, "public", "intents"), { recursive: true });
       writeFileSync(join(driftDir, "config.toml"), CONFIG_TEMPLATE);
-      writeFileSync(
-        join(driftDir, ".gitignore"),
-        "keys/\n",
-      );
     }
+    // Idempotent merge: never deletes user lines, only ensures the ADR-009
+    // ignore rules are present so `git add .` can never stage private data.
+    ensureDriftGitignore(driftDir);
     const keysDir = join(driftDir, "keys");
     const keyPath = join(keysDir, "ed25519.pem");
     let keyPair: { privateKeyPem: string; publicKeyPem: string };
@@ -233,11 +263,14 @@ export class Drift {
       writeFileSync(keyPath, keyPair.privateKeyPem, { mode: 0o600 });
     }
 
-    const drift = new Drift(root);
-    drift.store.setMeta("schema_version", "1");
-    drift.store.setMeta("public_key", keyPair.publicKeyPem.trim());
-    drift.store.setMeta("created_at", String(Date.now()));
-    if (opts.author) drift.store.setMeta("default_author", opts.author);
+    const drift = new Drift(root, { forceStore: true });
+    const store = drift.requireStore("drift init");
+    store.setMeta("schema_version", "1");
+    store.setMeta("public_key", keyPair.publicKeyPem.trim());
+    store.setMeta("created_at", String(Date.now()));
+    if (opts.author) store.setMeta("default_author", opts.author);
+    // Commit the public key so fresh clones can verify manifest signatures.
+    drift.publicStore.writePublicKey(keyPair.publicKeyPem.trim());
     drift.close();
     return {
       repoRoot: root,
@@ -259,7 +292,18 @@ export class Drift {
   }
 
   close(): void {
-    this.store.close();
+    this.store?.close();
+  }
+
+  /** The private store, or a clear error naming the command that needs it. */
+  private requireStore(command: string): IntentStore {
+    if (!this.store) {
+      throw new DriftError(
+        `No local Drift store in this clone — \`${command}\` needs private local data. Run \`drift init\` to create the local intent store and signing key.`,
+        EXIT.KEY,
+      );
+    }
+    return this.store;
   }
 
   get publicKey(): string {
@@ -290,14 +334,16 @@ export class Drift {
       return {
         initialized: true,
         repoRoot: root,
-        intents: drift.store.allRows().length,
-        head: drift.store.getHead(),
+        intents: drift.store ? drift.store.allRows().length : drift.publicStore.list().length,
+        head: drift.store?.getHead() ?? null,
         encryption: drift.config.encryption.enabled,
         promptMode: drift.config.prompts.mode,
         gitBranch: branchRes.status === 0 ? branchRes.stdout.trim() : null,
         gitHead: headRes.status === 0 ? headRes.stdout.trim() : null,
         gitDirty: ws.stdout.trim().length > 0,
-        lastIntent: last ? { id: last.id, timestamp: last.timestamp, prompt: last.prompt } : null,
+        lastIntent: last
+          ? { id: last.id, timestamp: last.timestamp, summary: last.summary ?? "" }
+          : null,
       };
     } finally {
       drift.close();
@@ -306,6 +352,7 @@ export class Drift {
 
   // ---------------------------------------------------------------- realize
   realize(opts: RealizeOptions): RealizeResult {
+    const store = this.requireStore("drift realize");
     const prompt = (opts.prompt ?? "").trim();
     if (!prompt) {
       throw new DriftError("realize requires a prompt: drift realize -p \"what did you change and why\"");
@@ -385,7 +432,7 @@ export class Drift {
       ? redact(opts.agentState, this.redactionPatterns).text
       : undefined;
 
-    const headId = this.store.getHead();
+    const headId = store.getHead();
     const timestamp = Date.now();
     const id = newIntentId();
     const authorId = opts.author ?? (gitIdentity(this.repoRoot, "user.name") || "unknown");
@@ -460,7 +507,7 @@ export class Drift {
       signature,
     };
     try {
-      this.store.insertIntent(intent);
+      store.insertIntent(intent);
     } catch (err) {
       // Commit landed but intent recording failed — surface it so the user can
       // run `drift doctor` (trailer-backref check) instead of a bare error.
@@ -468,17 +515,62 @@ export class Drift {
         `git commit landed (${gitSha}) but intent recording failed: ${err instanceof Error ? err.message : String(err)}. Run \`drift doctor\` to reconcile.`,
       );
     }
-    this.store.setHead(id);
+    store.setHead(id);
+
+    // ADR-009: persist the public (safe, signed) provenance view so fresh
+    // clones and the GitHub Action/App can show intent metadata without any
+    // private data. In `none` mode the summary stays empty — nothing derived
+    // from the prompt may persist anywhere.
+    const publicView: UnsignedPublicIntentView = {
+      schemaVersion: 1,
+      id,
+      summary: mode === "none" ? "" : buildPublicSummary(safePrompt),
+      model: opts.model,
+      agent: { type: author.type, identifier: author.identifier },
+      verification: opts.verifyCmd,
+      files: deltas
+        .slice(0, PUBLIC_FILES_MAX)
+        .map((d) => ({ path: d.filePath, mutationType: d.type, summary: d.summary || undefined })),
+      commit: gitSha,
+      timestamp,
+    };
+    this.publicStore.write(publicView, this.privateKeyPem);
 
     return { gitSha, intentId: id, astDelta: deltas, redactions: redactionResult.count };
   }
 
   // -------------------------------------------------------------------- log
   log(filters: { author?: string; model?: string; file?: string; limit?: number } = {}): LogEntry[] {
-    return this.store.listIntents(filters).map((e) => ({
-      ...e,
-      prompt: this.decryptText(e.prompt, e.id),
-    }));
+    if (this.store) {
+      return this.store.listIntents(filters).map((e) => {
+        const prompt = this.decryptText(e.prompt, e.id);
+        return { ...e, prompt, summary: this.summaryFor(e.id, prompt) };
+      });
+    }
+    // Public-only (fresh clone): serve the committed public manifests.
+    let views = this.publicStore.list();
+    if (filters.author) {
+      views = views.filter((v) => v.agent?.identifier === filters.author);
+    }
+    if (filters.model) {
+      views = views.filter((v) => v.model === filters.model);
+    }
+    if (filters.file) {
+      views = views.filter((v) =>
+        (v.files ?? []).some((f) => f.path === filters.file || f.path.startsWith(`${filters.file}/`)),
+      );
+    }
+    const limit = filters.limit !== undefined ? safeClamp(filters.limit, 100) : 100;
+    return views.slice(0, limit).map(publicViewToLogEntry);
+  }
+
+  /** Safe public summary for an intent: manifest first, then derived. */
+  summaryFor(id: string, localPrompt: string): string {
+    const view = this.publicStore.getById(id);
+    if (view) return view.summary;
+    // Pre-ADR-009 local intent with no manifest yet — derive a safe summary
+    // from the (already redacted) stored prompt.
+    return localPrompt ? buildPublicSummary(sanitizePublicText(localPrompt)) : "";
   }
 
   // ------------------------------------------------------------------ blame
@@ -533,7 +625,7 @@ export class Drift {
           fallback = s;
           fallbackLine = ln;
         }
-        if (this.store.findByGitSha(s)) {
+        if (this.store?.findByGitSha(s) || this.publicStore.findByCommit(s)) {
           chosen = s;
           line = ln;
           break;
@@ -553,10 +645,18 @@ export class Drift {
       }
     }
     const committed = sha !== "0000000000000000000000000000000000000000";
-    let intent: (IntentRecord & { signatureValid: boolean }) | null = null;
+    let intent: (IntentRecord & { signatureValid: boolean; summary: string }) | null = null;
     if (committed) {
-      const record = this.store.findByGitSha(sha);
-      if (record) {
+      let record: IntentRecord | null = this.store?.findByGitSha(sha) ?? null;
+      let signatureValid = false;
+      if (!record) {
+        // Fresh clone (no private DB): resolve via the committed manifest.
+        const view = this.publicStore.findByCommit(sha);
+        if (view) {
+          record = publicViewToIntentRecord(view);
+          signatureValid = this.publicStore.verifySignature(view);
+        }
+      } else if (this.store) {
         const obj = this.store.readObjectRecord(record.objectPath);
         const canonical = obj
           ? canonicalJson({
@@ -571,10 +671,15 @@ export class Drift {
             })
           : "";
         const signature = (obj?.signature as string | undefined) ?? record.signature;
+        signatureValid = signature ? verifyPayload(canonical, this.publicKeyPem, signature) : false;
+      }
+      if (record) {
+        const prompt = this.decryptText(record.prompt, record.id);
         intent = {
           ...record,
-          prompt: this.decryptText(record.prompt, record.id),
-          signatureValid: signature ? verifyPayload(canonical, this.publicKeyPem, signature) : false,
+          prompt,
+          summary: this.summaryFor(record.id, prompt),
+          signatureValid,
         };
       }
     }
@@ -599,22 +704,31 @@ export class Drift {
     if (!isInsideRepo(this.repoRoot, file)) {
       throw new DriftError(`Path escapes the repository root: ${filePath}`);
     }
-    return this.store.contextForFile(relative, limit).map((e) => ({
-      ...e,
-      prompt: this.decryptText(e.prompt, e.id),
-    }));
+    if (this.store) {
+      return this.store.contextForFile(relative, limit).map((e) => {
+        const prompt = this.decryptText(e.prompt, e.id);
+        return { ...e, prompt, summary: this.summaryFor(e.id, prompt) };
+      });
+    }
+    return this.publicStore
+      .list()
+      .filter((v) => (v.files ?? []).some((f) => f.path === relative))
+      .slice(0, safeClamp(limit, 5))
+      .map(publicViewToLogEntry);
   }
 
   // ---------------------------------------------------------------- verify
   verify(intentId: string): VerifyResult {
-    const intent = this.store.getById(intentId);
-    if (!intent) throw new DriftError(`Intent not found: ${intentId}`);
-    if (!intent.verifyCmd) {
+    const record = this.store ? this.store.getById(intentId) : null;
+    const view = record ? null : this.publicStore.getById(intentId);
+    if (!record && !view) throw new DriftError(`Intent not found: ${intentId}`);
+    const verifyCmd = record?.verifyCmd ?? view?.verification ?? null;
+    if (!verifyCmd) {
       return { intentId, verifyCmd: null, status: "no-command", exitCode: null, stdout: "", stderr: "" };
     }
     // NOTE: verifyCmd executes with the user's shell. Only run `drift verify`
     // on intents you trust (local or from a trusted upstream).
-    const res = spawnSync(intent.verifyCmd, {
+    const res = spawnSync(verifyCmd, {
       cwd: this.repoRoot,
       shell: true,
       encoding: "utf8",
@@ -623,7 +737,7 @@ export class Drift {
     });
     return {
       intentId,
-      verifyCmd: intent.verifyCmd,
+      verifyCmd,
       status: res.status === 0 ? "pass" : "fail",
       exitCode: res.status,
       stdout: (res.stdout ?? "").toString(),
@@ -633,7 +747,8 @@ export class Drift {
 
   // ---------------------------------------------------------------- replay
   replay(intentId: string, opts: { checkout?: boolean } = {}): ReplayResult {
-    const intent = this.store.getById(intentId);
+    const store = this.requireStore("drift replay");
+    const intent = store.getById(intentId);
     if (!intent) throw new DriftError(`Intent not found: ${intentId}`);
     if (opts.checkout) {
       checkout(this.repoRoot, intent.gitCommitSha);
@@ -669,6 +784,63 @@ export class Drift {
     const checks: DoctorCheck[] = [];
     const orphanIds: string[] = [];
     const fixed: string[] = [];
+
+    // --- ADR-009 storage-safety checks (always run) -----------------------
+    const untracked = this.untrackPrivateDriftFiles();
+    checks.push({
+      name: "gitignore-private",
+      ok: untracked.length === 0,
+      detail: untracked.length
+        ? `not ignored: ${untracked.join(", ")} — run \`drift init\` to merge the ADR-009 ignore rules into .drift/.gitignore`
+        : "drift.db, objects/, keys/ and private/ are gitignored",
+    });
+
+    const tracked = this.trackedPrivateDriftFiles();
+    const untrackCmd = tracked.length
+      ? `git rm --cached ${tracked.map(quotePath).join(" ")}`
+      : "";
+    checks.push({
+      name: "tracked-private",
+      ok: tracked.length === 0,
+      detail: tracked.length
+        ? `private Drift data is TRACKED: ${tracked.join(", ")}.\n  Fix: ${untrackCmd}\n  then commit. NOTE: this only untracks the current files — they remain in old commits' history.`
+        : "no private Drift data is tracked by git",
+    });
+
+    const legacy = this.trackedPromptBearingObjects();
+    checks.push({
+      name: "legacy-objects",
+      ok: legacy.length === 0,
+      detail: legacy.length
+        ? `tracked prompt-bearing objects found: ${legacy.join(", ")}.\n  Fix: ${`git rm --cached ${legacy.map(quotePath).join(" ")}`}\n  NOTE: this does not remove them from old git history.`
+        : "no tracked prompt-bearing objects",
+    });
+
+    // --- public manifest integrity ---------------------------------------
+    const views = this.publicStore.list();
+    const badSigs = views.filter((v) => !this.publicStore.verifySignature(v));
+    checks.push({
+      name: "public-manifests",
+      ok: badSigs.length === 0,
+      detail: badSigs.length
+        ? `${views.length} manifest(s) with invalid signatures: ${badSigs.map((v) => v.id).join(", ")}`
+        : `${views.length} public manifest(s), all signatures valid`,
+    });
+
+    if (!this.store) {
+      checks.push({
+        name: "sqlite-store",
+        ok: true,
+        detail: "read-only clone: no private database present; serving from public manifests",
+      });
+      const ws = execGit(this.repoRoot, ["status", "--porcelain", "--", ".", ":(exclude).drift"], true);
+      checks.push({
+        name: "worktree",
+        ok: true,
+        detail: ws.stdout.trim() ? "uncommitted change(s) present" : "clean",
+      });
+      return { checks, orphanIds, fixed };
+    }
 
     const integrity = this.store.integrityCheck();
     checks.push({ name: "sqlite-integrity", ok: integrity === "ok", detail: integrity });
@@ -716,20 +888,21 @@ export class Drift {
       }
     }
 
-    // commits with Drift-Intent trailer but no stored row
+    // commits with Drift-Intent trailer but no stored row / manifest
     const trailerOnly: string[] = [];
     for (const { sha, body } of gitLogMessages(this.repoRoot)) {
-      const m = /Drift-Intent:\s*(did_[0-9a-f]+)/.exec(body);
-      if (m) {
-        const id = m[1]!;
-        if (!this.store.getById(id)) trailerOnly.push(sha.slice(0, 8));
+      for (const id of extractDriftIntentIds(body)) {
+        if (!this.store.getById(id) && !this.publicStore.getById(id)) {
+          trailerOnly.push(sha.slice(0, 8));
+          break;
+        }
       }
     }
     checks.push({
       name: "trailer-backrefs",
       ok: trailerOnly.length === 0,
       detail: trailerOnly.length
-        ? `commits with missing intent rows: ${trailerOnly.join(", ")}`
+        ? `commits with unresolved Drift-Intent trailers: ${trailerOnly.join(", ")}`
         : "all Drift-Intent trailers resolve",
     });
 
@@ -744,41 +917,103 @@ export class Drift {
     return { checks, orphanIds, fixed };
   }
 
+  /** Private Drift paths that git does NOT ignore. */
+  private untrackPrivateDriftFiles(): string[] {
+    const candidates = [
+      ".drift/drift.db",
+      ".drift/objects",
+      ".drift/keys/ed25519.pem",
+      ".drift/private",
+    ];
+    return candidates.filter((p) => {
+      const res = execGit(this.repoRoot, ["check-ignore", "-q", "--", p], true);
+      return res.status !== 0;
+    });
+  }
+
+  /** Tracked files under .drift that are NOT in the public allow-list. */
+  private trackedPrivateDriftFiles(): string[] {
+    const res = execGit(this.repoRoot, ["ls-files", "--", ".drift"], true);
+    const allowed = (p: string) =>
+      p === ".drift/.gitignore" ||
+      p === ".drift/config.toml" ||
+      p.startsWith(".drift/public/");
+    return res.stdout
+      .split("\n")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0 && !allowed(p));
+  }
+
+  /** Tracked .drift JSON files whose content carries a `prompt` field. */
+  private trackedPromptBearingObjects(): string[] {
+    return this.trackedPrivateDriftFiles().filter((p) => {
+      if (!p.endsWith(".json")) return false;
+      const abs = resolve(this.repoRoot, p);
+      if (!existsSync(abs)) return false;
+      try {
+        return /\.json$/.test(p) && JSON.stringify(JSON.parse(readFileSync(abs, "utf8"))).includes("\"prompt\"");
+      } catch {
+        return false;
+      }
+    });
+  }
+
   // ---------------------------------------------------------------- export
   exportJson(): string {
-    const entries = this.store
-      .listIntents({})
-      .map((e) => ({
-        id: e.id,
-        gitSha: e.gitSha,
-        authorType: e.authorType,
-        authorId: e.authorId,
-        model: e.model,
-        prompt: this.decryptText(e.prompt, e.id),
-        timestamp: new Date(e.timestamp).toISOString(),
-        files: e.files,
-      }));
+    if (this.store) {
+      const entries = this.store
+        .listIntents({})
+        .map((e) => ({
+          id: e.id,
+          gitSha: e.gitSha,
+          authorType: e.authorType,
+          authorId: e.authorId,
+          model: e.model,
+          prompt: this.decryptText(e.prompt, e.id),
+          timestamp: new Date(e.timestamp).toISOString(),
+          files: e.files,
+        }));
+      return JSON.stringify({ schemaVersion: 1, exportedAt: new Date().toISOString(), intents: entries }, null, 2);
+    }
+    // Public-only clone: export the public views (no prompts).
+    const entries = this.publicStore.list().map((v) => ({
+      id: v.id,
+      gitSha: v.commit,
+      authorType: v.agent?.type ?? "HUMAN",
+      authorId: v.agent?.identifier ?? "unknown",
+      model: v.model ?? null,
+      summary: v.summary,
+      timestamp: new Date(v.timestamp).toISOString(),
+      files: (v.files ?? []).map((f) => ({ path: f.path, mutationType: f.mutationType, summary: f.summary ?? null })),
+    }));
     return JSON.stringify({ schemaVersion: 1, exportedAt: new Date().toISOString(), intents: entries }, null, 2);
   }
 
   verifyIntentSignature(intentId: string): { ok: boolean; detail: string } {
-    const intent = this.store.getById(intentId);
-    if (!intent) return { ok: false, detail: "not found" };
-    const obj = this.store.readObjectRecord(intent.objectPath);
-    if (!obj?.signature) return { ok: false, detail: "object or signature missing" };
-    const canonical = obj
-      ? canonicalJson({
-          id: obj.id,
-          parentId: obj.parentId,
-          author: obj.author,
-          prompt: obj.prompt,
-          astDelta: obj.astDelta,
-          agentState: obj.agentState,
-          verifyCmd: obj.verifyCmd,
-          timestamp: obj.timestamp,
-        })
-      : "";
-    const valid = verifyPayload(canonical, this.publicKeyPem, obj.signature as string);
+    if (this.store) {
+      const intent = this.store.getById(intentId);
+      if (!intent) return { ok: false, detail: "not found" };
+      const obj = this.store.readObjectRecord(intent.objectPath);
+      if (!obj?.signature) return { ok: false, detail: "object or signature missing" };
+      const canonical = obj
+        ? canonicalJson({
+            id: obj.id,
+            parentId: obj.parentId,
+            author: obj.author,
+            prompt: obj.prompt,
+            astDelta: obj.astDelta,
+            agentState: obj.agentState,
+            verifyCmd: obj.verifyCmd,
+            timestamp: obj.timestamp,
+          })
+        : "";
+      const valid = verifyPayload(canonical, this.publicKeyPem, obj.signature as string);
+      return { ok: valid, detail: valid ? "valid" : "invalid" };
+    }
+    // Public-only clone: verify the committed manifest signature.
+    const view = this.publicStore.getById(intentId);
+    if (!view) return { ok: false, detail: "not found" };
+    const valid = this.publicStore.verifySignature(view);
     return { ok: valid, detail: valid ? "valid" : "invalid" };
   }
 }
@@ -821,6 +1056,92 @@ function buildCommitMessage(
 
 function publicKeyFromPrivate(privateKeyPem: string): string {
   return createPublicKey(privateKeyPem).export({ type: "spki", format: "pem" }).toString();
+}
+
+/**
+ * ADR-009 ignore rules. Order matters: `*` first, then the negations, so
+ * `git add .` inside `.drift/` can only ever stage the public allow-list.
+ * Verified with `git check-ignore` / `git add -A` in the storage tests.
+ */
+const DRIFT_GITIGNORE_RULES = [
+  "# Drift private state — never commit",
+  "*",
+  "!.gitignore",
+  "!config.toml",
+  "!public/",
+  "!public/**",
+];
+
+/**
+ * Ensure `.drift/.gitignore` contains the ADR-009 rules. Idempotent and
+ * non-destructive: existing lines are kept, missing rules are appended as a
+ * block (the negation order within the block is preserved).
+ */
+export function ensureDriftGitignore(driftDir: string): void {
+  const path = join(driftDir, ".gitignore");
+  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const existingLines = new Set(existing.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0));
+  const missing = DRIFT_GITIGNORE_RULES.filter((l) => !existingLines.has(l));
+  if (missing.length === 0) return; // idempotent: nothing to do
+  const block = `${existing.trim() ? "\n" : ""}${DRIFT_GITIGNORE_RULES.join("\n")}\n`;
+  writeFileSync(path, existing.replace(/[\r\n]+$/, "") + block);
+}
+
+/** Map a public manifest to the shared LogEntry shape (no prompt). */
+function publicViewToLogEntry(v: PublicIntentView): LogEntry {
+  return {
+    id: v.id,
+    gitSha: v.commit,
+    authorType: v.agent?.type ?? "HUMAN",
+    authorId: v.agent?.identifier ?? "unknown",
+    model: v.model ?? null,
+    prompt: "",
+    summary: v.summary,
+    timestamp: v.timestamp,
+    files: (v.files ?? []).map((f) => ({
+      path: f.path,
+      mutationType: f.mutationType as MutationType,
+      summary: f.summary ?? null,
+    })),
+  };
+}
+
+/** Map a public manifest to an IntentRecord-shaped object (private fields empty). */
+function publicViewToIntentRecord(v: PublicIntentView): IntentRecord {
+  return {
+    id: v.id,
+    parentId: null,
+    gitCommitSha: v.commit,
+    author: {
+      type: v.agent?.type ?? "HUMAN",
+      identifier: v.agent?.identifier ?? "unknown",
+      model: v.model ?? undefined,
+    },
+    prompt: "",
+    astDelta: (v.files ?? []).map((f) => ({
+      filePath: f.path,
+      type: f.mutationType as MutationType,
+      nodeIds: [],
+      summary: f.summary ?? "",
+    })),
+    agentState: undefined,
+    verifyCmd: v.verification,
+    timestamp: v.timestamp,
+    objectPath: "",
+    signature: v.signature,
+  };
+}
+
+/** Clamp a user-supplied limit to a safe positive integer (mirrors store.safeLimit). */
+function safeClamp(n: number | undefined, fallback: number): number {
+  if (n === undefined) return fallback;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.floor(n));
+}
+
+/** Quote a path for shell display in doctor instructions. */
+function quotePath(p: string): string {
+  return /[^A-Za-z0-9_./-]/.test(p) ? `'${p.replace(/'/g, "'\\''")}'` : p;
 }
 
 /**

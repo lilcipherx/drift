@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "did_07bff1ee3e9d31b296105084ba33acb0",
+  "summary": "Add TokenPayload interface for JWT validation",
+  "model": "claude-3-5-sonnet",
+  "agent": {
+    "type": "AGENT",
+    "identifier": "Drift Demo"
+  },
+  "verification": "npm test",
+  "files": [
+    {
+      "path": "src/auth.ts",
+      "mutationType": "MOVED",
+      "summary": "function \"verifyToken\" moved from line 1 to 6"
+    }
+  ],
+  "commit": "1223750ae6959419a65db518ddd672251bb7a375",
+  "timestamp": 1786844457595,
+  "signature": "Z1IGQ9TeVnUMvMjP1sffvrK+Iama4GsE+lSOkatUITTJdXEqWkAskJEzzlalFY0VvT55msfMYlenIRnsHKesAw=="
+}

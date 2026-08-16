@@ -1,4 +1,4 @@
-export { Drift } from "./engine.js";
+export { Drift, ensureDriftGitignore } from "./engine.js";
 export type {
   BlameResult,
   DoctorCheck,
@@ -9,6 +9,21 @@ export type {
   ReplayResult,
   VerifyResult,
 } from "./engine.js";
+export {
+  PublicStore,
+  buildPublicSummary,
+  sanitizePublicText,
+  PUBLIC_FILES_MAX,
+  PUBLIC_SUMMARY_MAX,
+} from "./public.js";
+export type {
+  PublicAgent,
+  PublicIntentFile,
+  PublicIntentView,
+  UnsignedPublicIntentView,
+} from "./public.js";
+export { DRIFT_INTENT_ID_RE, extractDriftIntentIds, parseGitTrailers } from "./trailers.js";
+export type { GitTrailer } from "./trailers.js";
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export type { ExitCode } from "./errors.js";
 export {
