@@ -210,7 +210,7 @@ test("drift_context hydrates reasoning for a file", async () => {
   assert.ok(data.intents.length >= 1);
 });
 
-test("drift_verify runs recorded verification", async () => {
+test("drift_verify is informational by default and executes only with run:true", async () => {
   // record an intent with a verification command
   writeFileSync(join(repo, "src", "util.ts"), "export const n = 1;\nexport const answer = 42;\nexport const q = 7;\n");
   const realize = await client.request("tools/call", {
@@ -218,11 +218,19 @@ test("drift_verify runs recorded verification", async () => {
     arguments: { prompt: "add q", verifyCmd: 'node -e "process.exit(0)"' },
   });
   const realizeData = JSON.parse(realize.content[0].text);
+  // default: informational — never executes repository-provided code
   const verify = await client.request("tools/call", {
     name: "drift_verify",
     arguments: { intentId: realizeData.intentId },
   });
   const verifyData = JSON.parse(verify.content[0].text);
   assert.equal(verifyData.status, "ok");
-  assert.equal(verifyData.verifyStatus, "pass");
+  assert.equal(verifyData.verifyStatus, "not-executed");
+  assert.equal(verifyData.signature, "valid");
+  // explicit run:true executes (validly signed manifest)
+  const verifyRun = await client.request("tools/call", {
+    name: "drift_verify",
+    arguments: { intentId: realizeData.intentId, run: true },
+  });
+  assert.equal(JSON.parse(verifyRun.content[0].text).verifyStatus, "pass");
 });

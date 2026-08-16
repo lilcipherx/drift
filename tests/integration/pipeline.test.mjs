@@ -133,11 +133,15 @@ export function refreshToken(expired: string): string {
   assert.equal(baselineOut.status, "ok");
   assert.equal(baselineOut.baseline, true);
 
-  // 5. verify
+  // 5. verify — INFORMATION by default (never executes repository code);
+  // execution requires an explicit --run and a validly signed manifest.
   const verify = run(repo, ["verify", realizeOut.intentId, "--json"]);
   assert.equal(verify.status, 0, verify.stderr);
   assert.equal(parseJson(verify.stdout).status, "ok");
-  assert.equal(parseJson(verify.stdout).verifyStatus, "pass");
+  assert.equal(parseJson(verify.stdout).verifyStatus, "not-executed");
+  assert.equal(parseJson(verify.stdout).signature, "valid");
+  const verifyRun = run(repo, ["verify", realizeOut.intentId, "--run", "--json"]);
+  assert.equal(parseJson(verifyRun.stdout).verifyStatus, "pass");
 
   // 6. context
   const ctx = run(repo, ["context", "src/auth.ts", "--json"]);
@@ -598,7 +602,7 @@ test("prompt modes: default commit-summary keeps the full prompt out of git hist
   const logSafe = parseJson(run(repo, ["log", "--json"]).stdout);
   assert.equal(logSafe.intents[0].summary, "Fix race condition in token refresh");
   assert.ok(!("prompt" in logSafe.intents[0]));
-  // and the committed public manifest carries only the first line
+  // and the committed public manifest carries the explicit public summary
   const manifestDir = join(repo, ".drift", "public", "intents");
   const manifestFiles = readdirSync(manifestDir).filter((f) => f.endsWith(".json"));
   assert.equal(manifestFiles.length, 1);

@@ -158,8 +158,8 @@ test("one-line prompt + explicit public summary: the raw prompt never enters git
   writeFileSync(join(repo, "src", "a.ts"), `export const a = ${Date.now()};\n`);
   const res = run(repo, ["realize", "-p", prompt, "--summary", summary, "--json"]);
   assert.equal(res.status, 0, res.stderr);
-  git(repo, ["add", "-A"]);
-  git(repo, ["commit", "-m", "intent"]);
+  // NO manual second commit: realize must commit source + public manifest
+  // atomically (the regression this pass fixed).
 
   // the safe public summary IS public — present in history, log and manifest
   const messages = git(repo, ["log", "--all", "--format=%B"]);
@@ -208,8 +208,7 @@ test("one-line prompt without a summary: generic non-prompt fallback, marker abs
   writeFileSync(join(repo, "src", "a.ts"), `export const a = ${Date.now()};\n`);
   const res = run(repo, ["realize", "-p", prompt, "--json"]);
   assert.equal(res.status, 0, res.stderr);
-  git(repo, ["add", "-A"]);
-  git(repo, ["commit", "-m", "intent"]);
+  // NO manual second commit — realize is atomic.
 
   // generic fallback derived only from non-prompt metadata
   const log = JSON.parse(run(repo, ["log", "--json"]).stdout);
@@ -240,8 +239,7 @@ test("secret marker is absent everywhere under none mode", () => {
   writeFileSync(configPath, readFileSync(configPath, "utf8") + "\n[prompts]\nmode = \"none\"\n");
   const prompt = `secret ${MARKER_NONE} that must persist nowhere`;
   realizeWithMarker(repo, prompt);
-  git(repo, ["add", "-A"]);
-  git(repo, ["commit", "-m", "intent"]);
+  // NO manual second commit — realize is atomic.
 
   assert.ok(!git(repo, ["log", "--all", "-p"]).includes(MARKER_NONE));
   assert.ok(!git(repo, ["log", "--all", "--format=%B"]).includes(MARKER_NONE));
@@ -271,9 +269,8 @@ test("fresh clone serves log/blame from public manifests; an empty local store c
   writeFileSync(join(origin, "src", "a.ts"), `export const a = ${Date.now()};\n`);
   const realize = run(origin, ["realize", "-p", prompt, "--summary", summary, "--json"]);
   assert.equal(realize.status, 0, realize.stderr);
-  // commit the intent + public provenance (the private store stays untracked)
-  git(origin, ["add", "-A"]);
-  git(origin, ["commit", "-m", "intent commit"]);
+  // NO manual second commit: realize commits source + public manifest
+  // atomically (the regression this pass fixed).
 
   const bare = mkdtempSync(join(tmpdir(), "drift-bare-"));
   git(origin, ["clone", "--bare", "-q", ".", bare]);
@@ -301,7 +298,19 @@ test("fresh clone serves log/blame from public manifests; an empty local store c
   // missing private dirs/keys and leave public provenance untouched.
   const initClone = run(clone, ["init"]);
   assert.equal(initClone.status, 0, initClone.stderr);
-  assert.ok(existsSync(join(clone, ".drift", "keys", "ed25519.pem")), "init must create the signing key in a clone");
+  // Trust-root preservation (Blocker B): init in a clone must NOT generate a
+  // replacement key — it creates only the missing PRIVATE dirs/db and enters
+  // read-only signer mode. The committed public key is preserved byte-for-byte.
+  assert.ok(!existsSync(join(clone, ".drift", "keys", "ed25519.pem")), "clone init must NOT create a new signing key");
+  const keyBytes = readFileSync(join(clone, ".drift", "public", "key.pem"), "utf8").replace(/\r\n/g, "\n");
+  assert.equal(
+    keyBytes,
+    readFileSync(join(origin, ".drift", "public", "key.pem"), "utf8").replace(/\r\n/g, "\n"),
+    "public key must be preserved (modulo autocrlf line endings)",
+  );
+  const st = JSON.parse(run(clone, ["status", "--json"]).stdout);
+  assert.equal(st.signerState, "read-only", "clone enters read-only signer mode");
+  assert.equal(st.signingAllowed, false);
 
   // log still lists the committed public intent after init
   const log = JSON.parse(run(clone, ["log", "--json"]).stdout);
@@ -347,13 +356,12 @@ test("fresh clone serves log/blame from public manifests; an empty local store c
   const doctor = JSON.parse(run(clone, ["doctor", "--json"]).stdout);
   assert.equal(doctor.status, "ok");
 
-  // after init the signing key was regenerated (it never leaves the origin
-  // machine) — the OLD signature must NOT be reported valid against the new
-  // key. Truthful state: it no longer verifies. This is the documented
-  // key-rotation limitation of ADR-009.
+  // Blocker B guarantee: after init the committed public key is PRESERVED
+  // byte-for-byte, so the OLD signature still verifies against the unchanged
+  // trust root. No replacement key was generated in the clone.
   const sigAfter = JSON.parse(run(clone, ["verify-intent", log.intents[0].id, "--json"]).stdout);
-  assert.equal(sigAfter.ok, false, "a regenerated local key must never validate an old signature");
-  assert.equal(sigAfter.detail, "invalid", "old signature no longer verifies against the rotated key");
+  assert.equal(sigAfter.ok, true, "signature must remain valid after clone-init preserves the trust root");
+  assert.equal(sigAfter.state, "valid", sigAfter.detail);
 });
 
 // ------------------------------------------------------- legacy detection

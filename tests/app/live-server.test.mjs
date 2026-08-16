@@ -267,14 +267,15 @@ test("payload without installation.id: clean error, not retryable", async () => 
   assert.equal(state.checkRuns, checkRunsBefore);
 });
 
-// ------------------------------------------------------------- 3d) manifest missing → subject fallback
-test("intent manifest missing: falls back to the commit subject as summary", async () => {
+// -------------------------------------------- 3d) manifest missing → generic fallback (never the subject)
+test("intent manifest missing: generic non-prompt fallback, never the commit subject", async () => {
   const r = await sendWebhook("pull_request", basePayload("opened", HEAD3, 8));
   assert.equal(r.status, 200, JSON.stringify(r.data));
   assert.equal(r.data.action, "commented");
   assert.equal(r.data.intentsFound, 1);
   assert.equal(prComments[8].length, 1);
-  assert.ok(prComments[8][0].body.includes("fallback subject here"), prComments[8][0].body);
+  assert.ok(prComments[8][0].body.includes("public provenance manifest missing"), prComments[8][0].body);
+  assert.ok(!prComments[8][0].body.includes("fallback subject here"), "commit subject must never be rendered as a summary");
   assert.equal(state.posted, 2);
 });
 

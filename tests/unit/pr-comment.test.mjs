@@ -187,15 +187,19 @@ test("extractDriftIntentIds: dedupes, validates format, handles multiple trailer
 });
 
 // ------------------------------------------------------- intentsFromCommits
-test("intentsFromCommits: hydrates public manifests for PR commits only; missing manifest falls back to subject", () => {
+test("intentsFromCommits: hydrates public manifests for PR commits only; missing manifest → generic non-prompt fallback", () => {
   const repo = makeRepo();
   const manifests = {
     [ID_A]: { summary: "Public summary A", model: "m1", agent: { type: "AGENT", identifier: "bot" }, files: [{ path: "src/a.ts", mutationType: "MODIFIED", summary: null }], verification: "npm test" },
-    // ID_B has NO manifest → subject fallback
+    // ID_B has NO manifest → generic fallback, NEVER the commit subject
+    // (a legacy `full`-mode subject may contain the whole private prompt)
   };
   const intents = intentsFromCommits({
     repoRoot: repo,
-    commits: [commit(repo, `feat A\n\nDrift-Intent: ${ID_A}`), commit(repo, `feat B\n\nDrift-Intent: ${ID_B}\nDrift-Intent: ${ID_B}`)],
+    commits: [
+      commit(repo, `feat A\n\nDrift-Intent: ${ID_A}`),
+      commit(repo, `DRIFT_LEGACY_SUBJECT_SECRET_b8e4\n\nDrift-Intent: ${ID_B}\nDrift-Intent: ${ID_B}`),
+    ],
     readManifestImpl: (root, id) => manifests[id] ?? null,
   });
   assert.equal(intents.length, 2);
@@ -203,7 +207,9 @@ test("intentsFromCommits: hydrates public manifests for PR commits only; missing
   assert.equal(intents[0].summary, "Public summary A");
   assert.equal(intents[0].verification, "npm test");
   assert.equal(intents[1].id, ID_B);
-  assert.equal(intents[1].summary, "feat B", "missing manifest must degrade to the commit subject");
+  assert.equal(intents[1].summary, `Drift intent ${ID_B}`, "missing manifest must degrade to the generic fallback");
+  assert.equal(intents[1].missingManifest, true);
+  assert.ok(!JSON.stringify(intents).includes("DRIFT_LEGACY_SUBJECT_SECRET_b8e4"), "commit subject must never leak");
   assert.equal(intents[1].files.length, 0);
 });
 
@@ -313,4 +319,65 @@ test("upsertComment: non-ok and malformed responses throw clear errors", async (
     }),
     /malformed API response/,
   );
+});
+
+// ------------------------------------------- trust-root verification (ADR-009)
+import { generateKeyPairSync, sign as nodeSign } from "node:crypto";
+import {
+  canonicalJson,
+  getFileAt,
+  verifyManifestSignature,
+  signatureStateFor,
+} from "../../scripts/pr-comment.mjs";
+
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+const KEY = publicKey.export({ type: "spki", format: "pem" }).toString();
+const OTHER_KEY = generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString();
+
+function signed(body) {
+  const { signature: _sig, ...unsigned } = body;
+  const signature = nodeSign(null, Buffer.from(canonicalJson(unsigned), "utf8"), privateKey).toString("base64");
+  return { ...unsigned, signature };
+}
+
+test("verifyManifestSignature: valid for the signing key, false for wrong/missing keys", () => {
+  const manifest = signed({ id: ID_A, summary: "s", timestamp: 1 });
+  assert.equal(verifyManifestSignature(manifest, KEY), true);
+  assert.equal(verifyManifestSignature(manifest, OTHER_KEY), false);
+  assert.equal(verifyManifestSignature({ id: ID_A, summary: "s" }, KEY), false, "unsigned");
+  assert.equal(verifyManifestSignature(manifest, "not a key"), false);
+});
+
+test("signatureStateFor: valid against base, untrusted-key when only the head key signs", () => {
+  const manifest = signed({ id: ID_A, summary: "s", timestamp: 1 });
+  // valid: verifies against the BASE-branch trust root
+  assert.equal(signatureStateFor(manifest, { baseKey: KEY, headKey: KEY }), "valid");
+  // the PR REPLACED the key: manifest only verifies against the new (head) key
+  assert.equal(signatureStateFor(manifest, { baseKey: OTHER_KEY, headKey: KEY }), "untrusted-key");
+  // invalid: no key verifies
+  assert.equal(signatureStateFor(manifest, { baseKey: OTHER_KEY, headKey: OTHER_KEY }), "invalid");
+  // bootstrap: base has no Drift key, head key verifies
+  assert.equal(signatureStateFor(manifest, { baseKey: null, headKey: KEY }), "bootstrap");
+  // unsigned / missing / unverifiable
+  assert.equal(signatureStateFor({ id: ID_A, summary: "s" }, { baseKey: KEY, headKey: KEY }), "unsigned");
+  assert.equal(signatureStateFor(null, { baseKey: KEY, headKey: KEY }), "missing");
+  assert.equal(signatureStateFor(signed({ id: ID_A, summary: "s", timestamp: 1 }), { baseKey: null, headKey: null }), "unverifiable");
+});
+
+test("getFileAt: reads a file at a git ref, null when absent", () => {
+  const repo = makeRepo();
+  const sha = commit(repo, "add file");
+  assert.ok((getFileAt(repo, sha, "src/a.ts") ?? "").includes("export const"), "file content at ref");
+  assert.equal(getFileAt(repo, sha, "does-not-exist.ts"), null);
+  assert.equal(getFileAt(repo, "f".repeat(40), "src/a.ts"), null);
+});
+
+test("buildSummary: key-rotation and missing-manifest states are rendered, never the prompt", () => {
+  const body = buildSummary([
+    { id: ID_A, summary: `Drift intent ${ID_A}`, missingManifest: true, signatureState: "missing", files: [] },
+    { id: ID_B, summary: "real summary", missingManifest: false, signatureState: "untrusted-key", files: [] },
+  ]);
+  assert.ok(body.includes("manifest missing"), body);
+  assert.ok(body.includes("signed with a different key"), body);
+  assert.ok(!body.includes("intent.prompt"));
 });

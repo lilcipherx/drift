@@ -345,11 +345,15 @@ test("handler: transient 5xx / network errors are retryable", async () => {
   assert.equal(result2.retryable, true);
 });
 
-test("fetchIntents: falls back to commit subject when the public manifest is missing", async () => {
-  const commits = [{ sha: "s", message: `Fallback subject here\n\nDrift-Intent: ${INTENT_ID}` }];
+test("fetchIntents: missing manifest uses a generic non-prompt fallback (never the commit subject)", async () => {
+  // A legacy `full`-mode commit subject may contain a complete private prompt
+  // (e.g. DRIFT_LEGACY_SUBJECT_SECRET_b8e4) — it must NEVER be rendered.
+  const commits = [{ sha: "s", message: `DRIFT_LEGACY_SUBJECT_SECRET_b8e4\n\nDrift-Intent: ${INTENT_ID}` }];
   const github = new FakeGitHub(commits, {}); // no manifests at all
   const views = await fetchIntents(github, "lilcipherx", "drift", "s", commits, [INTENT_ID]);
-  assert.equal(views[0].summary, "Fallback subject here");
+  assert.equal(views[0].summary, `Drift intent ${INTENT_ID}`);
+  assert.equal(views[0].missingManifest, true);
+  assert.ok(!JSON.stringify(views).includes("DRIFT_LEGACY_SUBJECT_SECRET_b8e4"));
   assert.equal(views[0].files.length, 0);
   assert.equal(views[0].signature, false);
 });
@@ -367,7 +371,7 @@ test("fetchIntents: never loads or returns a prompt from a legacy object", async
   });
   const views = await fetchIntents(github, "lilcipherx", "drift", "s", commits, [INTENT_ID]);
   assert.ok(!JSON.stringify(views).includes("DRIFT_PRIVATE_SECRET_7f2c91"));
-  assert.equal(views[0].summary, "Subject", "falls back to the commit subject, not the object prompt");
+  assert.equal(views[0].summary, `Drift intent ${INTENT_ID}`, "generic fallback, never the commit subject or object prompt");
 });
 
 // ------------------------------------------------------------ server smoke
