@@ -12,7 +12,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { GitHubAppClient } from "./github.js";
 import { handleWebhook, type WebhookEvent } from "./handler.js";
-import { createWebhookServer } from "./server.js";
+import { assertWebhookAuthConfigured, createWebhookServer } from "./server.js";
 
 const USAGE = `Drift GitHub App
 
@@ -66,12 +66,13 @@ async function runDev(payloadPath: string, dryRun: boolean): Promise<void> {
 }
 
 async function runStart(): Promise<void> {
-  // A public webhook endpoint with HMAC verification disabled lets anyone
-  // forge pull_request events — require the secret in server mode (dev mode
-  // stays permissive because it processes a local file).
-  if (!process.env.GITHUB_WEBHOOK_SECRET) {
-    throw new Error("GITHUB_WEBHOOK_SECRET is required for drift-app start");
-  }
+  // Fail closed: a public webhook endpoint without HMAC verification lets
+  // anyone forge pull_request events. The only escape hatch is an explicit
+  // DRIFT_APP_INSECURE_DEV_MODE=true (loudly warned, local development only).
+  const { webhookSecret, insecureDevMode } = assertWebhookAuthConfigured(
+    process.env.GITHUB_WEBHOOK_SECRET,
+    process.env.DRIFT_APP_INSECURE_DEV_MODE,
+  );
   const github = new GitHubAppClient({
     appId: process.env.GITHUB_APP_ID ?? "",
     privateKeyPem: loadPrivateKey(),
@@ -83,7 +84,8 @@ async function runStart(): Promise<void> {
   }
   const { close, port: actualPort } = await createWebhookServer({
     github,
-    webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
+    webhookSecret,
+    insecureDevMode,
     port,
     log: (line) => console.log(line),
   });

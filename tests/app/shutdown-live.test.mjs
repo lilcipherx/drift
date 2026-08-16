@@ -150,6 +150,10 @@ describe("close() in-flight and force-grace semantics", () => {
           res.writeHead(200, { "Content-Type": "application/json" });
           return res.end(JSON.stringify({ head: { sha: HEAD }, title: "feat: add login" }));
         }
+        if (req.method === "GET" && path.match(/\/pulls\/\d+\/files$/)) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify([]));
+        }
         // the hook under test: slow (ms) or never-finishing commits listing
         if (req.method === "GET" && path.match(/\/pulls\/\d+\/commits$/)) {
           if (mockCfg.commitsDelay === "never") return; // never respond

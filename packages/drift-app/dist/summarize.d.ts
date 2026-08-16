@@ -4,12 +4,8 @@
  * and must never appear in a PR comment or check-run summary.
  */
 import type { IntentView } from "./intents.js";
-/**
- * Invisible marker embedded in every Drift summary comment. The webhook
- * handler uses it to find an existing comment and update it in place, so
- * comments never accumulate across `synchronize` deliveries.
- */
-export declare const SUMMARY_MARKER = "<!-- drift:summary -->";
+import { SUMMARY_MARKER, type ProvenanceAudit } from "./trust.js";
+export { SUMMARY_MARKER };
 export interface SummaryInput {
     owner: string;
     repo: string;
@@ -17,6 +13,10 @@ export interface SummaryInput {
     prTitle: string;
     intents: IntentView[];
     repoUrl?: string;
+    /** Trust-root warning is prepended when the PR modifies key.pem. */
+    keyChange?: "replaced" | "removed";
+    /** Public-provenance integrity violations (append-only rules). */
+    audit?: ProvenanceAudit;
 }
 export declare function summarizeIntents(input: SummaryInput): string;
 //# sourceMappingURL=summarize.d.ts.map

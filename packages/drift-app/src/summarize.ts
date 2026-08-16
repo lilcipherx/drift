@@ -6,13 +6,10 @@
 
 import { sanitizePublicText } from "@drift/core";
 import type { IntentView } from "./intents.js";
+import { SUMMARY_MARKER, TRUST_ROOT_WARNING, type ProvenanceAudit } from "./trust.js";
 
-/**
- * Invisible marker embedded in every Drift summary comment. The webhook
- * handler uses it to find an existing comment and update it in place, so
- * comments never accumulate across `synchronize` deliveries.
- */
-export const SUMMARY_MARKER = "<!-- drift:summary -->";
+export { SUMMARY_MARKER };
+
 
 export interface SummaryInput {
   owner: string;
@@ -21,6 +18,10 @@ export interface SummaryInput {
   prTitle: string;
   intents: IntentView[];
   repoUrl?: string;
+  /** Trust-root warning is prepended when the PR modifies key.pem. */
+  keyChange?: "replaced" | "removed";
+  /** Public-provenance integrity violations (append-only rules). */
+  audit?: ProvenanceAudit;
 }
 
 /** Hard caps so a pathological PR can never produce a huge comment. */
@@ -43,6 +44,7 @@ const SIGNATURE_LABELS: Record<string, string> = {
   unverifiable: "⚠ unverifiable (no verification key)",
   "untrusted-key": "⚠ unverified — signed with a different key than the base branch",
   bootstrap: "unverified bootstrap (base branch has no Drift key yet)",
+  malformed: "⚠ malformed public manifest — not verified",
   missing: "⚠ public provenance manifest missing",
 };
 
@@ -52,6 +54,16 @@ export function summarizeIntents(input: SummaryInput): string {
   const lines: string[] = [];
 
   lines.push(SUMMARY_MARKER);
+  if (input.keyChange === "replaced" || input.keyChange === "removed") {
+    lines.push(TRUST_ROOT_WARNING);
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  }
+  const audit = input.audit;
+  const integrityBroken =
+    audit &&
+    (audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0);
   lines.push("## Drift — Why this changed");
   lines.push("");
   lines.push(`${intents.length} intent${intents.length === 1 ? "" : "s"} on this PR · ${input.prTitle ? safe(input.prTitle, 80) : ""}`);
@@ -62,11 +74,15 @@ export function summarizeIntents(input: SummaryInput): string {
     lines.push("");
     if (intent.missingManifest) {
       lines.push("_(public provenance manifest missing — summary is a generic fallback)_");
+    } else if (intent.malformedManifest) {
+      lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+      lines.push("");
+      lines.push(`_⚠ malformed public manifest — not verified${intent.manifestError ? ` (${safe(intent.manifestError, META_LIMIT)})` : ""}_`);
     } else {
       lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
     }
     const trust = SIGNATURE_LABELS[intent.signatureState];
-    if (trust) {
+    if (trust && !intent.malformedManifest) {
       lines.push("");
       lines.push(`_${trust}_`);
     }
@@ -109,6 +125,21 @@ export function summarizeIntents(input: SummaryInput): string {
   if (truncated) {
     lines.push("");
     lines.push(`_… and ${input.intents.length - MAX_INTENTS} more intent(s) not shown._`);
+  }
+
+  if (integrityBroken && audit) {
+    lines.push("");
+    lines.push("## ⚠ Public provenance integrity violations");
+    lines.push("");
+    for (const v of audit.violations) {
+      lines.push(`- **${safe(v.code, 16)}** \`${safe(v.id, 40)}\` — ${safe(v.detail, 200)}`);
+    }
+    for (const id of audit.replayIds) {
+      lines.push(`- **replayed** \`${safe(id, 40)}\` — this intent's manifest already exists on the base branch`);
+    }
+    for (const id of audit.ambiguousIds) {
+      lines.push(`- **ambiguous** \`${safe(id, 40)}\` — the intent id is referenced by more than one commit on this PR`);
+    }
   }
 
   lines.push("");

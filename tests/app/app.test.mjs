@@ -23,7 +23,9 @@ const { extractIntentIds, fetchIntents } = await mod("intents.js");
 const { summarizeIntents, SUMMARY_MARKER } = await mod("summarize.js");
 const { verifyWebhookSignature, handleWebhook } = await mod("handler.js");
 const { createAppJwt, decodeJwt } = await mod("jwt.js");
-const { createWebhookServer } = await mod("server.js");
+const { createWebhookServer, assertWebhookAuthConfigured } = await mod("server.js");
+const { deriveProvenanceConclusion, evaluateKeyChange, isDriftOwnedComment } = await mod("trust.js");
+const { signatureStateFor, auditProvenanceIntegrity } = await mod("intents.js");
 
 // ------------------------------------------------------------- unit: trailers
 test("extractIntentIds: parses Drift-Intent trailers across commits, dedupes, ignores invalid ids", () => {
@@ -165,26 +167,56 @@ test("createAppJwt: RS256 header, iss/iat/exp claims, TTL capped at 600s", () =>
 });
 
 // ------------------------------------------------------- handler (fake GH)
+const APP_COMMENT = (id, body) => ({
+  id,
+  body,
+  user: { login: "drift-app[bot]", type: "Bot" },
+  performed_via_github_app: { id: 12345 },
+});
+
 class FakeGitHub {
   constructor(commits, manifests, existingComments = [], opts = {}) {
     this.commits = commits;
-    this.manifests = manifests; // path -> JSON string
+    this.manifests = manifests; // path -> JSON string (at HEAD)
+    // Base-branch manifests (default: empty — a fresh base, so every head
+    // manifest is a legitimate atomic addition).
+    this.baseManifests = opts.baseManifests ?? {};
+    // The key at the HEAD ref (default). `basePublicKeyPem` (when given)
+    // simulates a base-branch key that differs from the head — required for
+    // key-only PR / trust-root-change scenarios.
     this.publicKeyPem = opts.publicKeyPem ?? null;
-    // issue comments already on the PR (id ascending)
-    this.existing = existingComments.map((body, i) => ({ id: i + 1, body }));
+    this.basePublicKeyPem = opts.basePublicKeyPem ?? null;
+    // issue comments already on the PR (id ascending) — Drift comments are
+    // authored by the App (ownership-verified); plain strings stay user-ish.
+    this.existing = existingComments.map((body, i) =>
+      typeof body === "string" ? APP_COMMENT(i + 1, body) : body,
+    );
     this.nextId = this.existing.length + 1;
     this.calls = { comments: [], checks: [], updates: [] };
     this.installation = null;
+    this.pullFiles = opts.pullFiles ?? [];
   }
   setInstallation(id) { this.installation = id; }
   async getPullCommits() { return this.commits; }
-  async getFileContent(owner, repo, path) {
-    if (path === ".drift/public/key.pem") return this.publicKeyPem;
-    return this.manifests[path] ?? null;
+  async getPullFiles() { return this.pullFiles; }
+  isBaseRef(ref) { return ref === "base123" || ref === "base-sha"; }
+  async getFileContent(owner, repo, path, ref) {
+    const base = this.isBaseRef(ref);
+    if (path === ".drift/public/key.pem") {
+      return base ? this.basePublicKeyPem : this.publicKeyPem;
+    }
+    return (base ? this.baseManifests : this.manifests)[path] ?? null;
+  }
+  async listDirectory(owner, repo, path, ref) {
+    if (path !== ".drift/public/intents") return [];
+    const src = this.isBaseRef(ref) ? this.baseManifests : this.manifests;
+    return Object.keys(src)
+      .filter((p) => p.startsWith(".drift/public/intents/"))
+      .map((p) => p.split("/").pop());
   }
   async postComment(owner, repo, issueNumber, body) {
     this.calls.comments.push({ issueNumber, body });
-    this.existing.push({ id: this.nextId++, body });
+    this.existing.push(APP_COMMENT(this.nextId++, body));
   }
   async updateComment(owner, repo, commentId, body) {
     this.calls.updates.push({ commentId, body });
@@ -198,11 +230,15 @@ class FakeGitHub {
   }
 }
 
+/** Default deps for handler tests not exercising auth (explicit dev mode). */
+const DEV_DEPS = { insecureDevMode: true };
+const devDeps = (github, extra = {}) => ({ github, ...DEV_DEPS, ...extra });
+
 const PAYLOAD = {
   action: "opened",
   installation: { id: 77 },
   repository: { name: "drift", owner: { login: "lilcipherx" } },
-  pull_request: { number: 7, title: "Fix race", head: { sha: "abc123def" } },
+  pull_request: { number: 7, title: "Fix race", head: { sha: "abc123def" }, base: { sha: "base123" } },
 };
 
 function eventFor(payload, raw = JSON.stringify(payload)) {
@@ -214,13 +250,15 @@ const COMMITS = [{ sha: "abc123def", message: `Fix race condition in token refre
 function makeGitHub(opts = {}, manifestOverride = null) {
   return new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestOverride ?? manifestJson() }, [], {
     publicKeyPem: PUBLIC_KEY_PEM,
+    // default: same trust root on base and head (no trust-root change)
+    basePublicKeyPem: PUBLIC_KEY_PEM,
     ...opts,
   });
 }
 
 test("handler: readOnly (dev --dry-run) builds the summary without writing", async () => {
   const github = makeGitHub();
-  const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github, { readOnly: true }));
   assert.equal(result.action, "dry-run");
   assert.equal(result.intentsFound, 1);
   assert.ok(result.commentBody.includes("Drift — Why this changed"));
@@ -236,7 +274,7 @@ test("handler: readOnly (dev --dry-run) builds the summary without writing", asy
 
 test("handler: posts intent summary comment + check run, never the prompt", async () => {
   const github = makeGitHub();
-  const result = await handleWebhook(eventFor(PAYLOAD), { github, checkRun: true });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github, { checkRun: true }));
   assert.equal(result.action, "commented");
   assert.equal(result.intentsFound, 1);
   assert.equal(github.installation, 77);
@@ -255,7 +293,7 @@ test("handler: never renders the full prompt even when the manifest summary is a
   // manifest summary is safe by construction (first line, sanitized), but a
   // malicious summary still cannot break out or inject HTML/marker syntax
   const github = makeGitHub(null, manifestJson({ summary: `clean summary\n<!-- injected --> @everyone` }));
-  const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github, { readOnly: true }));
   assert.ok(result.commentBody.includes("clean summary"));
   assert.ok(!result.commentBody.includes("injected"), "injected HTML comment must be neutralized");
   assert.ok(!result.commentBody.includes("@everyone") || result.commentBody.includes("@\u200beveryone"));
@@ -263,13 +301,13 @@ test("handler: never renders the full prompt even when the manifest summary is a
 
 test("handler: signature verified against the committed public key", async () => {
   const github = makeGitHub();
-  const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github, { readOnly: true }));
   assert.ok(result.commentBody.includes("✓ signed"), "valid manifest signature must be shown");
 });
 
 test("handler: no intents → no comment", async () => {
   const github = new FakeGitHub([{ sha: "s", message: "plain commit" }], {});
-  const result = await handleWebhook(eventFor(PAYLOAD), { github });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
   assert.equal(result.action, "no-intents");
   assert.equal(github.calls.comments.length, 0);
 });
@@ -281,8 +319,12 @@ test("handler: rejects wrong signature and non-PR events", async () => {
     { github, webhookSecret: "s3cret" },
   );
   assert.equal(bad.action, "error");
-  const push = await handleWebhook({ ...eventFor(PAYLOAD), event: "push" }, { github });
+  const push = await handleWebhook({ ...eventFor(PAYLOAD), event: "push" }, devDeps(github));
   assert.equal(push.action, "skipped");
+  // production mode without a secret fails CLOSED before any event processing
+  const closed = await handleWebhook({ ...eventFor(PAYLOAD), event: "push" }, { github });
+  assert.equal(closed.action, "error");
+  assert.ok(closed.error.includes("webhook secret missing"));
 });
 
 test("handler: synchronize updates the existing Drift comment instead of posting", async () => {
@@ -292,7 +334,7 @@ test("handler: synchronize updates the existing Drift comment instead of posting
   });
   const result = await handleWebhook(
     { ...eventFor(PAYLOAD), payload: { ...PAYLOAD, action: "synchronize" } },
-    { github },
+    devDeps(github),
   );
   assert.equal(result.action, "updated");
   assert.equal(github.calls.updates.length, 1);
@@ -310,7 +352,7 @@ test("handler: synchronize with no prior Drift comment posts a new one", async (
   });
   const result = await handleWebhook(
     { ...eventFor(PAYLOAD), payload: { ...PAYLOAD, action: "synchronize" } },
-    { github },
+    devDeps(github),
   );
   assert.equal(result.action, "commented");
   assert.equal(github.calls.comments.length, 1);
@@ -322,7 +364,7 @@ test("handler: permanent 4xx GitHub API errors are not retryable", async () => {
   github.getPullCommits = async () => {
     throw new Error("getPullCommits failed: 404");
   };
-  const result = await handleWebhook(eventFor(PAYLOAD), { github });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
   assert.equal(result.action, "error");
   assert.equal(result.retryable, false);
   assert.ok(result.error.includes("404"));
@@ -333,7 +375,7 @@ test("handler: transient 5xx / network errors are retryable", async () => {
   github.getPullCommits = async () => {
     throw new Error("getPullCommits failed: 503");
   };
-  const result = await handleWebhook(eventFor(PAYLOAD), { github });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
   assert.equal(result.action, "error");
   assert.equal(result.retryable, true);
 
@@ -341,7 +383,7 @@ test("handler: transient 5xx / network errors are retryable", async () => {
   github2.getPullCommits = async () => {
     throw new TypeError("fetch failed");
   };
-  const result2 = await handleWebhook(eventFor(PAYLOAD), { github: github2 });
+  const result2 = await handleWebhook(eventFor(PAYLOAD), devDeps(github2));
   assert.equal(result2.retryable, true);
 });
 
@@ -392,16 +434,13 @@ test("webhook server: POST /webhook with valid signature returns 200 + posts com
     assert.equal(data.action, "commented");
     assert.equal(github.calls.comments.length, 1);
 
-    // bad signature → client-side error, acked with 200 (not retryable)
+    // bad signature → rejected with 401 BEFORE any processing (fail closed)
     const bad = await fetch(`http://127.0.0.1:${port}/webhook`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-github-event": "pull_request", "x-hub-signature-256": "sha256=wrong" },
       body: rawBody,
     });
-    assert.equal(bad.status, 200);
-    const badData = await bad.json();
-    assert.equal(badData.action, "error");
-    assert.equal(badData.retryable, false);
+    assert.equal(bad.status, 401);
 
     // health check
     const health = await fetch(`http://127.0.0.1:${port}/health`);
@@ -426,4 +465,370 @@ test("webhook server: oversized body is rejected with 413 (not retryable)", asyn
   } finally {
     await close();
   }
+});
+
+// ------------------------------------------- A: check conclusion policy
+const state = (signatureState, id = INTENT_ID) => ({ id, signatureState });
+
+test("deriveProvenanceConclusion: table-driven state → conclusion mapping", () => {
+  const cases = [
+    { intents: [state("valid")], keyChange: "unchanged", expect: "success" },
+    { intents: [state("valid"), state("valid")], keyChange: "unchanged", expect: "success" },
+    { intents: [state("invalid")], keyChange: "unchanged", expect: "failure" },
+    { intents: [state("untrusted-key")], keyChange: "replaced", expect: "failure" },
+    { intents: [state("untrusted-key")], keyChange: "unchanged", expect: "failure" },
+    { intents: [state("malformed")], keyChange: "unchanged", expect: "failure" },
+    { intents: [state("valid")], keyChange: "replaced", expect: "failure" },
+    { intents: [state("valid")], keyChange: "removed", expect: "failure" },
+    { intents: [state("bootstrap")], keyChange: "bootstrap", expect: "neutral" },
+    { intents: [state("unsigned")], keyChange: "unchanged", expect: "neutral" },
+    { intents: [state("unverifiable")], keyChange: "unchanged", expect: "neutral" },
+    { intents: [state("missing")], keyChange: "unchanged", expect: "neutral" },
+    { intents: [state("valid"), state("unsigned")], keyChange: "unchanged", expect: "neutral" },
+    { intents: [], keyChange: "none", expect: "neutral" },
+    { intents: [], keyChange: "unchanged", expect: "neutral" },
+    { intents: [], keyChange: "bootstrap", expect: "neutral" },
+    { intents: [], keyChange: "replaced", expect: "failure" },
+    { intents: [], keyChange: "removed", expect: "failure" },
+  ];
+  for (const c of cases) {
+    const r = deriveProvenanceConclusion({ intents: c.intents, keyChange: c.keyChange });
+    assert.equal(r.conclusion, c.expect, `intents=[${c.intents.map((i) => i.signatureState).join(",")}] key=${c.keyChange}`);
+  }
+  // a failure summary explains the reason
+  const f = deriveProvenanceConclusion({ intents: [state("invalid")], keyChange: "unchanged" });
+  assert.ok(f.summary.includes("Invalid: 1"));
+  assert.ok(f.title.includes("untrusted provenance"));
+});
+
+test("deriveProvenanceConclusion: mixed valid+invalid is a failure, not a green check", () => {
+  const r = deriveProvenanceConclusion({
+    intents: [state("valid"), state("invalid")],
+    keyChange: "unchanged",
+  });
+  assert.equal(r.conclusion, "failure");
+});
+
+test("evaluateKeyChange: detects bootstrap, removal and replacement", () => {
+  const A = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
+  const B = "-----BEGIN PUBLIC KEY-----\nBBBB\n-----END PUBLIC KEY-----\n";
+  assert.equal(evaluateKeyChange(null, null), "none");
+  assert.equal(evaluateKeyChange(null, A), "bootstrap");
+  assert.equal(evaluateKeyChange(A, null), "removed");
+  assert.equal(evaluateKeyChange(A, A), "unchanged");
+  assert.equal(evaluateKeyChange(A, B), "replaced");
+});
+
+// ----------------------------------------------- B: key-only PR visibility
+const OTHER = generateKeyPairSync("ed25519");
+const OTHER_PUBLIC_KEY_PEM = OTHER.publicKey.export({ type: "spki", format: "pem" }).toString();
+
+test("handler: key-only PR (replaced key, zero intents) → warning comment + failing check run", async () => {
+  const github = new FakeGitHub([{ sha: "s", message: "rotate key only" }], {}, [], {
+    publicKeyPem: OTHER_PUBLIC_KEY_PEM, // head key
+    basePublicKeyPem: PUBLIC_KEY_PEM, // base trust root — differs → replaced
+  });
+  const payload = {
+    ...PAYLOAD,
+    pull_request: { ...PAYLOAD.pull_request, base: { sha: "base123" }, head: { sha: "head456" } },
+  };
+  const result = await handleWebhook(eventFor(payload), devDeps(github));
+  assert.equal(result.action, "key-change");
+  assert.equal(result.intentsFound, 0);
+  assert.equal(result.conclusion, "failure");
+  assert.ok(result.commentBody.includes("trust-root change detected"), "warning must be visible");
+  assert.equal(github.calls.comments.length, 1, "a warning comment is posted even with zero intents");
+  assert.equal(github.calls.checks.length, 1);
+  assert.equal(github.calls.checks[0].conclusion, "failure");
+});
+
+test("handler: initial bootstrap (no base key, zero intents) → visible neutral check run", async () => {
+  const github = new FakeGitHub([{ sha: "s", message: "add drift" }], {}, [], {
+    publicKeyPem: PUBLIC_KEY_PEM, // head introduces the first key
+  });
+  const payload = {
+    ...PAYLOAD,
+    pull_request: { ...PAYLOAD.pull_request, base: { sha: "base123" }, head: { sha: "head456" } },
+  };
+  const result = await handleWebhook(eventFor(payload), devDeps(github));
+  assert.equal(result.action, "key-change");
+  assert.equal(result.conclusion, "neutral");
+  assert.equal(github.calls.checks.length, 1);
+  assert.equal(github.calls.checks[0].conclusion, "neutral");
+});
+
+// ------------------------------------------------ C: bootstrap semantics
+test("signatureStateFor: a failed head signature with no base key is INVALID, never bootstrap", async () => {
+  const manifest = signedManifest({
+    schemaVersion: 1,
+    id: INTENT_ID,
+    summary: "s",
+    commit: "abc",
+    timestamp: 1786000000000,
+  });
+  const tampered = { ...manifest, summary: "tampered" }; // signature no longer verifies
+  const loaded = { manifest: tampered, errors: null };
+  assert.equal(signatureStateFor(loaded, null, PUBLIC_KEY_PEM), "invalid");
+  assert.equal(signatureStateFor({ manifest, errors: null }, null, PUBLIC_KEY_PEM), "bootstrap");
+  assert.equal(signatureStateFor({ manifest: null, errors: null }, PUBLIC_KEY_PEM, PUBLIC_KEY_PEM), "missing");
+});
+
+test("handler: invalid bootstrap signature fails the check run (never labeled bootstrap)", async () => {
+  const github = makeGitHub({}, JSON.stringify({ ...MANIFEST, summary: "tampered-after-signing" }));
+  const payload = {
+    ...PAYLOAD,
+    pull_request: { ...PAYLOAD.pull_request, base: { sha: "base123" }, head: { sha: "head456" } },
+  };
+  const result = await handleWebhook(eventFor(payload), devDeps(github, { readOnly: true }));
+  assert.equal(result.action, "dry-run");
+  assert.ok(result.commentBody.includes("invalid signature"), "tampered signature must show as invalid");
+});
+
+// -------------------------------------------------- D: comment ownership
+test("isDriftOwnedComment: only GitHub-attested App authorship — never bot, never a user marker", () => {
+  const marker = SUMMARY_MARKER;
+  // a github-actions[bot] comment is the ACTION's, which the App must never edit
+  assert.equal(isDriftOwnedComment({ body: `${marker} action`, user: { login: "github-actions[bot]", type: "Bot" }, performed_via_github_app: null }), false);
+  // a real App-authored comment carries performed_via_github_app.id (GitHub-set)
+  assert.equal(isDriftOwnedComment({ body: `${marker} app`, user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }), true);
+  // a user-authored body that merely contains the marker is a spoof
+  assert.equal(isDriftOwnedComment({ body: `${marker} spoofed`, user: { login: "alice", type: "User" }, performed_via_github_app: null }), false);
+  assert.equal(isDriftOwnedComment({ body: "no marker", user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }), false);
+});
+
+test("handler: a user-authored spoofed marker is never updated — the App posts its own", async () => {
+  const spoof = {
+    id: 5,
+    body: `spoofed ${SUMMARY_MARKER}`,
+    user: { login: "alice", type: "User" },
+    performed_via_github_app: null,
+  };
+  const github = new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [spoof], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+  });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.action, "commented", "official comment is POSTed (not a spoof update)");
+  assert.equal(github.calls.updates.length, 0, "spoofed comment must never be PATCHed");
+  assert.equal(github.calls.comments.length, 1);
+});
+
+// ----------------------------------------- integrity audit (append-only)
+test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous are detected; valid atomic addition is clean", async () => {
+  const base = { [MANIFEST_PATH]: manifestJson() };
+  // valid atomic addition (base empty, head has the manifest, one trailer)
+  let audit = await auditProvenanceIntegrity(
+    new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [], { publicKeyPem: PUBLIC_KEY_PEM, basePublicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    COMMITS,
+    "base123",
+    "abc123def",
+  );
+  assert.deepEqual(audit, { violations: [], replayIds: [], ambiguousIds: [] }, JSON.stringify(audit));
+
+  // modified: present on base AND head
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [], { baseManifests: base, publicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    COMMITS,
+    "base123",
+    "abc123def",
+  );
+  assert.ok(audit.violations.some((v) => v.code === "modified" && v.id === INTENT_ID), JSON.stringify(audit));
+
+  // deleted: on base, absent on head
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(COMMITS, {}, [], { baseManifests: base, publicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    COMMITS,
+    "base123",
+    "abc123def",
+  );
+  assert.ok(audit.violations.some((v) => v.code === "deleted" && v.id === INTENT_ID), JSON.stringify(audit));
+
+  // orphan: added without any trailer
+  const noTrailer = [{ sha: "x", message: "plain commit" }];
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson() }, [], { publicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    noTrailer,
+    "base123",
+    "abc123def",
+  );
+  assert.ok(audit.violations.some((v) => v.code === "orphan" && v.id === INTENT_ID), JSON.stringify(audit));
+
+  // ambiguous: two commits reference the same id
+  const twoCommits = [
+    { sha: "a1", message: `one\n\nDrift-Intent: ${INTENT_ID}` },
+    { sha: "a2", message: `two\n\nDrift-Intent: ${INTENT_ID}` },
+  ];
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(twoCommits, { [MANIFEST_PATH]: manifestJson() }, [], { publicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    twoCommits,
+    "base123",
+    "abc123def",
+  );
+  assert.ok(audit.ambiguousIds.includes(INTENT_ID), JSON.stringify(audit));
+
+  // renamed via the PR files API
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [], {
+      publicKeyPem: PUBLIC_KEY_PEM,
+      pullFiles: [
+        {
+          filename: `.drift/public/intents/did_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json`,
+          status: "renamed",
+          previous_filename: MANIFEST_PATH,
+        },
+      ],
+    }),
+    "lilcipherx",
+    "drift",
+    7,
+    COMMITS,
+    "base123",
+    "abc123def",
+  );
+  assert.ok(audit.violations.some((v) => v.code === "renamed"), JSON.stringify(audit));
+
+  // replay: a commit references an id whose manifest already exists on base
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [], { baseManifests: base, publicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    COMMITS,
+    "base123",
+    "abc123def",
+  );
+  assert.ok(audit.replayIds.includes(INTENT_ID), JSON.stringify(audit));
+});
+
+test("deriveProvenanceConclusion: any integrity violation fails the check, even with zero intents", () => {
+  const r = deriveProvenanceConclusion({
+    intents: [],
+    keyChange: "unchanged",
+    audit: { violations: [{ code: "modified", id: INTENT_ID, detail: "append-only" }], replayIds: [], ambiguousIds: [] },
+  });
+  assert.equal(r.conclusion, "failure");
+  assert.ok(r.title.includes("integrity"), r.title);
+  const replay = deriveProvenanceConclusion({
+    intents: [],
+    keyChange: "unchanged",
+    audit: { violations: [], replayIds: [INTENT_ID], ambiguousIds: [] },
+  });
+  assert.equal(replay.conclusion, "failure");
+  const ambiguous = deriveProvenanceConclusion({
+    intents: [],
+    keyChange: "unchanged",
+    audit: { violations: [], replayIds: [], ambiguousIds: [INTENT_ID] },
+  });
+  assert.equal(ambiguous.conclusion, "failure");
+  const clean = deriveProvenanceConclusion({
+    intents: [state("valid")],
+    keyChange: "unchanged",
+    audit: { violations: [], replayIds: [], ambiguousIds: [] },
+  });
+  assert.equal(clean.conclusion, "success");
+});
+
+test("handler: an integrity-only PR (tampered manifest, zero new trailers) still gets a failing check run + warning", async () => {
+  // base has the manifest; head carries it too but commits carry no trailers
+  const noTrailer = [{ sha: "x", message: "tamper without trailer" }];
+  const github = new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson() }, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    basePublicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: { [MANIFEST_PATH]: manifestJson() },
+  });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "failure", JSON.stringify(result));
+  assert.equal(github.calls.checks.length, 1);
+  assert.equal(github.calls.checks[0].conclusion, "failure");
+  assert.ok(result.commentBody.includes("integrity"), "the violation must be visible in the comment");
+});
+
+test("handler: check-run creation is independent from the comment — a comment failure never loses the check result", async () => {
+  const github = makeGitHub();
+  github.postComment = async () => {
+    throw new Error("comment POST failed");
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "success", JSON.stringify(result));
+  assert.equal(github.calls.checks.length, 1, "check run must still be created when the comment fails");
+  assert.equal(github.calls.checks[0].conclusion, "success");
+
+  // and the reverse: a check-run failure must not suppress the comment
+  const github2 = makeGitHub();
+  github2.createCheckRun = async () => {
+    throw new Error("check run failed");
+  };
+  const result2 = await handleWebhook(eventFor(PAYLOAD), devDeps(github2));
+  assert.equal(result2.conclusion, "success");
+  assert.equal(github2.calls.comments.length, 1, "comment must still be posted when the check run fails");
+
+  // both fail → surfaced as an error (not silently green)
+  const github3 = makeGitHub();
+  github3.postComment = async () => {
+    throw new Error("comment POST failed");
+  };
+  github3.createCheckRun = async () => {
+    throw new Error("check run failed");
+  };
+  const result3 = await handleWebhook(eventFor(PAYLOAD), devDeps(github3));
+  assert.equal(result3.action, "error", JSON.stringify(result3));
+});
+
+// ------------------------------------------------ E: malformed manifests
+test("handler: malformed tracked manifest → malformed state, failing check, no crash, actionable message", async () => {
+  const malformed = JSON.stringify({ ...MANIFEST, files: { path: "src/x.ts" }, timestamp: "not-a-number" });
+  const github = makeGitHub({}, malformed);
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github, { readOnly: true }));
+  assert.equal(result.intentsFound, 1);
+  assert.ok(result.commentBody.includes("malformed public manifest"), result.commentBody);
+  assert.ok(!result.commentBody.includes("not-a-number"), "raw garbage is not rendered as data");
+  // a real (non-readOnly) delivery produces a failing check run
+  const github2 = makeGitHub({}, malformed);
+  const live = await handleWebhook(eventFor(PAYLOAD), devDeps(github2));
+  assert.equal(live.conclusion, "failure");
+  assert.equal(github2.calls.checks[0].conclusion, "failure");
+  assert.ok(github2.calls.checks[0].title.includes("untrusted provenance") || github2.calls.checks[0].title.includes("malformed"));
+});
+
+// ------------------------------------------------ H: webhook fail-closed
+test("webhook auth: production without a secret fails closed (startup + request)", () => {
+  assert.throws(() => assertWebhookAuthConfigured(undefined, undefined), /GITHUB_WEBHOOK_SECRET is required/);
+  assert.throws(() => assertWebhookAuthConfigured("", "false"), /GITHUB_WEBHOOK_SECRET is required/);
+  // explicit dev mode passes (and is the only escape hatch)
+  const dev = assertWebhookAuthConfigured(undefined, "true");
+  assert.equal(dev.insecureDevMode, true);
+  assert.equal(dev.webhookSecret, undefined);
+  // a real secret always wins
+  const prod = assertWebhookAuthConfigured("s3cret", "true");
+  assert.equal(prod.insecureDevMode, false);
+  assert.equal(prod.webhookSecret, "s3cret");
+});
+
+test("webhook auth: missing/invalid signatures are rejected when a secret is configured", async () => {
+  const github = makeGitHub();
+  const noSig = await handleWebhook(eventFor(PAYLOAD), { github, webhookSecret: "s3cret" });
+  assert.equal(noSig.action, "error");
+  assert.ok(noSig.error.includes("invalid webhook signature"));
+  const badSig = await handleWebhook(
+    { ...eventFor(PAYLOAD), signature: "sha256=deadbeef" },
+    { github, webhookSecret: "s3cret" },
+  );
+  assert.equal(badSig.action, "error");
+  // explicit dev mode bypasses the requirement
+  const dev = await handleWebhook(eventFor(PAYLOAD), { github, insecureDevMode: true });
+  assert.equal(dev.action, "commented");
 });

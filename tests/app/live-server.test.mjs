@@ -51,13 +51,19 @@ const manifests = {
   [`.drift/public/intents/${ID2}.json`]: manifestObj(ID2, "wire token refresh middleware", "src/token.ts"),
 };
 
-// page 1: 100 commits, only ID1 trailer; page 2: 50 commits, only ID2 trailer
+// page 1: 100 commits (pagination) — the FIRST carries the ID1 trailer, the
+// rest are plain; page 2: 50 commits — the first carries ID2. Each intent id
+// is referenced by exactly one commit (atomic association).
 const commit = (n, id) => ({
   sha: `c${String(n).padStart(39, "0")}`,
-  commit: { message: `chore: commit ${n}\n\nDrift-Intent: ${id}` },
+  commit: {
+    message: id
+      ? `chore: commit ${n}\n\nDrift-Intent: ${id}`
+      : `chore: commit ${n}`,
+  },
 });
-const commitsPage1 = Array.from({ length: 100 }, (_, i) => commit(i, ID1));
-const commitsPage2 = Array.from({ length: 50 }, (_, i) => commit(i + 100, ID2));
+const commitsPage1 = Array.from({ length: 100 }, (_, i) => commit(i, i === 0 ? ID1 : null));
+const commitsPage2 = Array.from({ length: 50 }, (_, i) => commit(i + 100, i === 0 ? ID2 : null));
 // PR 8: one commit with a trailer whose object is missing
 const commitsPr8 = [
   { sha: "e".repeat(40), commit: { message: `fallback subject here\n\nDrift-Intent: ${ID3}` } },
@@ -75,11 +81,17 @@ let mockPort;
 let webhook; // { port, close }
 let hookPort;
 
+const BASE_SHA = "0".repeat(40);
 const basePayload = (action, headSha, prNumber = 7) => ({
   action,
   installation: { id: 42 },
   repository: { name: "demo", owner: { login: "lilcipherx" } },
-  pull_request: { number: prNumber, title: "feat: add login", head: { sha: headSha } },
+  pull_request: {
+    number: prNumber,
+    title: "feat: add login",
+    head: { sha: headSha },
+    base: { sha: BASE_SHA },
+  },
 });
 
 function sign(raw) {
@@ -141,15 +153,33 @@ before(async () => {
         });
         return res.end(JSON.stringify(commitsPage1));
       }
+      // PR files (rename/append-only audit) — none in these fixtures
+      const filesMatch = req.method === "GET" && path.match(/\/pulls\/\d+\/files$/);
+      if (filesMatch) return json(res, 200, []);
       // contents: public manifests + key.pem only (ADR-009); anything else 404
       if (req.method === "GET" && path.includes("/contents/")) {
         const filePath = decodeURIComponent(path.split("/contents/")[1].split("?")[0]);
+        const ref = u.searchParams.get("ref") ?? "";
+        const atBase = ref === BASE_SHA;
+        // manifests exist only on PR 7's heads (HEAD1/HEAD2); base and the
+        // other PR heads have none
+        const serveManifests = ref === HEAD1 || ref === HEAD2;
+        const manifestObj =
+          filePath === ".drift/public/intents"
+            ? serveManifests
+              ? Object.keys(manifests).map((p) => ({ name: p.split("/").pop() }))
+              : []
+            : null;
         const obj =
           filePath === ".drift/public/key.pem"
-            ? { content: Buffer.from("-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n", "utf8").toString("base64"), encoding: "base64" }
-            : manifests[filePath]
-              ? { content: Buffer.from(JSON.stringify(manifests[filePath]), "utf8").toString("base64"), encoding: "base64" }
-              : null;
+            ? atBase || !serveManifests
+              ? null
+              : { content: Buffer.from("-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n", "utf8").toString("base64"), encoding: "base64" }
+            : manifestObj
+              ? manifestObj
+              : manifests[filePath] && serveManifests
+                ? { content: Buffer.from(JSON.stringify(manifests[filePath]), "utf8").toString("base64"), encoding: "base64" }
+                : null;
         if (!obj) return json(res, 404, { message: "Not Found" });
         return json(res, 200, obj);
       }
@@ -157,14 +187,20 @@ before(async () => {
       const commentsMatch = path.match(/\/issues\/(\d+)\/comments$/);
       if (commentsMatch) {
         const n = Number(commentsMatch[1]);
+        const withOwnership = ({ id, body }) => ({
+          id,
+          body,
+          user: { login: "drift-app[bot]", type: "Bot" },
+          performed_via_github_app: { id: 12345 },
+        });
         if (req.method === "GET") {
-          return json(res, 200, prComments[n].map(({ id, body }) => ({ id, body })));
+          return json(res, 200, prComments[n].map(withOwnership));
         }
         if (req.method === "POST") {
           const { body: text } = JSON.parse(body || "{}");
           state.posted++;
           prComments[n].push({ id: nextCommentId, body: text });
-          return json(res, 201, { id: nextCommentId++, body: text });
+          return json(res, 201, withOwnership({ id: nextCommentId++, body: text }));
         }
       }
       if (req.method === "PATCH" && path.includes("/issues/comments/")) {
@@ -293,14 +329,12 @@ test("PR without Drift-Intent trailers: no-intents, nothing written", async () =
 });
 
 // ------------------------------------------------------------- 4) bad signature
-test("bad HMAC signature: acked as error, not retryable", async () => {
+test("bad HMAC signature: rejected with 401 before any processing", async () => {
   const r = await sendWebhook("pull_request", basePayload("opened", HEAD1), {
     signature: "sha256=deadbeef",
   });
-  assert.equal(r.status, 200);
-  assert.equal(r.data.action, "error");
-  assert.equal(r.data.error, "invalid webhook signature");
-  assert.equal(r.data.retryable, false);
+  assert.equal(r.status, 401, JSON.stringify(r.data));
+  assert.equal(r.data.error, "invalid or missing webhook signature");
 });
 
 // ------------------------------------------------------------- 5) non-PR event

@@ -83,6 +83,37 @@ export class GitHubAppClient {
         }
         return commits;
     }
+    async getPullFiles(owner, repo, number) {
+        const token = await this.getInstallationToken(await this.requireInstallation());
+        const files = [];
+        let path = `/repos/${owner}/${repo}/pulls/${number}/files?per_page=100`;
+        for (let page = 0; path && page < 20; page++) {
+            const res = await this.request(path, token);
+            if (!res.ok)
+                throw new Error(`getPullFiles failed: ${res.status}`);
+            const data = (await res.json());
+            files.push(...data.map((f) => ({
+                filename: f.filename,
+                status: f.status,
+                ...(f.previous_filename ? { previous_filename: f.previous_filename } : {}),
+            })));
+            path = nextPagePath(res.headers.get("link"));
+        }
+        return files;
+    }
+    /** File NAMES in a directory at a ref ([] when the dir does not exist). */
+    async listDirectory(owner, repo, path, ref) {
+        const token = await this.getInstallationToken(await this.requireInstallation());
+        const res = await this.request(`/repos/${owner}/${repo}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`, token);
+        if (res.status === 404)
+            return [];
+        if (!res.ok)
+            throw new Error(`listDirectory ${path} failed: ${res.status}`);
+        const data = (await res.json());
+        if (!Array.isArray(data))
+            return [];
+        return data.map((d) => d.name).filter((n) => typeof n === "string");
+    }
     /** Raw UTF-8 content of a file at a ref, or null when absent. */
     async getFileContent(owner, repo, path, ref) {
         const token = await this.getInstallationToken(await this.requireInstallation());
@@ -110,7 +141,12 @@ export class GitHubAppClient {
             if (!res.ok)
                 throw new Error(`listIssueComments failed: ${res.status}`);
             const data = (await res.json());
-            comments.push(...data.map((c) => ({ id: c.id, body: c.body })));
+            comments.push(...data.map((c) => ({
+                id: c.id,
+                body: c.body,
+                user: c.user,
+                performed_via_github_app: c.performed_via_github_app,
+            })));
             path = nextPagePath(res.headers.get("link"));
         }
         return comments;

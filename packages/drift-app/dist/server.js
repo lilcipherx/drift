@@ -3,7 +3,21 @@
  * on POST /webhook, verifies the HMAC signature, and delegates to the handler.
  */
 import { createServer } from "node:http";
-import { handleWebhook } from "./handler.js";
+import { handleWebhook, verifyWebhookSignature } from "./handler.js";
+/**
+ * Fail-closed startup: a production webhook endpoint MUST authenticate
+ * deliveries. `DRIFT_APP_INSECURE_DEV_MODE` (exactly "true") is the only
+ * way to run without a secret and it must be explicit and loud.
+ */
+export function assertWebhookAuthConfigured(webhookSecret, insecureDevMode) {
+    if (webhookSecret)
+        return { webhookSecret, insecureDevMode: false };
+    if (insecureDevMode === "true") {
+        console.error("[drift-app] ⚠ DRIFT_APP_INSECURE_DEV_MODE=true — webhook signatures are NOT verified. Local development only; never use in production.");
+        return { webhookSecret: undefined, insecureDevMode: true };
+    }
+    throw new Error("GITHUB_WEBHOOK_SECRET is required: a public webhook endpoint without HMAC verification lets anyone forge pull_request events. For local development only, set DRIFT_APP_INSECURE_DEV_MODE=true explicitly.");
+}
 // GitHub webhook payloads can reach several MB on busy PRs — keep a bounded
 // but realistic cap (8 MB) instead of rejecting legitimate large deliveries.
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -81,10 +95,39 @@ export async function createWebhookServer(opts) {
         }
         try {
             const rawBody = await readBody(req, opts.maxBodyBytes ?? MAX_BODY_BYTES);
+            const signature = req.headers["x-hub-signature-256"];
+            // --- Authenticate BEFORE parsing any JSON -----------------------------
+            // Production requires a webhook secret and a valid X-Hub-Signature-256
+            // over the RAW body. Untrusted JSON is never parsed before the HMAC
+            // check passes. Fail closed: missing secret → 403, missing/invalid
+            // signature → 401 (never 200). Only an explicit
+            // DRIFT_APP_INSECURE_DEV_MODE=true allows unsigned requests.
+            const secret = opts.webhookSecret;
+            if (!secret) {
+                if (opts.insecureDevMode !== true) {
+                    sendJson(res, 403, {
+                        error: "webhook secret missing — production requires authenticated webhooks (local development: set DRIFT_APP_INSECURE_DEV_MODE=true explicitly)",
+                    });
+                    return;
+                }
+                console.error("[drift-app] ⚠ DRIFT_APP_INSECURE_DEV_MODE=true — webhook signatures are NOT verified. Local development only; never enable this in production.");
+            }
+            else if (!verifyWebhookSignature(rawBody, signature, secret)) {
+                sendJson(res, 401, { error: "invalid or missing webhook signature" });
+                return;
+            }
+            let payload;
+            try {
+                payload = rawBody ? JSON.parse(rawBody) : {};
+            }
+            catch {
+                sendJson(res, 400, { error: "malformed JSON body" });
+                return;
+            }
             const event = {
                 event: req.headers["x-github-event"] ?? "",
-                signature: req.headers["x-hub-signature-256"],
-                payload: rawBody ? JSON.parse(rawBody) : {},
+                signature,
+                payload,
                 rawBody,
             };
             const result = await handleWebhook(event, opts);

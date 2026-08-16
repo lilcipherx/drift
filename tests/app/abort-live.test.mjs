@@ -88,6 +88,9 @@ before(async () => {
       if (req.method === "GET" && /\/pulls\/\d+$/.test(path)) {
         return json(res, 200, { head: { sha: HEAD_SLOW }, title: "feat: add login" });
       }
+      if (req.method === "GET" && path.match(/\/pulls\/\d+\/files$/)) {
+        return json(res, 200, []);
+      }
       // PR 77 commits are deliberately slow — the abort window lives here.
       if (req.method === "GET" && path.match(/\/pulls\/\d+\/commits$/)) {
         await sleep(600);

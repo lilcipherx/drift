@@ -19,11 +19,28 @@ export interface CheckRunInput {
 export interface IssueComment {
     id: number;
     body: string;
+    /** Server-controlled authorship fields used for Drift comment ownership. */
+    user?: {
+        login?: string;
+        type?: string;
+    } | null;
+    performed_via_github_app?: {
+        id?: number;
+    } | null;
+}
+export interface PullFile {
+    filename: string;
+    status: string;
+    previous_filename?: string;
 }
 export interface GitHubClientLike {
     setInstallation(id: number): void;
     getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
+    /** All changed files of the PR (paginated, so PRs with >100 files work). */
+    getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
     getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
+    /** File NAMES in a directory at a ref ([] when the dir does not exist). */
+    listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
     listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
     postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
     updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
@@ -52,6 +69,9 @@ export declare class GitHubAppClient implements GitHubClientLike {
         title: string;
     }>;
     getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
+    getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
+    /** File NAMES in a directory at a ref ([] when the dir does not exist). */
+    listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
     /** Raw UTF-8 content of a file at a ref, or null when absent. */
     getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
     /**

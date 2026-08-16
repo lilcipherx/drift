@@ -13,6 +13,15 @@ export interface ServerOptions extends WebhookDeps {
     /** Grace for in-flight requests on close() before force-close (ms). */
     closeGraceMs?: number;
 }
+/**
+ * Fail-closed startup: a production webhook endpoint MUST authenticate
+ * deliveries. `DRIFT_APP_INSECURE_DEV_MODE` (exactly "true") is the only
+ * way to run without a secret and it must be explicit and loud.
+ */
+export declare function assertWebhookAuthConfigured(webhookSecret: string | undefined, insecureDevMode: string | undefined): {
+    webhookSecret: string | undefined;
+    insecureDevMode: boolean;
+};
 export declare function createWebhookServer(opts: ServerOptions): Promise<{
     server: import("http").Server<typeof IncomingMessage, typeof ServerResponse>;
     port: number;

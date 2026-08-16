@@ -24,12 +24,25 @@ export interface CheckRunInput {
 export interface IssueComment {
   id: number;
   body: string;
+  /** Server-controlled authorship fields used for Drift comment ownership. */
+  user?: { login?: string; type?: string } | null;
+  performed_via_github_app?: { id?: number } | null;
+}
+
+export interface PullFile {
+  filename: string;
+  status: string;
+  previous_filename?: string;
 }
 
 export interface GitHubClientLike {
   setInstallation(id: number): void;
   getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
+  /** All changed files of the PR (paginated, so PRs with >100 files work). */
+  getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
   getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
+  /** File NAMES in a directory at a ref ([] when the dir does not exist). */
+  listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
   listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
   postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
   updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
@@ -123,6 +136,44 @@ export class GitHubAppClient implements GitHubClientLike {
     return commits;
   }
 
+  async getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]> {
+    const token = await this.getInstallationToken(await this.requireInstallation());
+    const files: PullFile[] = [];
+    let path: string | null = `/repos/${owner}/${repo}/pulls/${number}/files?per_page=100`;
+    for (let page = 0; path && page < 20; page++) {
+      const res = await this.request(path, token);
+      if (!res.ok) throw new Error(`getPullFiles failed: ${res.status}`);
+      const data = (await res.json()) as {
+        filename: string;
+        status: string;
+        previous_filename?: string;
+      }[];
+      files.push(
+        ...data.map((f) => ({
+          filename: f.filename,
+          status: f.status,
+          ...(f.previous_filename ? { previous_filename: f.previous_filename } : {}),
+        })),
+      );
+      path = nextPagePath(res.headers.get("link"));
+    }
+    return files;
+  }
+
+  /** File NAMES in a directory at a ref ([] when the dir does not exist). */
+  async listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]> {
+    const token = await this.getInstallationToken(await this.requireInstallation());
+    const res = await this.request(
+      `/repos/${owner}/${repo}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`,
+      token,
+    );
+    if (res.status === 404) return [];
+    if (!res.ok) throw new Error(`listDirectory ${path} failed: ${res.status}`);
+    const data = (await res.json()) as { name?: string }[];
+    if (!Array.isArray(data)) return [];
+    return data.map((d) => d.name).filter((n): n is string => typeof n === "string");
+  }
+
   /** Raw UTF-8 content of a file at a ref, or null when absent. */
   async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
     const token = await this.getInstallationToken(await this.requireInstallation());
@@ -149,8 +200,20 @@ export class GitHubAppClient implements GitHubClientLike {
     for (let page = 0; path && page < 10; page++) {
       const res = await this.request(path, token);
       if (!res.ok) throw new Error(`listIssueComments failed: ${res.status}`);
-      const data = (await res.json()) as { id: number; body: string }[];
-      comments.push(...data.map((c) => ({ id: c.id, body: c.body })));
+      const data = (await res.json()) as {
+        id: number;
+        body: string;
+        user?: { login?: string; type?: string } | null;
+        performed_via_github_app?: { id?: number } | null;
+      }[];
+      comments.push(
+        ...data.map((c) => ({
+          id: c.id,
+          body: c.body,
+          user: c.user,
+          performed_via_github_app: c.performed_via_github_app,
+        })),
+      );
       path = nextPagePath(res.headers.get("link"));
     }
     return comments;
