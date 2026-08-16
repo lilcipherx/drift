@@ -199,12 +199,13 @@ class FakeGitHub {
     this.calls = { comments: [], checks: [], updates: [] };
     this.installation = null;
     this.pullFiles = opts.pullFiles ?? [];
+    this.pullFilesTruncated = opts.pullFilesTruncated ?? false;
     this.appId = opts.appId ?? "12345";
   }
   setInstallation(id) { this.installation = id; }
   getAppId() { return this.appId; }
   async getPullCommits() { return this.commits; }
-  async getPullFiles() { return this.pullFiles; }
+  async getPullFiles() { return { files: this.pullFiles, truncated: this.pullFilesTruncated }; }
   isBaseRef(ref) { return ref === "base123" || ref === "base-sha"; }
   async getFileContent(owner, repo, path, ref) {
     const base = this.isBaseRef(ref);
@@ -648,7 +649,7 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
   assert.deepEqual(audit, { violations: [], replayIds: [], ambiguousIds: [] }, JSON.stringify(audit));
 
   // unchanged: byte-identical content on base AND head is NOT a modification
-  // (issue 4 — filename presence alone is never evidence of tampering)
+  // (issue 4 — the changed-files listing does not even contain the file)
   audit = await auditProvenanceIntegrity(
     new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [], { baseManifests: base, publicKeyPem: PUBLIC_KEY_PEM }),
     "lilcipherx",
@@ -660,11 +661,12 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
   );
   assert.deepEqual(audit, { violations: [], replayIds: [INTENT_ID], ambiguousIds: [] }, JSON.stringify(audit));
 
-  // modified: present on base AND head with DIFFERENT content
+  // modified: the PR changed an existing manifest (append-only violation)
   audit = await auditProvenanceIntegrity(
     new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson({ summary: "tampered content" }) }, [], {
       baseManifests: base,
       publicKeyPem: PUBLIC_KEY_PEM,
+      pullFiles: [{ filename: MANIFEST_PATH, status: "modified" }],
     }),
     "lilcipherx",
     "drift",
@@ -677,7 +679,11 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
 
   // deleted: on base, absent on head
   audit = await auditProvenanceIntegrity(
-    new FakeGitHub(COMMITS, {}, [], { baseManifests: base, publicKeyPem: PUBLIC_KEY_PEM }),
+    new FakeGitHub(COMMITS, {}, [], {
+      baseManifests: base,
+      publicKeyPem: PUBLIC_KEY_PEM,
+      pullFiles: [{ filename: MANIFEST_PATH, status: "deleted" }],
+    }),
     "lilcipherx",
     "drift",
     7,
@@ -690,7 +696,10 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
   // orphan: added without any trailer
   const noTrailer = [{ sha: "x", message: "plain commit" }];
   audit = await auditProvenanceIntegrity(
-    new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson() }, [], { publicKeyPem: PUBLIC_KEY_PEM }),
+    new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson() }, [], {
+      publicKeyPem: PUBLIC_KEY_PEM,
+      pullFiles: [{ filename: MANIFEST_PATH, status: "added" }],
+    }),
     "lilcipherx",
     "drift",
     7,
@@ -706,7 +715,10 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
     { sha: "a2", message: `two\n\nDrift-Intent: ${INTENT_ID}` },
   ];
   audit = await auditProvenanceIntegrity(
-    new FakeGitHub(twoCommits, { [MANIFEST_PATH]: manifestJson() }, [], { publicKeyPem: PUBLIC_KEY_PEM }),
+    new FakeGitHub(twoCommits, { [MANIFEST_PATH]: manifestJson() }, [], {
+      publicKeyPem: PUBLIC_KEY_PEM,
+      pullFiles: [{ filename: MANIFEST_PATH, status: "added" }],
+    }),
     "lilcipherx",
     "drift",
     7,
@@ -753,7 +765,7 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
 test("auditProvenanceIntegrity: added-then-modified in the same PR is a violation (issue 5)", async () => {
   // commit c1 introduces the manifest with content X (and carries the single
   // matching trailer); commit c2 later modifies it to content Y. The final
-  // diff may still look like "added", so head-vs-introduction blob comparison
+  // diff may still report "added", so head-vs-introduction blob comparison
   // must catch the post-introduction mutation.
   const commits = [
     { sha: "c1", message: `add intent\n\nDrift-Intent: ${INTENT_ID}` },
@@ -763,6 +775,7 @@ test("auditProvenanceIntegrity: added-then-modified in the same PR is a violatio
   const headContent = manifestJson({ summary: "mutated after introduction" });
   const github = new FakeGitHub(commits, { [MANIFEST_PATH]: headContent }, [], {
     publicKeyPem: PUBLIC_KEY_PEM,
+    pullFiles: [{ filename: MANIFEST_PATH, status: "added" }],
     perCommit: { c1: { [MANIFEST_PATH]: introContent }, c2: { [MANIFEST_PATH]: headContent } },
   });
   const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
@@ -780,6 +793,7 @@ test("auditProvenanceIntegrity: trailer on a different commit than the introduct
   const content = manifestJson();
   const github = new FakeGitHub(commits, { [MANIFEST_PATH]: content }, [], {
     publicKeyPem: PUBLIC_KEY_PEM,
+    pullFiles: [{ filename: MANIFEST_PATH, status: "added" }],
     perCommit: { c1: { [MANIFEST_PATH]: content }, c2: { [MANIFEST_PATH]: content } },
   });
   const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
@@ -816,6 +830,90 @@ test("contract: a real Core V2 manifest is valid through the App (production wri
   rmSync(root, { recursive: true, force: true });
 });
 
+// ------------------------------------------------ App audit scalability
+function historicalManifests(count, sizeBytes = 0) {
+  const out = {};
+  const pad = (n) => `did_${String(n).padStart(32, "0")}`;
+  for (let i = 0; i < count; i++) {
+    const id = pad(i);
+    const summary = sizeBytes > 0 ? "x".repeat(sizeBytes) : `historical ${i}`;
+    out[`.drift/public/intents/${id}.json`] = JSON.stringify({
+      schemaVersion: 1,
+      id,
+      summary,
+      commit: "c",
+      timestamp: i,
+      signature: "",
+    });
+  }
+  return out;
+}
+
+test("App audit scalability: >200 unchanged historical manifests never fail a source-only PR (issue 8)", async () => {
+  // base and head both contain 201 byte-identical historical manifests; the
+  // PR changes only README.md. Unchanged history must not be enumerated or
+  // counted — the check stays clean.
+  const manifests = historicalManifests(201);
+  const commits = [{ sha: "s", message: "docs: update README" }];
+  const github = new FakeGitHub(commits, manifests, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: manifests,
+    pullFiles: [{ filename: "README.md", status: "modified" }],
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
+  assert.deepEqual(audit, { violations: [], replayIds: [], ambiguousIds: [] }, JSON.stringify(audit));
+});
+
+test("App audit scalability: 1000 unchanged historical manifests + one valid atomic addition → success", async () => {
+  const ID_B = "did_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const MANIFEST_B = `.drift/public/intents/${ID_B}.json`;
+  const historical = historicalManifests(1000);
+  const bContent = JSON.stringify(
+    signedManifest({ schemaVersion: 1, id: ID_B, summary: "new feature", commit: "c2", timestamp: 1001 }),
+  );
+  const commits = [{ sha: "c2", message: `feat: add feature\n\nDrift-Intent: ${ID_B}` }];
+  const github = new FakeGitHub(commits, { ...historical, [MANIFEST_B]: bContent }, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: historical,
+    pullFiles: [{ filename: MANIFEST_B, status: "added" }],
+    perCommit: { c2: { [MANIFEST_B]: bContent } },
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
+  assert.deepEqual(audit, { violations: [], replayIds: [], ambiguousIds: [] }, JSON.stringify(audit));
+});
+
+test("App audit scalability: large historical provenance total never counts against a source-only PR", async () => {
+  // >50 MiB of unchanged historical manifests; the PR changes one tiny file.
+  // Historical size must not be loaded or counted.
+  const historical = historicalManifests(300, 180 * 1024); // ~52 MiB total history
+  const commits = [{ sha: "s", message: "fix: typo" }];
+  const github = new FakeGitHub(commits, historical, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: historical,
+    pullFiles: [{ filename: "src/a.ts", status: "modified" }],
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
+  assert.deepEqual(audit, { violations: [], replayIds: [], ambiguousIds: [] }, JSON.stringify(audit));
+});
+
+test("App audit limits apply ONLY to changed PR provenance; incomplete pagination fails safely", async () => {
+  // 201 public manifests changed by ONE PR → bounded-audit violation
+  const many = [];
+  for (let i = 0; i < 201; i++) {
+    many.push({ filename: `.drift/public/intents/did_${String(i).padStart(32, "0")}.json`, status: "added" });
+  }
+  const github = new FakeGitHub([], {}, [], { publicKeyPem: PUBLIC_KEY_PEM, pullFiles: many });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, [], "base123", "head123");
+  assert.ok(audit.violations.length > 0, JSON.stringify(audit));
+  assert.ok(audit.violations.some((v) => v.detail.includes("bounded audit")), JSON.stringify(audit));
+
+  // incomplete changed-files listing → audit cannot conclude, never success
+  const trunc = new FakeGitHub([], {}, [], { publicKeyPem: PUBLIC_KEY_PEM, pullFilesTruncated: true });
+  const auditTrunc = await auditProvenanceIntegrity(trunc, "lilcipherx", "drift", 7, [], "base123", "head123");
+  assert.ok(auditTrunc.violations.length > 0, JSON.stringify(auditTrunc));
+  assert.ok(auditTrunc.violations.some((v) => v.detail.includes("incomplete")), JSON.stringify(auditTrunc));
+});
+
 test("deriveProvenanceConclusion: any integrity violation fails the check, even with zero intents", () => {
   const r = deriveProvenanceConclusion({
     intents: [],
@@ -846,12 +944,13 @@ test("deriveProvenanceConclusion: any integrity violation fails the check, even 
 
 test("handler: an integrity-only PR (tampered manifest, zero new trailers) still gets a failing check run + warning", async () => {
   // base has the manifest; head carries it with DIFFERENT content and commits
-  // carry no trailers — content comparison must flag the modification
+  // carry no trailers — the changed-files listing flags the modification
   const noTrailer = [{ sha: "x", message: "tamper without trailer" }];
   const github = new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson({ summary: "tampered content" }) }, [], {
     publicKeyPem: PUBLIC_KEY_PEM,
     basePublicKeyPem: PUBLIC_KEY_PEM,
     baseManifests: { [MANIFEST_PATH]: manifestJson() },
+    pullFiles: [{ filename: MANIFEST_PATH, status: "modified" }],
   });
   const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
   assert.equal(result.conclusion, "failure", JSON.stringify(result));

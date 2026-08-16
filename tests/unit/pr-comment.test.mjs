@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -528,15 +528,28 @@ test("getFileAt: reads a file at a git ref, null when absent", () => {
   assert.equal(getFileAt(repo, "f".repeat(40), "src/a.ts"), null);
 });
 
-test("buildSummary: trust-root warning is the whole body for a key-only PR", () => {
-  const body = buildSummary([], { keyChange: true });
-  assert.ok(body.includes("trust-root change detected"), body);
-  assert.ok(body.includes(".drift/public/key.pem"), body);
-  assert.ok(body.startsWith(SUMMARY_MARKER));
-  const withIntents = buildSummary([{ id: ID_A, summary: "s", files: [] }], { keyChange: true });
+test("buildSummary: full key-change state — replacement blocks, bootstrap is visible+neutral, none is ordinary", () => {
+  // replaced: blocking warning, whole body for a key-only PR
+  const replaced = buildSummary([], { keyChange: "replaced" });
+  assert.ok(replaced.includes("trust-root change detected"), replaced);
+  assert.ok(replaced.includes(".drift/public/key.pem"), replaced);
+  assert.ok(replaced.startsWith(SUMMARY_MARKER));
+  const removed = buildSummary([], { keyChange: "removed" });
+  assert.ok(removed.includes("trust-root change detected"), removed);
+  const withIntents = buildSummary([{ id: ID_A, summary: "s", files: [] }], { keyChange: "replaced" });
   assert.ok(withIntents.includes("trust-root change detected"));
   assert.ok(withIntents.includes("1 intent on this PR"));
-  assert.equal(buildSummary([], { keyChange: false }), null);
+  // bootstrap: VISIBLE and explicitly labeled, never reduced to a boolean
+  const boot = buildSummary([], { keyChange: "bootstrap" });
+  assert.ok(boot.includes("initial trust-root bootstrap"), boot);
+  assert.ok(boot.includes("first Drift public signing key"), boot);
+  assert.ok(!boot.includes("trust-root change detected"), "bootstrap is not a replacement warning");
+  const bootWithIntents = buildSummary([{ id: ID_A, summary: "s", files: [] }], { keyChange: "bootstrap" });
+  assert.ok(bootWithIntents.includes("initial trust-root bootstrap"));
+  assert.ok(bootWithIntents.includes("1 intent on this PR"));
+  // none / unchanged: ordinary no-summary behavior
+  assert.equal(buildSummary([], { keyChange: "none" }), null);
+  assert.equal(buildSummary([], { keyChange: "unchanged" }), null);
 });
 
 // ------------------------------------------------------ Action allowlist (F)
@@ -601,6 +614,171 @@ test("buildSummary: key-rotation and missing-manifest states are rendered, never
   assert.ok(body.includes("manifest missing"), body);
   assert.ok(body.includes("signed with a different key"), body);
   assert.ok(!body.includes("intent.prompt"));
+});
+
+// ------------------------------------ end-to-end Action runs (immutable head)
+import { fileURLToPath } from "node:url";
+const SCRIPT = fileURLToPath(new URL("../../scripts/pr-comment.mjs", import.meta.url));
+
+/** Run the REAL Action script with a controlled event file + env. */
+function runAction({ repo, event, env = {}, token = "" }) {
+  const eventFile = join(repo, ".event.json");
+  const summaryFile = join(repo, ".step-summary.md");
+  writeFileSync(eventFile, JSON.stringify(event));
+  const res = spawnSync(process.execPath, [SCRIPT], {
+    cwd: repo,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GITHUB_EVENT_PATH: eventFile,
+      GITHUB_STEP_SUMMARY: summaryFile,
+      DRIFT_REPO: repo,
+      GITHUB_TOKEN: token,
+      ...env,
+    },
+  });
+  const summary = existsSync(summaryFile) ? readFileSync(summaryFile, "utf8") : "";
+  return { status: res.status ?? -1, summary, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+
+const eventForSha = (repo, baseSha, headSha, prNumber = 7) => ({
+  pull_request: { number: prNumber, base: { sha: baseSha }, head: { sha: headSha } },
+  repository: { full_name: "lilcipherx/drift" },
+});
+
+function writeKey(repo, pem) {
+  const dir = join(repo, ".drift", "public");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "key.pem"), pem);
+}
+
+function writeManifestFile(repo, id, manifestObj) {
+  const dir = join(repo, ".drift", "public", "intents");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${id}.json`), JSON.stringify(manifestObj, null, 2));
+}
+
+test("Action immutable head: synthetic merge checkout cannot affect trust results (scenario A)", () => {
+  // base B (key K1) → side commit H (key K2) → synthetic merge M whose TREE
+  // has K1 again. The event head.sha is H, so the trust result must reflect
+  // K2 (replaced) even though HEAD shows K1.
+  const repo = makeRepo();
+  const K1 = KEY;
+  const K2 = OTHER_KEY;
+  writeKey(repo, K1);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "base with K1"]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  git(repo, ["checkout", "-qb", "side"]);
+  writeKey(repo, K2);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 5;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "head with K2"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  git(repo, ["checkout", "-q", "main"]);
+  git(repo, ["merge", "--no-ff", "side", "-m", "merge side"]);
+  // synthetic merge: HEAD tree now has K2 — force it back to K1 so HEAD
+  // differs from the event head SHA
+  git(repo, ["checkout", "-q", baseSha, "--", ".drift/public/key.pem"]);
+  git(repo, ["commit", "-qm", "synthetic merge (K1 tree)"]);
+  assert.equal((git(repo, ["show", "HEAD:.drift/public/key.pem"]).trim()), K1.trim(), "HEAD shows K1");
+  assert.equal((git(repo, ["show", `${headSha}:.drift/public/key.pem`]).trim()), K2.trim(), "event head shows K2");
+
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.notEqual(r.status, 0, "replaced trust root must fail the workflow");
+  assert.ok(r.summary.includes("trust-root change detected"), r.summary);
+  assert.ok(r.stderr.includes("provenance error"), r.stderr);
+});
+
+test("Action immutable head: working-tree provenance mutations are ignored (scenario B/C)", () => {
+  const repo = makeRepo();
+  writeKey(repo, KEY);
+  // historical manifest A at base (with its own trailer at base)
+  const manifestA = signed({ schemaVersion: 2, id: ID_A, summary: "historical A", timestamp: 1, signingKeyId: signingKeyIdFor(KEY) });
+  writeManifestFile(repo, ID_A, manifestA);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `base with K + A\n\nDrift-Intent: ${ID_A}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // head ATOMICALLY adds new intent B (manifest + trailer in one commit)
+  const manifestB = signed({ schemaVersion: 2, id: ID_B, summary: "immutable intent", timestamp: 2, signingKeyId: signingKeyIdFor(KEY) });
+  writeManifestFile(repo, ID_B, manifestB);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 6;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `head adds B\n\nDrift-Intent: ${ID_B}`]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+
+  // mutate the WORKING TREE (uncommitted): tamper manifest B + append junk to
+  // key.pem. The Action must evaluate the immutable head commit instead.
+  writeManifestFile(repo, ID_B, { ...manifestB, summary: "tampered in worktree" });
+  writeFileSync(join(repo, ".drift", "public", "key.pem"), `${KEY}\n# worktree junk\n`);
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.equal(r.status, 0, `working-tree mutations must not fail the trust check: ${r.stderr}`);
+  assert.ok(r.summary.includes("immutable intent"), r.summary);
+  assert.ok(r.summary.includes("✓ signed"), r.summary);
+  assert.ok(!r.summary.includes("tampered in worktree"), "working-tree manifest content must never be read");
+});
+
+test("Action failure policy: invalid provenance fails WITHOUT a token (exit non-zero, summary still written)", () => {
+  const repo = makeRepo();
+  writeKey(repo, KEY);
+  writeManifestFile(repo, ID_A, signed({ schemaVersion: 2, id: ID_A, summary: "orig", timestamp: 1, signingKeyId: signingKeyIdFor(KEY) }));
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `base\n\nDrift-Intent: ${ID_A}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // head MODIFIES the existing manifest (append-only violation), no trailer
+  writeManifestFile(repo, ID_A, signed({ schemaVersion: 2, id: ID_A, summary: "modified on PR", timestamp: 1, signingKeyId: signingKeyIdFor(KEY) }));
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 7;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "tamper manifest"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+
+  // no token, default fail-on-provenance-error=true → must still exit non-zero
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.notEqual(r.status, 0, "invalid provenance must fail the workflow even without a token");
+  assert.ok(r.summary.includes("integrity"), "safe step summary is still written");
+  assert.ok(r.stdout.includes("GITHUB_TOKEN not set"), "token absence is reported");
+  assert.ok(r.stderr.includes("provenance error"), "provenance failure is reported");
+
+  // fail-on-provenance-error=false → report-only, exit 0
+  const r2 = runAction({ repo, event: eventForSha(repo, baseSha, headSha), env: { FAIL_ON_PROVENANCE_ERROR: "false" } });
+  assert.equal(r2.status, 0, "report-only mode must not fail the workflow");
+});
+
+test("Action failure policy: comment failures and provenance failures are independent (with token)", () => {
+  const repo = makeRepo();
+  writeKey(repo, KEY);
+  // historical manifest A at base (trailer at base, not re-referenced on the PR)
+  writeManifestFile(repo, ID_A, signed({ schemaVersion: 2, id: ID_A, summary: "historical", timestamp: 1, signingKeyId: signingKeyIdFor(KEY) }));
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `base\n\nDrift-Intent: ${ID_A}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // head atomically adds NEW intent B (valid provenance)
+  writeManifestFile(repo, ID_B, signed({ schemaVersion: 2, id: ID_B, summary: "valid", timestamp: 2, signingKeyId: signingKeyIdFor(KEY) }));
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 8;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `head adds B\n\nDrift-Intent: ${ID_B}`]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+
+  // valid provenance + garbage token + comment 401: exit 0 unless
+  // fail-on-comment-error (a comment failure never causes a provenance fail)
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha), token: "garbage-token" });
+  assert.equal(r.status, 0, `valid provenance with a failing comment must stay green: ${r.stderr.slice(0, 300)}`);
+  const r2 = runAction({ repo, event: eventForSha(repo, baseSha, headSha), token: "garbage-token", env: { FAIL_ON_COMMENT_ERROR: "true" } });
+  assert.notEqual(r2.status, 0, "fail-on-comment-error=true must fail on the 401");
+});
+
+test("Action trust-root bootstrap: key-only PR is visible, neutral, and exits 0", () => {
+  const repo = makeRepo();
+  // base has NO drift key; head introduces K
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writeKey(repo, KEY);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "introduce first key"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.equal(r.status, 0, "bootstrap is neutral, never a failure");
+  assert.ok(r.summary.includes("initial trust-root bootstrap"), r.summary);
+  assert.ok(r.summary.includes("first Drift public signing key"), r.summary);
 });
 
 // ------------------------------------------------ provenance integrity audit
@@ -820,6 +998,64 @@ test("validateManifest: strict unknown-field rejection (top-level, agent, files)
   assert.equal(validateManifest({ ...base, agent: { type: "AGENT", identifier: "x", extraAgent: true } }).ok, false);
   assert.equal(validateManifest({ ...base, files: [{ path: "a", mutationType: "ADDED", extraFile: 1 }] }).ok, false);
   assert.equal(validateManifest({ ...base, commit: "abc" }).ok, false, "commit is V1-only, rejected on V2");
+});
+
+// ---------------------------------------- Core ⇄ Action ⇄ App validator parity
+// One schema, three consumers. Every vector below must classify identically
+// across the Core parser, the dependency-free Action validator and the App
+// loader — a classification difference is a security divergence.
+test("validator parity: identical vectors classify identically in Core, Action and App", async () => {
+  const core = await import("@drift/core");
+  const appUrl = new URL("../../packages/drift-app/dist/intents.js", import.meta.url);
+  const { parseLoadedManifest } = await import(appUrl.href);
+  const base = {
+    schemaVersion: 2,
+    id: ID_A,
+    summary: "summary text",
+    timestamp: 1,
+    signature: "",
+    signingKeyId: "0123456789abcdef",
+  };
+  const vectors = [
+    { name: "empty summary", manifest: { ...base, summary: "" } },
+    { name: "whitespace-only summary", manifest: { ...base, summary: "   \n\t " } },
+    { name: "summary with control characters", manifest: { ...base, summary: "ok\x07bell" } },
+    { name: "invalid V2 agent type", manifest: { ...base, agent: { type: "ROBOT", identifier: "x" } } },
+    { name: "empty agent identifier", manifest: { ...base, agent: { type: "AGENT", identifier: " " } } },
+    { name: "agent identifier with control chars", manifest: { ...base, agent: { type: "AGENT", identifier: "x\x00y" } } },
+    { name: "model with control chars", manifest: { ...base, model: "m\x1b[31m" } },
+    { name: "verification with control chars", manifest: { ...base, verification: "npm \x07test" } },
+    { name: "file path with control chars", manifest: { ...base, files: [{ path: "src/a.ts\x00", mutationType: "ADDED" }] } },
+    { name: "file summary with control chars", manifest: { ...base, files: [{ path: "a.ts", mutationType: "ADDED", summary: "x\x07" }] } },
+    { name: "unknown top-level field", manifest: { ...base, extra: 1 } },
+    { name: "unknown nested agent field", manifest: { ...base, agent: { type: "AGENT", identifier: "x", extra: 1 } } },
+    { name: "unknown nested file field", manifest: { ...base, files: [{ path: "a.ts", mutationType: "ADDED", extra: 1 }] } },
+    { name: "invalid signature encoding", manifest: { ...base, signature: "!!!not-base64!!!" } },
+    { name: "wrong signingKeyId format", manifest: { ...base, signingKeyId: "ZZZ" } },
+    { name: "oversized summary", manifest: { ...base, summary: "x".repeat(5000) } },
+    { name: "signature null (required case)", manifest: { ...base, summary: "", signature: null } },
+    { name: "valid V2", manifest: base },
+    { name: "valid V1", manifest: { schemaVersion: 1, id: ID_A, summary: "s", timestamp: 1, commit: "abc", signature: "" } },
+  ];
+  const classify = (m) => {
+    const raw = JSON.stringify(m);
+    const c = core.parsePublicIntentManifest(JSON.parse(raw), { expectedId: ID_A });
+    const a = validateManifest(JSON.parse(raw), { expectedId: ID_A });
+    const ap = parseLoadedManifest(raw, ID_A);
+    return {
+      core: c.ok ? "valid" : "malformed",
+      action: a.ok ? "valid" : "malformed",
+      app: ap.manifest ? "valid" : "malformed",
+    };
+  };
+  for (const { name, manifest } of vectors) {
+    const r = classify(manifest);
+    assert.equal(r.action, r.core, `Action vs Core divergence: ${name} — ${JSON.stringify(r)}`);
+    assert.equal(r.app, r.core, `App vs Core divergence: ${name} — ${JSON.stringify(r)}`);
+  }
+  // the required concrete case must be malformed EVERYWHERE
+  const required = classify({ schemaVersion: 2, summary: "", signature: null });
+  assert.deepEqual(required, { core: "malformed", action: "malformed", app: "malformed" }, JSON.stringify(required));
 });
 
 test("hasProvenanceError: trust/integrity state → workflow-failure mapping (issue 13)", () => {
