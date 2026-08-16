@@ -27,6 +27,13 @@ export interface WebhookDeps {
     checkRun?: boolean;
     /** Build the summary without writing anything (dev --dry-run). */
     readOnly?: boolean;
+    /**
+     * The configured Drift GitHub App id, used for EXACT comment ownership
+     * matching (performed_via_github_app.id must equal this). When absent, no
+     * comment is treated as owned (fail-safe: never PATCH a possibly-foreign
+     * comment).
+     */
+    appId?: string;
 }
 export interface WebhookResult {
     handled: boolean;

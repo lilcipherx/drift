@@ -11,6 +11,7 @@
  *    invalid/untrusted/malformed/key-change provenance fails the check.
  */
 
+import { signingKeyIdFor } from "@drift/core";
 import type { IntentView } from "./intents.js";
 
 /** Comment marker version 2 — the App owns the app-specific marker and must
@@ -27,6 +28,15 @@ export const TRUST_ROOT_WARNING =
 /** Trust-root relationship between the base branch and the PR head. */
 export type KeyChange = "none" | "unchanged" | "bootstrap" | "removed" | "replaced";
 
+/**
+ * Trust-root relationship between the base branch and the PR head, computed
+ * from CANONICAL SPKI-DER key fingerprints (`signingKeyIdFor`) — never from
+ * textual PEM bytes. The same key with LF/CRLF line endings or harmless
+ * surrounding whitespace is therefore "unchanged" (issue 6), while a
+ * genuinely different public key is a replacement. A malformed key hashes to
+ * a deterministic fallback id that never equals a real key, so a malformed
+ * head key is a replacement/unverifiable change, never a trusted state.
+ */
 export function evaluateKeyChange(
   baseKey: string | null,
   headKey: string | null,
@@ -35,7 +45,7 @@ export function evaluateKeyChange(
   if (!baseKey && headKey) return "bootstrap";
   if (baseKey && !headKey) return "removed";
   if (baseKey && headKey) {
-    return baseKey.trim() === headKey.trim() ? "unchanged" : "replaced";
+    return signingKeyIdFor(baseKey) === signingKeyIdFor(headKey) ? "unchanged" : "replaced";
   }
   return "none";
 }
@@ -48,34 +58,54 @@ export interface CommentIdentity {
 }
 
 /**
- * A comment belongs to the APP ONLY when GitHub itself attests that the App
- * authored it (`performed_via_github_app.id` is set by GitHub, not by the
- * commenter — a user cannot forge it). Comments authored by the composite
+ * A comment belongs to the APP ONLY when GitHub itself attests that THIS App
+ * authored it (`performed_via_github_app.id` set by GitHub, never by the
+ * commenter) AND that id equals the CONFIGURED Drift App id. An arbitrary
+ * positive id is not ownership — a different GitHub App that happens to use
+ * the marker must never be edited (issue 7). When the expected App id is
+ * unavailable (empty in production), ownership can not be proven, so no
+ * comment is treated as owned (fail-safe: we may post new comments but never
+ * PATCH a possibly-foreign comment). Comments authored by the composite
  * Action (`github-actions[bot]` login) belong to the Action and the App must
  * never edit them; user-authored bodies that merely contain a marker are
  * spoofs and are never touched.
  */
-export function isDriftOwnedComment(comment: CommentIdentity | null | undefined): boolean {
+export function isDriftOwnedComment(
+  comment: CommentIdentity | null | undefined,
+  expectedAppId: string | null | undefined,
+): boolean {
   if (!comment || typeof comment !== "object") return false;
   if (typeof comment.body !== "string") return false;
   const hasMarker =
     comment.body.includes(SUMMARY_MARKER) ||
     LEGACY_SUMMARY_MARKERS.some((m) => comment.body.includes(m));
   if (!hasMarker) return false;
+  // Ownership is only provable when the configured App id is available AND
+  // matches the GitHub-attested performed_via_github_app.id.
+  if (!expectedAppId || String(expectedAppId).trim().length === 0) return false;
   const appId = comment.performed_via_github_app?.id;
-  return typeof appId === "number" && Number.isInteger(appId) && appId > 0;
+  return typeof appId === "number" && Number.isInteger(appId) && appId > 0 && String(appId) === String(expectedAppId).trim();
 }
 
-/** Find the canonical owned comment (v2 marker first, legacy for migration). */
+/**
+ * Find the canonical owned comment (v2 marker first, legacy for migration) —
+ * deterministically the OLDEST owned comment (lowest id), so repeated
+ * webhook deliveries always update the same comment. Returns the canonical
+ * comment plus the number of additional owned duplicates (for diagnostics).
+ */
 export function findOwnedDriftComment(
   comments: (CommentIdentity & { id: number })[],
-): { id: number } | null {
-  const owned = comments.filter(isDriftOwnedComment);
-  return (
+  expectedAppId: string | null | undefined,
+): { id: number; duplicates: number } | null {
+  const owned = comments
+    .filter((c) => isDriftOwnedComment(c, expectedAppId))
+    .sort((a, b) => a.id - b.id); // deterministic: lowest id = oldest
+  if (owned.length === 0) return null;
+  const canonical =
     owned.find((c) => c.body.includes(SUMMARY_MARKER)) ??
     owned.find((c) => LEGACY_SUMMARY_MARKERS.some((m) => c.body.includes(m))) ??
-    null
-  );
+    owned[0]!;
+  return { id: canonical.id, duplicates: owned.length - 1 };
 }
 
 export type ProvenanceConclusion = "success" | "neutral" | "failure";
@@ -85,7 +115,7 @@ const FAILING_STATES = new Set(["invalid", "untrusted-key", "malformed"]);
 
 /** A public-provenance integrity violation (append-only rules). */
 export interface IntegrityViolation {
-  code: "modified" | "deleted" | "renamed" | "orphan";
+  code: "modified" | "deleted" | "renamed" | "orphan" | "intro-mismatch" | "mutated";
   id: string;
   detail: string;
 }

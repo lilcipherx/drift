@@ -38,6 +38,13 @@ export interface WebhookDeps {
   checkRun?: boolean;
   /** Build the summary without writing anything (dev --dry-run). */
   readOnly?: boolean;
+  /**
+   * The configured Drift GitHub App id, used for EXACT comment ownership
+   * matching (performed_via_github_app.id must equal this). When absent, no
+   * comment is treated as owned (fail-safe: never PATCH a possibly-foreign
+   * comment).
+   */
+  appId?: string;
 }
 
 export interface WebhookResult {
@@ -77,6 +84,9 @@ const PR_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
 
 export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Promise<WebhookResult> {
   const { github } = deps;
+  // Expected Drift App id for exact comment ownership (never an arbitrary
+  // positive id): the deps override wins, else the client's configured id.
+  const expectedAppId = deps.appId || github.getAppId?.() || null;
 
   // --- Fail-closed webhook authentication --------------------------------
   // Production App mode REQUIRES a webhook secret: without it anyone can
@@ -182,7 +192,7 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
           const checkError = await createCheckRunSafe(github, owner, repoName, headSha, conclusion, commentBody, deps.checkRun !== false);
           let writeError: string | null = null;
           try {
-            await writeOwnedComment(github, owner, repoName, prNumber, commentBody);
+            await writeOwnedComment(github, owner, repoName, prNumber, commentBody, expectedAppId);
           } catch (err) {
             writeError = err instanceof Error ? err.message : String(err);
           }
@@ -229,7 +239,7 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     let writeAction: "updated" | "commented" | null = null;
     let writeError: string | null = null;
     try {
-      writeAction = await writeOwnedComment(github, owner, repoName, prNumber, commentBody);
+      writeAction = await writeOwnedComment(github, owner, repoName, prNumber, commentBody, expectedAppId);
     } catch (err) {
       writeError = err instanceof Error ? err.message : String(err);
     }
@@ -300,13 +310,19 @@ async function writeOwnedComment(
   repo: string,
   prNumber: number,
   body: string,
+  expectedAppId: string | null | undefined,
 ): Promise<"updated" | "commented"> {
   const comments = (await github.listIssueComments(owner, repo, prNumber)) as (IssueComment & {
     user?: { login?: string; type?: string } | null;
     performed_via_github_app?: { id?: number } | null;
   })[];
-  const existing = findOwnedDriftComment(comments);
+  const existing = findOwnedDriftComment(comments, expectedAppId);
   if (existing) {
+    if (existing.duplicates > 0) {
+      console.error(
+        `[drift-app] ⚠ found ${existing.duplicates + 1} genuine Drift comments on PR #${prNumber} — updating the oldest (id ${existing.id}), leaving the others untouched.`,
+      );
+    }
     await github.updateComment(owner, repo, existing.id, body);
     return "updated";
   }

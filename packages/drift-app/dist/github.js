@@ -189,6 +189,9 @@ export class GitHubAppClient {
     setInstallation(id) {
         this.installationId = id;
     }
+    getAppId() {
+        return this.opts.appId?.trim() || null;
+    }
     installationId = null;
     async requireInstallation() {
         if (this.installationId == null) {

@@ -55,6 +55,7 @@ async function runDev(payloadPath: string, dryRun: boolean): Promise<void> {
     github,
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
     readOnly: dryRun,
+    appId: process.env.GITHUB_APP_ID,
   });
   if (dryRun && result.commentBody) {
     console.log(result.commentBody);
@@ -86,6 +87,7 @@ async function runStart(): Promise<void> {
     github,
     webhookSecret,
     insecureDevMode,
+    appId: process.env.GITHUB_APP_ID,
     port,
     log: (line) => console.log(line),
   });

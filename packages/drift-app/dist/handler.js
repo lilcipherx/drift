@@ -31,6 +31,9 @@ export function verifyWebhookSignature(rawBody, signature, secret) {
 const PR_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
 export async function handleWebhook(event, deps) {
     const { github } = deps;
+    // Expected Drift App id for exact comment ownership (never an arbitrary
+    // positive id): the deps override wins, else the client's configured id.
+    const expectedAppId = deps.appId || github.getAppId?.() || null;
     // --- Fail-closed webhook authentication --------------------------------
     // Production App mode REQUIRES a webhook secret: without it anyone can
     // forge pull_request deliveries. Unsigned requests are accepted ONLY in an
@@ -110,7 +113,7 @@ export async function handleWebhook(event, deps) {
                     const checkError = await createCheckRunSafe(github, owner, repoName, headSha, conclusion, commentBody, deps.checkRun !== false);
                     let writeError = null;
                     try {
-                        await writeOwnedComment(github, owner, repoName, prNumber, commentBody);
+                        await writeOwnedComment(github, owner, repoName, prNumber, commentBody, expectedAppId);
                     }
                     catch (err) {
                         writeError = err instanceof Error ? err.message : String(err);
@@ -153,7 +156,7 @@ export async function handleWebhook(event, deps) {
         let writeAction = null;
         let writeError = null;
         try {
-            writeAction = await writeOwnedComment(github, owner, repoName, prNumber, commentBody);
+            writeAction = await writeOwnedComment(github, owner, repoName, prNumber, commentBody, expectedAppId);
         }
         catch (err) {
             writeError = err instanceof Error ? err.message : String(err);
@@ -212,10 +215,13 @@ async function createCheckRunSafe(github, owner, repo, headSha, conclusion, comm
  * performed_via_github_app.id — never by marker presence alone).
  * Returns "updated" when an owned comment was PATCHed, else "commented".
  */
-async function writeOwnedComment(github, owner, repo, prNumber, body) {
+async function writeOwnedComment(github, owner, repo, prNumber, body, expectedAppId) {
     const comments = (await github.listIssueComments(owner, repo, prNumber));
-    const existing = findOwnedDriftComment(comments);
+    const existing = findOwnedDriftComment(comments, expectedAppId);
     if (existing) {
+        if (existing.duplicates > 0) {
+            console.error(`[drift-app] ⚠ found ${existing.duplicates + 1} genuine Drift comments on PR #${prNumber} — updating the oldest (id ${existing.id}), leaving the others untouched.`);
+        }
         await github.updateComment(owner, repo, existing.id, body);
         return "updated";
     }

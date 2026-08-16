@@ -70,7 +70,10 @@ export interface LoadedManifest {
  * Strictly parse a manifest fetched from the GitHub API. `expectedId` must
  * match both the requested intent id and (indirectly) the file it was loaded
  * from — callers only fetch `intents/<id>.json`, so a mismatched embedded id
- * is rejected outright.
+ * is rejected outright. The raw BYTE length is enforced BEFORE `JSON.parse`
+ * so an arbitrarily large tracked file is never loaded into the parser
+ * (issue 8) — the connector already returns a string, so the length check
+ * happens before any structural work.
  */
 export declare function parseLoadedManifest(raw: string | null, expectedId: string): LoadedManifest;
 /**
@@ -95,19 +98,34 @@ export declare function signatureStateFor(loaded: LoadedManifest, baseKey: strin
  */
 export declare function fetchIntents(github: GitHubClientLike, owner: string, repo: string, ref: string, commits: PullCommit[], ids: string[], baseRef?: string): Promise<IntentView[]>;
 /**
+ * Bounded per-PR audit limits (issue 8): manifests are compared by exact
+ * content, never by filename presence alone, and the audit never inspects
+ * more than `MAX_AUDITED_MANIFESTS` files or more than
+ * `MAX_TOTAL_PROVENANCE_BYTES_PER_PR` total content. These same limits are
+ * documented for the Action in `scripts/pr-comment.mjs` and in SECURITY.md.
+ */
+export declare const MAX_AUDITED_MANIFESTS = 200;
+export declare const MAX_TOTAL_PROVENANCE_BYTES_PER_PR: number;
+/**
  * Audit EVERY change under `.drift/public/intents/` on the PR — not just
  * trailer-derived intents. A PR can tamper with existing provenance without
  * adding any `Drift-Intent:` trailer; that must be a FAILING condition, not
- * invisible. Rules:
+ * invisible. Rules (ADR-009 append-only model):
  *
- *   added manifest   → orphan when NO PR commit references the id, or when
- *                      more than one commit references it (ambiguous — the
- *                      single introducing commit must carry the matching
- *                      trailer).
- *   modified manifest → violation (append-only).
- *   deleted manifest  → violation (append-only).
- *   renamed manifest  → violation (append-only).
+ *   unchanged          → file exists on base AND head with byte-identical
+ *                        content — NOT a modification (presence alone is
+ *                        never evidence of tampering; issue 4).
+ *   modified           → exists on both sides with DIFFERENT content.
+ *   deleted / renamed  → violation (append-only).
+ *   added manifest     → orphan when NO PR commit references the id; the
+ *                        introducing commit (the first PR commit where the
+ *                        file exists) must carry exactly ONE matching
+ *                        `Drift-Intent:` trailer; the head content must be
+ *                        byte-identical to the introduction content — a
+ *                        manifest added and then modified later in the same
+ *                        PR ("added-then-modified") is a violation.
  *   trailer for an id whose manifest exists on the base branch → replay.
+ *   one id referenced by >1 distinct PR commit → ambiguous association.
  *
  * The result feeds `deriveProvenanceConclusion` so any integrity break fails
  * the Check Run (never silently green).

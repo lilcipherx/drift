@@ -21,6 +21,15 @@ export declare const LEGACY_SUMMARY_MARKERS: string[];
 export declare const TRUST_ROOT_WARNING = "## \u26A0 Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
 /** Trust-root relationship between the base branch and the PR head. */
 export type KeyChange = "none" | "unchanged" | "bootstrap" | "removed" | "replaced";
+/**
+ * Trust-root relationship between the base branch and the PR head, computed
+ * from CANONICAL SPKI-DER key fingerprints (`signingKeyIdFor`) — never from
+ * textual PEM bytes. The same key with LF/CRLF line endings or harmless
+ * surrounding whitespace is therefore "unchanged" (issue 6), while a
+ * genuinely different public key is a replacement. A malformed key hashes to
+ * a deterministic fallback id that never equals a real key, so a malformed
+ * head key is a replacement/unverifiable change, never a trusted state.
+ */
 export declare function evaluateKeyChange(baseKey: string | null, headKey: string | null): KeyChange;
 /** A PR comment as returned by the GitHub API (ownership-relevant fields). */
 export interface CommentIdentity {
@@ -34,24 +43,35 @@ export interface CommentIdentity {
     } | null;
 }
 /**
- * A comment belongs to the APP ONLY when GitHub itself attests that the App
- * authored it (`performed_via_github_app.id` is set by GitHub, not by the
- * commenter — a user cannot forge it). Comments authored by the composite
+ * A comment belongs to the APP ONLY when GitHub itself attests that THIS App
+ * authored it (`performed_via_github_app.id` set by GitHub, never by the
+ * commenter) AND that id equals the CONFIGURED Drift App id. An arbitrary
+ * positive id is not ownership — a different GitHub App that happens to use
+ * the marker must never be edited (issue 7). When the expected App id is
+ * unavailable (empty in production), ownership can not be proven, so no
+ * comment is treated as owned (fail-safe: we may post new comments but never
+ * PATCH a possibly-foreign comment). Comments authored by the composite
  * Action (`github-actions[bot]` login) belong to the Action and the App must
  * never edit them; user-authored bodies that merely contain a marker are
  * spoofs and are never touched.
  */
-export declare function isDriftOwnedComment(comment: CommentIdentity | null | undefined): boolean;
-/** Find the canonical owned comment (v2 marker first, legacy for migration). */
+export declare function isDriftOwnedComment(comment: CommentIdentity | null | undefined, expectedAppId: string | null | undefined): boolean;
+/**
+ * Find the canonical owned comment (v2 marker first, legacy for migration) —
+ * deterministically the OLDEST owned comment (lowest id), so repeated
+ * webhook deliveries always update the same comment. Returns the canonical
+ * comment plus the number of additional owned duplicates (for diagnostics).
+ */
 export declare function findOwnedDriftComment(comments: (CommentIdentity & {
     id: number;
-})[]): {
+})[], expectedAppId: string | null | undefined): {
     id: number;
+    duplicates: number;
 } | null;
 export type ProvenanceConclusion = "success" | "neutral" | "failure";
 /** A public-provenance integrity violation (append-only rules). */
 export interface IntegrityViolation {
-    code: "modified" | "deleted" | "renamed" | "orphan";
+    code: "modified" | "deleted" | "renamed" | "orphan" | "intro-mismatch" | "mutated";
     id: string;
     detail: string;
 }

@@ -37,6 +37,8 @@ export interface PullFile {
 
 export interface GitHubClientLike {
   setInstallation(id: number): void;
+  /** The configured GitHub App id (for exact comment-ownership matching). */
+  getAppId(): string | null;
   getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
   /** All changed files of the PR (paginated, so PRs with >100 files work). */
   getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
@@ -256,6 +258,10 @@ export class GitHubAppClient implements GitHubClientLike {
 
   setInstallation(id: number): void {
     this.installationId = id;
+  }
+
+  getAppId(): string | null {
+    return this.opts.appId?.trim() || null;
   }
 
   private installationId: number | null = null;
