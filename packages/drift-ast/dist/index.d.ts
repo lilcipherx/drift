@@ -65,7 +65,8 @@ export declare function computeDelta(filePath: string, pre: SymbolInfo[] | null,
  * code never enters history, PRD §9.2).
  *
  * TypeScript/JavaScript: parsed by the TypeScript compiler (transpile only —
- * no typechecking, so type errors never block commits).
+ * no typechecking, so type errors never block commits). Works with the TS 5.x
+ * JS API and, when that is unavailable (TS 7 native), via `tsc --noCheck`.
  * Python: parsed with `ast` when a python interpreter is available.
  *
  * Returns a human-readable message for the first syntax error, or null when
