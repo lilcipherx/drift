@@ -225,13 +225,16 @@ server.registerTool(
   {
     title: "Drift Verify",
     description:
-      "Re-run the verification command recorded in an intent and report pass/fail.",
+      "Report an intent's recorded verification command and signature state WITHOUT executing it (default). Set run:true to execute, which is allowed only when the manifest is validly signed by the repository key — repository-provided verification strings are code.",
     inputSchema: {
       intentId: z.string(),
+      run: z.boolean().optional().describe("Execute the recorded verification command (requires a validly signed manifest). Default false: informational only."),
     },
   },
   async (args) => {
-    const out = runCli(["verify", String(args.intentId)]);
+    const cliArgs = ["verify", String(args.intentId)];
+    if (args.run) cliArgs.push("--run");
+    const out = runCli(cliArgs);
     if (!out.ok) return text({ status: "error", details: out.error?.message });
     return text(out.data);
   },

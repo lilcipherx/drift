@@ -7,6 +7,7 @@
 
 import { writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { resolve, sep } from "node:path";
 import { Drift, DriftError, EXIT } from "@drift/core";
 
 const require_ = createRequire(import.meta.url);
@@ -31,19 +32,24 @@ Usage:
   drift log [--author x] [--model m] [--file f] [--limit n] [--json]
   drift blame <file> --line N | --function name [--json]
   drift context <file> [--limit 5] [--json]
-  drift verify <intent-id> [--json]
+  drift verify <intent-id> [--run] [--allow-untrusted-command] [--json]
+                                   Information by default (no execution); --run executes the
+                                   recorded command only when the manifest is validly signed
   drift replay <intent-id> [--checkout] [--json]
   drift doctor [--fix] [--json]
-  drift export [--out file]
+  drift export [--out file] [--include-private-prompt] [--allow-repository-output]
   drift verify-intent <intent-id>  Check an intent's Ed25519 signature
+  drift key import --file <path>   Import the repository private signing key (read-only clone)
 
 Options:
   --json       machine-readable output
   --no-color   disable ANSI colors
   --summary TEXT   public summary for the intent (realize). Redacted, sanitized
                    and length-limited; never derived from the prompt.
-  --include-private-prompt   ALSO output the full local prompt (log/blame/context)
+  --include-private-prompt   ALSO output the full local prompt (log/blame/context/export)
                              — sensitive; never use in CI or on public surfaces
+  --allow-repository-output  permit drift export --out inside the git repository
+                             (private exports should go outside the repo)
 `;
 
 interface Args {
@@ -168,9 +174,15 @@ function run(argv: string[]): number {
           console.log(JSON.stringify({ status: "ok", ...result }));
         } else {
           console.log(colorize(!noColor, "green", "✓ Drift initialized"));
-          console.log(`  repo:   ${result.repoRoot}`);
-          console.log(`  key:    ${result.driftDir}\\keys\\ed25519.pem`);
-          console.log(`  pubkey: ${result.publicKeyPem.slice(0, 40)}…`);
+          console.log(`  repo:    ${result.repoRoot}`);
+          console.log(`  key:     ${result.driftDir}\\keys\\ed25519.pem`);
+          console.log(`  pubkey:  ${result.publicKeyPem.slice(0, 40)}…`);
+          console.log(`  signer:  ${result.signerState}`);
+          if (result.signerState === "read-only") {
+            console.log(
+              colorize(!noColor, "yellow", "  note: clone has public provenance but no private signing key — read commands work, new signed intents need `drift key import --file <path>`"),
+            );
+          }
           console.log("\nNext: edit a file, then run:");
           console.log(colorize(!noColor, "bold", "  drift realize -p \"what you changed and why\""));
         }
@@ -203,8 +215,18 @@ function run(argv: string[]): number {
           }
           console.log(`  prompt mode: ${result.promptMode}`);
           console.log(`  encryption:  ${result.encryption ? "on (AES-256-GCM)" : "off"}`);
+          console.log(`  signer:      ${result.signerState ?? "?"}`);
+          if (result.publicKeyFingerprint) {
+            console.log(`  pubkey fp:   ${result.publicKeyFingerprint}${result.privateKeyAvailable ? "" : " (private key absent — read-only)"}`);
+          }
+          console.log(`  signing:     ${result.signingAllowed ? "allowed" : "blocked"}`);
           const branch = result.gitBranch ?? "(detached)";
           console.log(`  git:         ${branch} @ ${result.gitHead ?? "?"}${result.gitDirty ? " (uncommitted changes)" : " (clean)"}`);
+          if (result.signerState === "read-only") {
+            console.log(
+              colorize(!noColor, "yellow", "  note: no private signing key — new signed intents require `drift key import --file <path>`"),
+            );
+          }
           console.log("\nNext:");
           console.log(colorize(!noColor, "bold", "  drift realize -p \"what you changed and why\""));
           console.log(colorize(!noColor, "bold", "  drift blame <file> --function <name>"));
@@ -373,31 +395,47 @@ function run(argv: string[]): number {
       case "verify": {
         const id = positional[0];
         if (!id) {
-          return usageError("usage: drift verify <intent-id>");
+          return usageError("usage: drift verify <intent-id> [--run] [--allow-untrusted-command]");
         }
         const drift = Drift.fromCwd(process.cwd());
-        const result = drift.verify(id);
+        const run = flags.has("run");
+        const allowUntrusted = flags.has("allow-untrusted-command");
+        if (allowUntrusted && !run) {
+          console.error(
+            colorize(!noColor, "yellow", "warning: --allow-untrusted-command has no effect without --run (nothing is executed by default)"),
+          );
+        }
+        if (run && allowUntrusted) {
+          console.error(
+            colorize(!noColor, "red", "⚠ DANGER: --run --allow-untrusted-command will execute a repository-provided command that may be untrusted. Only proceed if you trust this repository."),
+          );
+        }
+        const result = drift.verify(id, { run, allowUntrustedCommand: allowUntrusted });
         if (json) {
           console.log(
             JSON.stringify({
               status: "ok",
               intentId: result.intentId,
               verifyStatus: result.status,
+              signature: result.signature,
               verifyCmd: result.verifyCmd,
               exitCode: result.exitCode,
               stdout: result.stdout,
               stderr: result.stderr,
+              message: result.message,
             }),
           );
         } else {
-          const ok = result.status === "pass";
-          const label =
-            result.status === "no-command"
-              ? colorize(!noColor, "yellow", "no verification command recorded")
-              : ok
-                ? colorize(!noColor, "green", "PASS")
-                : colorize(!noColor, "red", "FAIL");
-          console.log(`${id}: ${label}`);
+          const statusLabel: Record<string, string> = {
+            pass: colorize(!noColor, "green", "PASS"),
+            fail: colorize(!noColor, "red", "FAIL"),
+            timeout: colorize(!noColor, "red", "TIMEOUT"),
+            "no-command": colorize(!noColor, "yellow", "no verification command recorded"),
+            "not-executed": colorize(!noColor, "yellow", "NOT EXECUTED"),
+            refused: colorize(!noColor, "red", "REFUSED"),
+          };
+          console.log(`${id}: ${statusLabel[result.status] ?? result.status}  [signature: ${result.signature}]`);
+          console.log(result.message);
           if (result.stdout) console.log(result.stdout.trimEnd());
           if (result.stderr) console.error(result.stderr.trimEnd());
         }
@@ -443,10 +481,26 @@ function run(argv: string[]): number {
       }
 
       case "export": {
+        const includePrivate = flags.has("include-private-prompt");
+        if (includePrivate) {
+          console.error(
+            colorize(!noColor, "yellow", "warning: --include-private-prompt exports the full local prompt — treat the output as secret, keep it outside the git repository"),
+          );
+        }
         const drift = Drift.fromCwd(process.cwd());
-        const data = drift.exportJson();
+        const data = drift.exportJson({ includePrivatePrompt: includePrivate });
         const out = stringFlag(flags, "out");
         if (out) {
+          // Private exports must not be written inside the repository where a
+          // stray `git add .` could commit them — refuse unless the user
+          // explicitly overrides.
+          const absOut = resolve(out);
+          const inside = absOut.startsWith(drift.repoRoot + sep) || absOut === drift.repoRoot;
+          if (includePrivate && inside && !flags.has("allow-repository-output")) {
+            return usageError(
+              `refusing to write a private prompt export inside the repository (${out}). Write it outside the repo or pass --allow-repository-output to override.`,
+            );
+          }
           writeFileSync(out, data);
           if (!json) console.log(colorize(!noColor, "green", `exported to ${out}`));
         } else {
@@ -465,9 +519,32 @@ function run(argv: string[]): number {
         if (json) {
           console.log(JSON.stringify({ status: result.ok ? "ok" : "error", ...result }));
         } else {
-          console.log(result.ok ? colorize(!noColor, "green", `✓ ${id} — ${result.detail}`) : colorize(!noColor, "red", `✗ ${id} — ${result.detail}`));
+          const icon = result.ok ? colorize(!noColor, "green", "✓") : colorize(!noColor, "red", "✗");
+          console.log(`${icon} ${id} — ${result.detail} [${result.state}]`);
         }
         return result.ok ? EXIT.OK : EXIT.ERROR;
+      }
+
+      case "key": {
+        const sub = positional[0];
+        if (sub !== "import") {
+          return usageError("usage: drift key import --file <path-to-private-key.pem>");
+        }
+        const file = stringFlag(flags, "file");
+        if (!file) {
+          return usageError("usage: drift key import --file <path-to-private-key.pem>");
+        }
+        const drift = Drift.fromCwd(process.cwd());
+        const result = drift.keyImport(file);
+        if (json) {
+          console.log(JSON.stringify({ status: "ok", ...result }));
+        } else {
+          console.log(colorize(!noColor, "green", "✓ repository signing key imported"));
+          console.log(`  signer:    ${result.signerState}`);
+          console.log(`  pubkey fp: ${result.publicKeyFingerprint ?? "?"}`);
+          console.log("  New signed intents can now be created with `drift realize`.");
+        }
+        return EXIT.OK;
       }
 
       case "version": {
