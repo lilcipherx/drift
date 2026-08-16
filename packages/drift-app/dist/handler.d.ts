@@ -16,8 +16,6 @@ export interface WebhookDeps {
     github: GitHubClientLike;
     /** HMAC webhook secret (X-Hub-Signature-256). Undefined ⇒ skip verification. */
     webhookSecret?: string;
-    /** Optional DRIFT_MASTER_KEY to decrypt encrypted prompts. */
-    masterKey?: string;
     /** Disable check-run creation (comment-only mode). */
     checkRun?: boolean;
     /** Build the summary without writing anything (dev --dry-run). */

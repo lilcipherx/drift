@@ -1,12 +1,14 @@
 /**
- * Read `Drift-Intent: <id>` trailers from pull request commits and hydrate the
- * intent objects from `.drift/objects/` at the PR head (PRD §16.2).
+ * Read `Drift-Intent: <id>` trailers from pull request commits (git-trailer
+ * aligned) and hydrate the SAFE public provenance from
+ * `.drift/public/intents/<id>.json` at the PR head (ADR-009).
+ *
+ * Private data (prompts, `objects/`, `drift.db`) is never read here and
+ * never rendered: comments show only the public summary + metadata.
  */
 
-import { deriveMasterKey, decryptAesGcm, isEncrypted } from "@drift/core";
+import { canonicalJson, extractDriftIntentIds, verifyPayload } from "@drift/core";
 import type { GitHubClientLike, PullCommit } from "./github.js";
-
-const TRAILER_RE = /Drift-Intent:\s*(did_[0-9a-f]{32})/g;
 
 export interface IntentFileView {
   path: string;
@@ -19,22 +21,19 @@ export interface IntentView {
   authorType: string;
   authorId: string;
   model: string | null;
-  prompt: string;
-  encryptedPrompt: boolean;
+  /** Safe public summary — the ONLY prompt-derived text ever rendered. */
+  summary: string;
   verifyCmd: string | null;
   files: IntentFileView[];
   signature: boolean;
 }
 
-/** Extract unique intent ids referenced by a set of commits (order preserved). */
+/** Extract unique, valid Drift-Intent ids referenced by a set of commits. */
 export function extractIntentIds(commits: PullCommit[]): string[] {
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const commit of commits) {
-    TRAILER_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = TRAILER_RE.exec(commit.message)) !== null) {
-      const id = m[1]!;
+    for (const id of extractDriftIntentIds(commit.message)) {
       if (!seen.has(id)) {
         seen.add(id);
         ids.push(id);
@@ -44,42 +43,20 @@ export function extractIntentIds(commits: PullCommit[]): string[] {
   return ids;
 }
 
-/**
- * Decrypt an `encv1:` prompt when DRIFT_MASTER_KEY is available. `aad` must
- * match the intent id the payload was bound to at realize time.
- */
-export function decryptPrompt(
-  prompt: string,
-  masterKeyEnv?: string,
-  aad?: string,
-): { prompt: string; encrypted: boolean } {
-  if (!isEncrypted(prompt)) return { prompt, encrypted: false };
-  if (!masterKeyEnv) return { prompt: "🔒 [encrypted]", encrypted: true };
-  try {
-    return { prompt: decryptAesGcm(prompt, deriveMasterKey(masterKeyEnv), aad), encrypted: true };
-  } catch {
-    return { prompt: "🔒 [encrypted: invalid key]", encrypted: true };
-  }
-}
-
-/**
- * Load the intent objects referenced by a PR. Falls back to the commit
- * message subject as the prompt when the object is missing (e.g. `.drift`
- * not committed).
- */
-interface LoadedObject {
-  id: string;
-  prompt?: string;
-  author?: { type?: string; identifier?: string; model?: string };
-  astDelta?: { filePath?: string; type?: string; summary?: string }[];
-  verifyCmd?: string;
+interface LoadedManifest {
+  id?: string;
+  summary?: string;
+  model?: string;
+  agent?: { type?: string; identifier?: string };
+  verification?: string;
+  files?: { path?: string; mutationType?: string; summary?: string }[];
   signature?: string;
 }
 
 /**
- * Load the intent objects referenced by a PR. Falls back to the commit
- * message subject as the prompt when the object is missing (e.g. `.drift`
- * not committed).
+ * Load the public manifests referenced by a PR. Falls back to the commit
+ * message subject as the summary when the manifest is missing (e.g. an
+ * intent realized before ADR-009, or `.drift/public` not committed).
  */
 export async function fetchIntents(
   github: GitHubClientLike,
@@ -88,60 +65,71 @@ export async function fetchIntents(
   ref: string,
   commits: PullCommit[],
   ids: string[],
-  masterKeyEnv?: string,
 ): Promise<IntentView[]> {
   if (ids.length === 0) return [];
 
-  // Fetch `.drift/objects/**` until every referenced intent is found (the
-  // object path is content-addressed, so it cannot be derived from the id).
-  const loaded = new Map<string, LoadedObject>();
-  const paths = await github.getObjectPaths(owner, repo, ref);
-  for (const path of paths) {
-    const raw = await github.getFileContent(owner, repo, path, ref);
+  // The manifest path is deterministic per intent id.
+  const loaded = new Map<string, LoadedManifest>();
+  for (const id of ids) {
+    const raw = await github.getFileContent(owner, repo, `.drift/public/intents/${id}.json`, ref);
     if (!raw) continue;
-    let obj: LoadedObject;
     try {
-      obj = JSON.parse(raw) as LoadedObject;
+      const parsed = JSON.parse(raw) as LoadedManifest;
+      if (parsed && parsed.id === id) loaded.set(id, parsed);
     } catch {
-      continue;
+      // malformed manifest — fall back to the commit subject
     }
-    if (obj.id && ids.includes(obj.id)) loaded.set(obj.id, obj);
-    // All referenced intents found — stop issuing more content API calls.
-    if (loaded.size >= ids.length) break;
   }
+
+  // Public key for signature verification (when committed).
+  let publicKey: string | null = null;
+  const keyRaw = await github.getFileContent(owner, repo, ".drift/public/key.pem", ref);
+  if (keyRaw && keyRaw.includes("PUBLIC KEY")) publicKey = keyRaw.trim();
 
   // subject fallback: map each intent id to the commit that introduced it
   const subjectByIntent = new Map<string, string>();
   for (const commit of commits) {
-    TRAILER_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = TRAILER_RE.exec(commit.message)) !== null) {
-      if (!subjectByIntent.has(m[1]!)) {
-        subjectByIntent.set(m[1]!, commit.message.split("\n")[0] ?? "");
+    for (const id of extractDriftIntentIds(commit.message)) {
+      if (!subjectByIntent.has(id)) {
+        subjectByIntent.set(id, commit.message.split("\n")[0] ?? "");
       }
     }
   }
 
   const views: IntentView[] = [];
   for (const id of ids) {
-    const obj = loaded.get(id);
-    const rawPrompt = obj?.prompt ?? subjectByIntent.get(id) ?? "";
-    const decrypted = decryptPrompt(rawPrompt, masterKeyEnv, id);
+    const manifest = loaded.get(id);
     views.push({
       id,
-      authorType: obj?.author?.type ?? "unknown",
-      authorId: obj?.author?.identifier ?? "unknown",
-      model: obj?.author?.model ?? null,
-      prompt: decrypted.prompt,
-      encryptedPrompt: decrypted.encrypted,
-      verifyCmd: obj?.verifyCmd ?? null,
-      files: (obj?.astDelta ?? []).map((d) => ({
-        path: d.filePath ?? "?",
-        mutationType: d.type ?? "MODIFIED",
-        summary: d.summary ?? null,
+      authorType: manifest?.agent?.type ?? "unknown",
+      authorId: manifest?.agent?.identifier ?? "unknown",
+      model: manifest?.model ?? null,
+      summary: manifest?.summary ?? subjectByIntent.get(id) ?? "",
+      verifyCmd: manifest?.verification ?? null,
+      files: (manifest?.files ?? []).map((f) => ({
+        path: f.path ?? "?",
+        mutationType: f.mutationType ?? "MODIFIED",
+        summary: f.summary ?? null,
       })),
-      signature: Boolean(obj?.signature),
+      signature:
+        Boolean(manifest?.signature) &&
+        Boolean(publicKey) &&
+        verifyManifestSignature(manifest as LoadedManifest & { id: string }, publicKey as string),
     });
   }
   return views;
+}
+
+/** Verify a manifest's Ed25519 signature against the committed public key. */
+function verifyManifestSignature(
+  manifest: LoadedManifest & { id: string },
+  publicKey: string,
+): boolean {
+  const { signature, ...unsigned } = manifest;
+  if (!signature || !unsigned.id) return false;
+  try {
+    return verifyPayload(canonicalJson(unsigned), publicKey, signature);
+  } catch {
+    return false;
+  }
 }

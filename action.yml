@@ -1,13 +1,16 @@
 name: "Drift Intent Check"
-description: "Validate and summarize Drift intents on this pull request (PRD §14.4)."
+description: "Validate Drift and post a privacy-safe intent summary for THIS pull request's commits only (ADR-009: public manifests, never the full prompt)."
 author: "Drift"
 inputs:
   command:
     description: "drift subcommand to run against the repo (log | doctor | verify <intent-id>)"
     default: "log"
   comment:
-    description: "Post (or update in place) a Drift intent-summary comment on the PR. Requires GITHUB_TOKEN; skipped automatically on non-PR runs or repos without Drift intents."
+    description: "Post (or update in place) a Drift intent-summary comment on the PR. Requires GITHUB_TOKEN and `pull-requests: write`; skipped automatically on non-PR runs or repos without Drift intents. On forks with a read-only token the summary is written to the step summary instead."
     default: "true"
+  fail-on-comment-error:
+    description: "When true, the job fails if the PR comment cannot be posted/updated (e.g. a fork's read-only token). Default false: warn and fall back to the step summary."
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -31,12 +34,14 @@ runs:
         exit $DRIFT_EXIT
       env:
         DRIFT_COMMAND: ${{ inputs.command }}
-    # Idempotent provenance summary: posts once, then PATCHes the same
-    # marker comment on every synchronize/force-push. Never spams.
+    # Privacy-safe, PR-scoped, idempotent provenance summary: reads only
+    # Drift-Intent trailers from THIS PR's commits + `.drift/public/`
+    # manifests. Never renders the full prompt. Posts once, then PATCHes the
+    # same marker comment on every synchronize/force-push.
     - name: "Post Drift PR summary comment"
       if: ${{ inputs.comment == 'true' }}
       shell: bash
       env:
         GITHUB_TOKEN: ${{ github.token }}
-        DRIFT_CLI: ${{ github.action_path }}/packages/drift-cli/dist/cli.js
+        FAIL_ON_COMMENT_ERROR: ${{ inputs.fail-on-comment-error }}
       run: node "$GITHUB_ACTION_PATH/scripts/pr-comment.mjs"

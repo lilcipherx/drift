@@ -51,7 +51,6 @@ async function runDev(payloadPath, dryRun) {
     const result = await handleWebhook(event, {
         github,
         webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
-        masterKey: process.env.DRIFT_MASTER_KEY,
         readOnly: dryRun,
     });
     if (dryRun && result.commentBody) {
@@ -82,7 +81,6 @@ async function runStart() {
     const { close, port: actualPort } = await createWebhookServer({
         github,
         webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
-        masterKey: process.env.DRIFT_MASTER_KEY,
         port,
         log: (line) => console.log(line),
     });

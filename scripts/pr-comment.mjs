@@ -2,70 +2,301 @@
 /**
  * Drift PR summary comment (GitHub Action).
  *
- * Runs `drift log --json` in the consumer repository and posts (or updates
- * in place — idempotent, marker-based) a compact provenance summary on the
- * pull request. Zero extra dependencies: plain `fetch` + the REST API.
+ * Selects ONLY the commits of the current pull request (immutable base/head
+ * SHAs via `git merge-base` + `git rev-list`), reads `Drift-Intent:` trailers
+ * from those commits' messages with git's own trailer parser, hydrates the
+ * SAFE public manifests (`.drift/public/intents/<id>.json`, ADR-009) and
+ * posts/updates one marker comment. The full prompt is never read, never
+ * rendered and never posted.
  *
  * Env:
- *   GITHUB_TOKEN       token for the API (from `${{ github.token }}`)
- *   GITHUB_REPOSITORY  owner/repo of the run
- *   GITHUB_EVENT_PATH  event JSON file (pull_request.number)
- *   DRIFT_CLI          path to the drift CLI (default: packages/drift-cli/dist/cli.js)
+ *   GITHUB_TOKEN            token for the API (from `${{ github.token }}`)
+ *   GITHUB_REPOSITORY       owner/repo of the run
+ *   GITHUB_EVENT_PATH       event JSON file
+ *   GITHUB_STEP_SUMMARY     step summary file (same safe summary is written)
+ *   FAIL_ON_COMMENT_ERROR   "true" → exit 1 when the comment cannot be written
+ *                           (default: warn + step summary + exit 0)
+ *   DRIFT_REPO              repo root override (default: cwd)
  *
- * Graceful behaviour: skips silently when the run is not a pull_request,
- * when the repo has no Drift intents, or when Drift is not initialized.
+ * Graceful behaviour: non-PR events, missing tokens, no intents and fork PR
+ * permission failures degrade to an informational step summary, never a
+ * crash, never a duplicated comment.
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 export const SUMMARY_MARKER = "<!-- drift:summary -->";
-const PROMPT_TRUNCATE = 200;
+const MAX_INTENTS = 10;
 const MAX_FILES = 10;
+const SUMMARY_LIMIT = 500;
+const META_LIMIT = 120;
+const TOTAL_LIMIT = 12000;
 
-function escCell(text) {
-  return String(text ?? "").replace(/\|/g, "\\|");
+// ---------------------------------------------------------------------------
+// Sanitization (mirrors @drift/core sanitizePublicText so this script stays
+// dependency-free and safe to run from any checkout).
+// ---------------------------------------------------------------------------
+
+export function sanitizeCommentText(text) {
+  let out = String(text ?? "");
+  out = out.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+  out = out.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  out = out.replace(/<!--[\s\S]*?-->/g, "").replace(/<!--/g, "").replace(/-->/g, "");
+  out = out.replace(/@(everyone|here|all)\b/gi, "@\u200b$1");
+  return out;
 }
 
-function truncate(text) {
-  const s = String(text ?? "");
-  return s.length <= PROMPT_TRUNCATE ? s : `${s.slice(0, PROMPT_TRUNCATE - 1)}…`;
+function safe(text, limit) {
+  const cleaned = sanitizeCommentText(text).replace(/`/g, "").replace(/\s+/g, " ").trim();
+  return cleaned.length <= limit ? cleaned : `${cleaned.slice(0, limit - 1)}…`;
 }
+
+// ---------------------------------------------------------------------------
+// Git helpers (argument arrays only — never interpolated shell strings)
+// ---------------------------------------------------------------------------
+
+function git(repoRoot, args, { input } = {}) {
+  const res = spawnSync("git", args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    input,
+    maxBuffer: 64 * 1024 * 1024,
+    windowsHide: true,
+  });
+  return { status: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+
+/** Parse the pull_request event into immutable SHAs (never branch names). */
+export function parseEvent(rawEventJson) {
+  let event;
+  try {
+    event = JSON.parse(rawEventJson);
+  } catch {
+    return null;
+  }
+  const pr = event?.pull_request;
+  if (!pr || typeof pr !== "object") return null;
+  const { number, base, head } = pr;
+  if (!Number.isInteger(number) || !base?.sha || !head?.sha) return null;
+  const repo = event?.repository?.full_name;
+  if (typeof repo !== "string" || !/^[^/]+\/[^/]+$/.test(repo)) return null;
+  return { repo, prNumber: number, baseSha: String(base.sha), headSha: String(head.sha) };
+}
+
+/**
+ * The commit shas belonging to the PR: `merge-base(base,head)..head`.
+ * Returns { ok:false, reason } when the range cannot be computed safely —
+ * callers must NOT fall back to repo-wide intent lists.
+ */
+export function prCommitShas(repoRoot, baseSha, headSha, gitImpl = git) {
+  const mb = gitImpl(repoRoot, ["merge-base", baseSha, headSha]);
+  if (mb.status !== 0 || !mb.stdout.trim()) {
+    return { ok: false, reason: "merge-base", shas: [] };
+  }
+  const mergeBase = mb.stdout.trim();
+  const rev = gitImpl(repoRoot, ["rev-list", "--reverse", `${mergeBase}..${headSha}`]);
+  if (rev.status !== 0) {
+    return { ok: false, reason: "rev-list", shas: [] };
+  }
+  const shas = rev.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => /^[0-9a-f]{40}$/.test(s));
+  return { ok: true, shas };
+}
+
+// ---------------------------------------------------------------------------
+// Trailer parsing — git's own `interpret-trailers --parse`, with a small
+// git-trailer-aligned fallback parser when git is unavailable.
+// ---------------------------------------------------------------------------
+
+const ID_RE = /^did_[0-9a-f]{32}$/;
+const TRAILER_LINE_RE = /^([A-Za-z0-9-]+):[ \t]*(.*)$/;
+
+/** Fallback parser: trailers live in the LAST paragraph of the message. */
+export function parseGitTrailers(message) {
+  const lines = String(message ?? "").split(/\r?\n/);
+  let last = [];
+  let cur = [];
+  for (const line of lines) {
+    if (line.trim() === "") {
+      if (cur.length > 0) {
+        last = cur;
+        cur = [];
+      }
+    } else {
+      cur.push(line);
+    }
+  }
+  if (cur.length > 0) last = cur;
+  const out = [];
+  let i = 0;
+  while (i < last.length) {
+    const m = TRAILER_LINE_RE.exec(last[i]);
+    if (!m) break;
+    let value = m[2];
+    i++;
+    while (i < last.length && /^[ \t]+/.test(last[i])) {
+      value += ` ${last[i].trim()}`;
+      i++;
+    }
+    out.push({ token: m[1], value });
+  }
+  return out;
+}
+
+/** All valid Drift-Intent ids in a commit message (deduped, order kept). */
+export function extractDriftIntentIds(message, gitImpl = git, repoRoot = process.cwd()) {
+  const res = gitImpl(repoRoot, ["interpret-trailers", "--parse"], { input: message });
+  const trailers =
+    res.status === 0
+      ? res.stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0)
+          .map((l) => {
+            const m = TRAILER_LINE_RE.exec(l);
+            return m ? { token: m[1], value: m[2] } : null;
+          })
+          .filter((t) => t !== null)
+      : parseGitTrailers(message);
+  const ids = [];
+  const seen = new Set();
+  for (const trailer of trailers) {
+    if (trailer.token !== "Drift-Intent") continue;
+    const id = trailer.value.trim();
+    if (ID_RE.test(id) && !seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// Intent loading — public manifests only
+// ---------------------------------------------------------------------------
+
+export function readManifest(repoRoot, id) {
+  const path = join(repoRoot, ".drift", "public", "intents", `${id}.json`);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walk PR commits, collect their intent ids (in order, deduped), hydrate from
+ * `.drift/public/intents/` and fall back to the introducing commit subject.
+ */
+export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManifestImpl = readManifest }) {
+  const ids = [];
+  const seen = new Set();
+  const intro = new Map(); // intent id -> { subject, sha }
+  for (const sha of commits) {
+    const res = gitImpl(repoRoot, ["log", "-1", "--format=%B", sha]);
+    if (res.status !== 0) continue;
+    const message = res.stdout;
+    const subject = (String(message).split("\n")[0] ?? "").trim();
+    for (const id of extractDriftIntentIds(message, gitImpl, repoRoot)) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+      if (!intro.has(id)) intro.set(id, { subject, sha });
+    }
+  }
+
+  const intents = [];
+  for (const id of ids) {
+    const manifest = readManifestImpl(repoRoot, id);
+    const fromCommit = intro.get(id);
+    intents.push({
+      id,
+      summary: manifest?.summary ?? fromCommit?.subject ?? "",
+      model: manifest?.model ?? null,
+      authorId: manifest?.agent?.identifier ?? null,
+      authorType: manifest?.agent?.type ?? null,
+      verification: manifest?.verification ?? null,
+      files: Array.isArray(manifest?.files)
+        ? manifest.files.map((f) => ({
+            path: f?.path ?? "?",
+            mutationType: f?.mutationType ?? "MODIFIED",
+            summary: f?.summary ?? null,
+          }))
+        : [],
+      commit: fromCommit?.sha ?? manifest?.commit ?? null,
+    });
+  }
+  return intents;
+}
+
+// ---------------------------------------------------------------------------
+// Comment building (safe public data only)
+// ---------------------------------------------------------------------------
 
 /** Build the summary comment body. Returns null when there is nothing to say. */
 export function buildSummary(intents) {
   if (!Array.isArray(intents) || intents.length === 0) return null;
-  const lines = [SUMMARY_MARKER, "## 🤖 Drift intent summary", ""];
-  lines.push(`${intents.length} intent${intents.length === 1 ? "" : "s"} on this PR`);
-  for (const intent of intents) {
-    lines.push("", `### Intent \`${String(intent.id ?? "?").slice(0, 8)}…\``, "");
-    const meta = [`**Author:** \`${escCell(intent.authorId ?? "unknown")}\` (${escCell(intent.authorType ?? "unknown")})`];
-    if (intent.model) meta.push(`**Model:** \`${escCell(intent.model)}\``);
-    if (intent.gitSha) meta.push(`**Commit:** \`${String(intent.gitSha).slice(0, 7)}\``);
-    lines.push(meta.join(" · "), "");
-    lines.push(`> ${truncate(intent.prompt) || "_(no prompt recorded)_"}`);
-    const files = Array.isArray(intent.files) ? intent.files : [];
-    if (files.length > 0) {
-      lines.push("", "| File | Change |", "| --- | --- |");
-      for (const f of files.slice(0, MAX_FILES)) {
-        lines.push(`| \`${escCell(f.path)}\` | **${escCell(f.mutationType)}** |`);
-      }
-      if (files.length > MAX_FILES) lines.push(`| … | +${files.length - MAX_FILES} more |`);
+  const shown = intents.slice(0, MAX_INTENTS);
+  const truncatedIntents = intents.length > MAX_INTENTS;
+  const lines = [SUMMARY_MARKER, "## Drift — Why this changed", ""];
+  lines.push(`${shown.length} intent${shown.length === 1 ? "" : "s"} on this PR`);
+  for (const intent of shown) {
+    lines.push("", `### Intent \`${safe(intent.id, 12)}\``, "");
+    lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+
+    const meta = [];
+    if (intent.authorId) meta.push(safe(intent.authorId, META_LIMIT));
+    if (intent.authorType && intent.authorType !== "unknown") meta.push(`(${safe(intent.authorType, 16)})`);
+    if (intent.model) meta.push(`model ${safe(intent.model, META_LIMIT)}`);
+    if (meta.length > 0) {
+      lines.push("", "### Generated with", "");
+      lines.push(meta.join(" · "));
     }
+
+    if (intent.files.length > 0) {
+      lines.push("", "### Affected code", "");
+      for (const f of intent.files.slice(0, MAX_FILES)) {
+        const detail = f.summary ? ` — ${safe(f.summary, 90)}` : "";
+        lines.push(`- \`${safe(f.path, 200)}\` (**${safe(f.mutationType, 16)}**)${detail}`);
+      }
+      if (intent.files.length > MAX_FILES) lines.push(`- … +${intent.files.length - MAX_FILES} more`);
+    }
+
+    if (intent.verification) {
+      lines.push("", "### Verification", "");
+      lines.push(`- \`${safe(intent.verification, META_LIMIT)}\``);
+    }
+
+    lines.push("", "### Trace", "");
+    lines.push(`- Intent: ${safe(intent.id, 40)}`);
+    if (intent.commit) lines.push(`- Commit: \`${String(intent.commit).slice(0, 7)}\``);
   }
-  lines.push(
-    "",
-    "---",
-    "_Generated by [Drift](https://github.com/lilcipherx/drift) — Git tracks what changed. Drift tracks why._",
-  );
-  return lines.join("\n");
+  if (truncatedIntents) {
+    lines.push("", `_… and ${intents.length - MAX_INTENTS} more intent(s) not shown._`);
+  }
+  lines.push("", "---", "_Generated by [Drift](https://github.com/lilcipherx/drift) — Git tracks what changed. Drift tracks why._");
+  let body = lines.join("\n");
+  if (body.length > TOTAL_LIMIT) {
+    body = `${body.slice(0, TOTAL_LIMIT)}\n\n_(summary truncated for size)_`;
+  }
+  return body;
 }
 
+// ---------------------------------------------------------------------------
+// Idempotent comment upsert
+// ---------------------------------------------------------------------------
+
 /**
- * Post the comment, or update the existing Drift comment in place
- * (idempotent across `synchronize` deliveries and force-pushes).
+ * Post the comment, or update the FIRST existing Drift comment in place
+ * (idempotent across `synchronize` deliveries). Never posts a duplicate when
+ * a marker comment already exists; never touches comments without the marker.
  */
 export async function upsertComment({ token, repo, issueNumber, body, fetchImpl = fetch }) {
   const headers = {
@@ -76,7 +307,12 @@ export async function upsertComment({ token, repo, issueNumber, body, fetchImpl 
   };
   const list = await fetchImpl(`https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`, { headers });
   if (!list.ok) throw new Error(`list comments: HTTP ${list.status}`);
-  const comments = (await list.json()) ?? [];
+  let comments = [];
+  try {
+    comments = (await list.json()) ?? [];
+  } catch {
+    throw new Error("list comments: malformed API response");
+  }
   const existing = Array.isArray(comments)
     ? comments.find((c) => typeof c?.body === "string" && c.body.includes(SUMMARY_MARKER))
     : undefined;
@@ -95,69 +331,94 @@ export async function upsertComment({ token, repo, issueNumber, body, fetchImpl 
     body: JSON.stringify({ body }),
   });
   if (!res.ok) throw new Error(`post comment: HTTP ${res.status}`);
-  return { action: "commented", id: (await res.json()).id };
+  let posted;
+  try {
+    posted = await res.json();
+  } catch {
+    throw new Error("post comment: malformed API response");
+  }
+  const id = Number(posted?.id);
+  if (!Number.isInteger(id)) throw new Error("post comment: malformed API response");
+  return { action: "commented", id };
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+function appendStepSummary(text) {
+  const path = process.env.GITHUB_STEP_SUMMARY;
+  if (!path) return;
+  try {
+    appendFileSync(path, `${text}\n`);
+  } catch {
+    /* step summary is best-effort */
+  }
 }
 
 async function main() {
-  // Only pull_request events carry a PR number worth commenting on.
-  let prNumber = null;
+  // 1. event
   const eventPath = process.env.GITHUB_EVENT_PATH;
-  if (eventPath && existsSync(eventPath)) {
-    try {
-      prNumber = JSON.parse(readFileSync(eventPath, "utf8"))?.pull_request?.number ?? null;
-    } catch {
-      /* malformed event file — treat as no PR */
-    }
-  }
-  const repo = process.env.GITHUB_REPOSITORY ?? "";
-  const token = process.env.GITHUB_TOKEN ?? "";
-  if (!prNumber || !repo) {
-    console.log("pr-comment: not a pull-request run — skipping");
+  if (!eventPath || !existsSync(eventPath)) {
+    console.log("pr-comment: GITHUB_EVENT_PATH missing or unreadable — skipping");
     return;
   }
-  if (!token) {
-    console.log("pr-comment: GITHUB_TOKEN not set — skipping comment (CI check still ran)");
+  let rawEvent;
+  try {
+    rawEvent = readFileSync(eventPath, "utf8");
+  } catch {
+    console.log("pr-comment: cannot read event file — skipping");
+    return;
+  }
+  const event = parseEvent(rawEvent);
+  if (!event) {
+    console.log("pr-comment: not a pull_request event — skipping");
     return;
   }
 
-  const cli = process.env.DRIFT_CLI || "packages/drift-cli/dist/cli.js";
-  const res = spawnSync(process.execPath, [cli, "log", "--json", "--limit", "20"], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-    env: { ...process.env, NO_COLOR: "1" },
-    windowsHide: true,
-  });
-  if (res.status !== 0) {
-    const msg = (res.stderr || res.stdout || "drift log failed").trim();
-    // A repo that never initialized Drift has nothing to summarize — that is
-    // expected, not an error.
-    if (/Not a Drift repository/.test(msg)) {
-      console.log("pr-comment: no Drift intents in this repository — skipping");
-      return;
-    }
-    console.error(`pr-comment: drift log failed: ${msg}`);
-    process.exitCode = 1;
+  const token = process.env.GITHUB_TOKEN ?? "";
+  if (!token) {
+    console.log("pr-comment: GITHUB_TOKEN not set — skipping comment (CI check still ran)");
+    appendStepSummary("_Drift: GITHUB_TOKEN not set — PR comment skipped._");
     return;
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(res.stdout);
-  } catch {
-    console.error("pr-comment: drift log produced no JSON output");
-    process.exitCode = 1;
+
+  const failOnError = process.env.FAIL_ON_COMMENT_ERROR === "true";
+  const repoRoot = process.env.DRIFT_REPO || process.cwd();
+
+  // 2. PR commit range — never the last N repo-wide intents.
+  const range = prCommitShas(repoRoot, event.baseSha, event.headSha);
+  if (!range.ok || range.shas.length === 0) {
+    console.log(`pr-comment: cannot compute PR commit range (${range.reason}) — skipping`);
+    appendStepSummary(
+      `_Drift: could not compute the pull-request commit range (${range.reason}). Make sure \`actions/checkout\` uses \`fetch-depth: 0\` so base history is available._`,
+    );
     return;
   }
-  const body = buildSummary(parsed?.intents ?? []);
+
+  // 3. intents from PR commits only.
+  const intents = intentsFromCommits({ repoRoot, commits: range.shas });
+  const body = buildSummary(intents);
   if (!body) {
-    console.log("pr-comment: no intents on this PR — skipping comment");
+    console.log("pr-comment: no Drift intents on this PR — nothing to summarize");
+    appendStepSummary("_Drift: no Drift intents on this PR — nothing to summarize._");
     return;
   }
+
+  // 4. The safe summary always lands in the step summary.
+  appendStepSummary(body);
+
+  // 5. Comment (idempotent), degrading gracefully on fork/read-only tokens.
   try {
-    const result = await upsertComment({ token, repo, issueNumber: prNumber, body });
+    const result = await upsertComment({ token, repo: event.repo, issueNumber: event.prNumber, body });
     console.log(`pr-comment: ${result.action} comment #${result.id}`);
   } catch (err) {
-    console.error(`pr-comment: failed to ${err instanceof Error ? err.message : String(err)}`);
-    process.exitCode = 1;
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`pr-comment: warning: could not ${message}`);
+    if (failOnError) {
+      console.error("pr-comment: FAIL_ON_COMMENT_ERROR is set — exiting non-zero");
+      process.exitCode = 1;
+    }
   }
 }
 

@@ -29,7 +29,6 @@ export interface IssueComment {
 export interface GitHubClientLike {
   setInstallation(id: number): void;
   getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
-  getObjectPaths(owner: string, repo: string, ref: string): Promise<string[]>;
   getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
   listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
   postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
@@ -122,18 +121,6 @@ export class GitHubAppClient implements GitHubClientLike {
       path = nextPagePath(res.headers.get("link"));
     }
     return commits;
-  }
-
-  /** All file paths under `.drift/objects/` reachable from `ref`. */
-  async getObjectPaths(owner: string, repo: string, ref: string): Promise<string[]> {
-    const token = await this.getInstallationToken(await this.requireInstallation());
-    const res = await this.request(`/repos/${owner}/${repo}/git/trees/${ref}?recursive=1`, token);
-    if (!res.ok) return []; // no tree (e.g. empty repo) — nothing to index
-    const data = (await res.json()) as { tree?: { path?: string; type?: string }[] };
-    return (data.tree ?? [])
-      .filter((t) => t.type === "blob" && t.path?.startsWith(".drift/objects/") && t.path.endsWith(".json"))
-      .map((t) => t.path!)
-      .sort();
   }
 
   /** Raw UTF-8 content of a file at a ref, or null when absent. */

@@ -56,7 +56,7 @@ export async function handleWebhook(event, deps) {
         if (ids.length === 0) {
             return { handled: true, action: "no-intents", intentsFound: 0 };
         }
-        const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids, deps.masterKey);
+        const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids);
         const commentBody = summarizeIntents({
             owner,
             repo: repoName,

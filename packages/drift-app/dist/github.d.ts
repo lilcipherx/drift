@@ -23,7 +23,6 @@ export interface IssueComment {
 export interface GitHubClientLike {
     setInstallation(id: number): void;
     getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
-    getObjectPaths(owner: string, repo: string, ref: string): Promise<string[]>;
     getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
     listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
     postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
@@ -53,8 +52,6 @@ export declare class GitHubAppClient implements GitHubClientLike {
         title: string;
     }>;
     getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
-    /** All file paths under `.drift/objects/` reachable from `ref`. */
-    getObjectPaths(owner: string, repo: string, ref: string): Promise<string[]>;
     /** Raw UTF-8 content of a file at a ref, or null when absent. */
     getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
     /**

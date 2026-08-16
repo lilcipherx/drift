@@ -21,8 +21,6 @@ export interface WebhookDeps {
   github: GitHubClientLike;
   /** HMAC webhook secret (X-Hub-Signature-256). Undefined ⇒ skip verification. */
   webhookSecret?: string;
-  /** Optional DRIFT_MASTER_KEY to decrypt encrypted prompts. */
-  masterKey?: string;
   /** Disable check-run creation (comment-only mode). */
   checkRun?: boolean;
   /** Build the summary without writing anything (dev --dry-run). */
@@ -96,7 +94,7 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
       return { handled: true, action: "no-intents", intentsFound: 0 };
     }
 
-    const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids, deps.masterKey);
+    const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids);
 
     const commentBody = summarizeIntents({
       owner,

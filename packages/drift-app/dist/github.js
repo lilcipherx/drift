@@ -83,18 +83,6 @@ export class GitHubAppClient {
         }
         return commits;
     }
-    /** All file paths under `.drift/objects/` reachable from `ref`. */
-    async getObjectPaths(owner, repo, ref) {
-        const token = await this.getInstallationToken(await this.requireInstallation());
-        const res = await this.request(`/repos/${owner}/${repo}/git/trees/${ref}?recursive=1`, token);
-        if (!res.ok)
-            return []; // no tree (e.g. empty repo) — nothing to index
-        const data = (await res.json());
-        return (data.tree ?? [])
-            .filter((t) => t.type === "blob" && t.path?.startsWith(".drift/objects/") && t.path.endsWith(".json"))
-            .map((t) => t.path)
-            .sort();
-    }
     /** Raw UTF-8 content of a file at a ref, or null when absent. */
     async getFileContent(owner, repo, path, ref) {
         const token = await this.getInstallationToken(await this.requireInstallation());

@@ -1,8 +1,10 @@
 /**
- * Build the semantic PR summary comment from intents (PRD §16.2, §26.3):
- * "Review intent, not 2,000 lines of diff."
+ * Build the semantic PR summary comment from SAFE public intent views
+ * (ADR-009). Never receives or renders `prompt` — the full prompt is private
+ * and must never appear in a PR comment or check-run summary.
  */
 
+import { sanitizePublicText } from "@drift/core";
 import type { IntentView } from "./intents.js";
 
 /**
@@ -21,60 +23,73 @@ export interface SummaryInput {
   repoUrl?: string;
 }
 
-const TRUNCATE = 140;
+/** Hard caps so a pathological PR can never produce a huge comment. */
+const MAX_INTENTS = 10;
+const MAX_FILES = 10;
+const SUMMARY_LIMIT = 500;
+const META_LIMIT = 120;
 
-function truncate(text: string): string {
-  if (text.length <= TRUNCATE) return text;
-  return `${text.slice(0, TRUNCATE - 1)}…`;
-}
-
-/** Escape `|` so untrusted paths/summaries cannot break the markdown table. */
-function escCell(text: string | null | undefined): string {
-  return String(text ?? "").replace(/\|/g, "\\|");
+/** Sanitize + clamp a value for public rendering. */
+function safe(text: string | null | undefined, limit: number): string {
+  const cleaned = sanitizePublicText(String(text ?? "")).replace(/`/g, "");
+  return cleaned.length <= limit ? cleaned : `${cleaned.slice(0, limit - 1)}…`;
 }
 
 export function summarizeIntents(input: SummaryInput): string {
-  const { intents } = input;
-  const authors = new Set(intents.map((i) => `${i.authorId} (${i.authorType})`));
+  const intents = input.intents.slice(0, MAX_INTENTS);
+  const truncated = input.intents.length > MAX_INTENTS;
   const lines: string[] = [];
 
   lines.push(SUMMARY_MARKER);
-  lines.push(`## 🤖 Drift intent summary`);
+  lines.push("## Drift — Why this changed");
   lines.push("");
-  lines.push(
-    `${intents.length} intent${intents.length === 1 ? "" : "s"} on this PR · ` +
-      `${authors.size} author${authors.size === 1 ? "" : "s"}` +
-      (input.repoUrl ? ` · [open in Drift](${input.repoUrl})` : ""),
-  );
+  lines.push(`${intents.length} intent${intents.length === 1 ? "" : "s"} on this PR · ${input.prTitle ? safe(input.prTitle, 80) : ""}`);
 
   for (const intent of intents) {
     lines.push("");
-    lines.push(`### Intent \`${intent.id.slice(0, 8)}…\``);
+    lines.push(`### Intent \`${safe(intent.id, 12)}\``);
     lines.push("");
-    const meta = [
-      `**Author:** \`${intent.authorId}\` (${intent.authorType})`,
-      intent.model ? `**Model:** \`${intent.model}\`` : null,
-      intent.signature ? "**Signature:** ✍ Ed25519" : null,
-      intent.encryptedPrompt ? "**Prompt:** 🔒 encrypted" : null,
-    ].filter(Boolean);
-    if (meta.length) lines.push(meta.join(" · "));
-    lines.push("");
-    lines.push(`> ${truncate(intent.prompt || "_(no prompt recorded)_")}`);
+    lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+
+    const meta: string[] = [];
+    if (intent.authorId) meta.push(safe(intent.authorId, META_LIMIT));
+    if (intent.authorType && intent.authorType !== "unknown") meta.push(`(${safe(intent.authorType, 16)})`);
+    if (intent.model) meta.push(`model ${safe(intent.model, META_LIMIT)}`);
+    if (intent.signature) meta.push("✓ signed");
+    if (meta.length > 0) {
+      lines.push("");
+      lines.push("### Generated with");
+      lines.push("");
+      lines.push(meta.join(" · "));
+    }
 
     if (intent.files.length > 0) {
       lines.push("");
-      lines.push("| File | Change |");
-      lines.push("| --- | --- |");
-      for (const f of intent.files.slice(0, 12)) {
-        lines.push(`| \`${escCell(f.path)}\` | **${f.mutationType}** — ${escCell(f.summary) || "changed"} |`);
-      }
-      if (intent.files.length > 12) {
-        lines.push(`| … | +${intent.files.length - 12} more |`);
-      }
-    } else {
+      lines.push("### Affected code");
       lines.push("");
-      lines.push("_No semantic delta recorded (intent object not found — was `.drift/` committed?)._");
+      for (const f of intent.files.slice(0, MAX_FILES)) {
+        const detail = f.summary ? ` — ${safe(f.summary, 90)}` : "";
+        lines.push(`- \`${safe(f.path, 200)}\` (**${safe(f.mutationType, 16)}**)${detail}`);
+      }
+      if (intent.files.length > MAX_FILES) lines.push(`- … +${intent.files.length - MAX_FILES} more`);
     }
+
+    if (intent.verifyCmd) {
+      lines.push("");
+      lines.push("### Verification");
+      lines.push("");
+      lines.push(`- \`${safe(intent.verifyCmd, META_LIMIT)}\``);
+    }
+
+    lines.push("");
+    lines.push("### Trace");
+    lines.push("");
+    lines.push(`- Intent: ${safe(intent.id, 40)}`);
+  }
+
+  if (truncated) {
+    lines.push("");
+    lines.push(`_… and ${input.intents.length - MAX_INTENTS} more intent(s) not shown._`);
   }
 
   lines.push("");

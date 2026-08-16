@@ -1,6 +1,7 @@
 /**
- * Build the semantic PR summary comment from intents (PRD §16.2, §26.3):
- * "Review intent, not 2,000 lines of diff."
+ * Build the semantic PR summary comment from SAFE public intent views
+ * (ADR-009). Never receives or renders `prompt` — the full prompt is private
+ * and must never appear in a PR comment or check-run summary.
  */
 import type { IntentView } from "./intents.js";
 /**
