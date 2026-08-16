@@ -198,7 +198,7 @@ server.registerTool(
   {
     title: "Drift Blame",
     description:
-      'Ask "why does this function exist?" — returns the originating prompt, model and intent for a line or function.',
+      'Ask "why does this function exist?" — returns the safe public summary, model and intent for a line or function (never the private prompt).',
     inputSchema: {
       file: z.string(),
       line: z.number().int().positive().optional().describe("1-based line number"),
@@ -237,7 +237,7 @@ server.registerTool(
   {
     title: "Drift Log",
     description:
-      "List recorded intents (ID, author, model, prompt, files) with optional filters.",
+      "List recorded intents (ID, author, model, public summary, files) with optional filters. The full private prompt is never returned.",
     inputSchema: {
       author: z.string().optional(),
       model: z.string().optional(),

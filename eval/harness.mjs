@@ -163,7 +163,9 @@ function runScenario(scenario) {
     }
     if (step.tool === "drift_blame" && step.expect.baseline === false) {
       blamePromptTotal++;
-      if (ok && actual.json?.intent && lastRealizePrompt !== null && actual.json.intent.prompt === lastRealizePrompt) {
+      // ADR-009: blame exposes the safe public `summary`, never the private
+      // prompt. Short eval prompts roundtrip 1:1 into the summary.
+      if (ok && actual.json?.intent && lastRealizePrompt !== null && actual.json.intent.summary === lastRealizePrompt) {
         blamePromptHits++;
       }
     }
