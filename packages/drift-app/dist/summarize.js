@@ -20,6 +20,16 @@ function safe(text, limit) {
     const cleaned = sanitizePublicText(String(text ?? "")).replace(/`/g, "");
     return cleaned.length <= limit ? cleaned : `${cleaned.slice(0, limit - 1)}…`;
 }
+/** Human label for a manifest signature/trust state (never the raw prompt). */
+const SIGNATURE_LABELS = {
+    valid: "✓ signed (trusted repository key)",
+    invalid: "⚠ invalid signature",
+    unsigned: "no signature",
+    unverifiable: "⚠ unverifiable (no verification key)",
+    "untrusted-key": "⚠ unverified — signed with a different key than the base branch",
+    bootstrap: "unverified bootstrap (base branch has no Drift key yet)",
+    missing: "⚠ public provenance manifest missing",
+};
 export function summarizeIntents(input) {
     const intents = input.intents.slice(0, MAX_INTENTS);
     const truncated = input.intents.length > MAX_INTENTS;
@@ -32,7 +42,17 @@ export function summarizeIntents(input) {
         lines.push("");
         lines.push(`### Intent \`${safe(intent.id, 12)}\``);
         lines.push("");
-        lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+        if (intent.missingManifest) {
+            lines.push("_(public provenance manifest missing — summary is a generic fallback)_");
+        }
+        else {
+            lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+        }
+        const trust = SIGNATURE_LABELS[intent.signatureState];
+        if (trust) {
+            lines.push("");
+            lines.push(`_${trust}_`);
+        }
         const meta = [];
         if (intent.authorId)
             meta.push(safe(intent.authorId, META_LIMIT));
@@ -40,8 +60,6 @@ export function summarizeIntents(input) {
             meta.push(`(${safe(intent.authorType, 16)})`);
         if (intent.model)
             meta.push(`model ${safe(intent.model, META_LIMIT)}`);
-        if (intent.signature)
-            meta.push("✓ signed");
         if (meta.length > 0) {
             lines.push("");
             lines.push("### Generated with");

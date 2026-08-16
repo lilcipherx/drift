@@ -1,10 +1,15 @@
 /**
  * Read `Drift-Intent: <id>` trailers from pull request commits (git-trailer
  * aligned) and hydrate the SAFE public provenance from
- * `.drift/public/intents/<id>.json` at the PR head (ADR-009).
+ * `.drift/public/intents/<id>.json` (ADR-009).
  *
  * Private data (prompts, `objects/`, `drift.db`) is never read here and
  * never rendered: comments show only the public summary + metadata.
+ *
+ * Trust model: manifests are verified against the BASE-branch public key —
+ * the PR head key is untrusted until a controlled rotation. A PR that
+ * replaces `.drift/public/key.pem` is detected and its provenance is marked
+ * unverified, never silently trusted.
  */
 
 import { canonicalJson, extractDriftIntentIds, verifyPayload } from "@drift/core";
@@ -16,16 +21,44 @@ export interface IntentFileView {
   summary: string | null;
 }
 
+/**
+ * Signature/trust state of a manifest against the base-branch trust root:
+ *   valid           — verifies against the base key.
+ *   invalid         — a signature exists but does not verify against base/head.
+ *   unsigned        — no signature recorded.
+ *   unverifiable    — no verification material available.
+ *   untrusted-key   — verifies only against a PR-replaced key (rotation).
+ *   bootstrap       — base branch has no Drift key (initial adoption).
+ *   missing         — no manifest found.
+ */
+export type SignatureState =
+  | "valid"
+  | "invalid"
+  | "unsigned"
+  | "unverifiable"
+  | "untrusted-key"
+  | "bootstrap"
+  | "missing";
+
 export interface IntentView {
   id: string;
   authorType: string;
   authorId: string;
   model: string | null;
-  /** Safe public summary — the ONLY prompt-derived text ever rendered. */
+  /**
+   * Safe public summary — the ONLY prompt-derived text ever rendered. When a
+   * manifest is missing, a generic non-prompt fallback (`Drift intent <id>`)
+   * is used; the commit subject is NEVER used (legacy `full`-mode subjects may
+   * contain a complete private prompt).
+   */
   summary: string;
   verifyCmd: string | null;
   files: IntentFileView[];
+  /** True only when the manifest is validly signed by the base trust root. */
   signature: boolean;
+  signatureState: SignatureState;
+  /** True when no public manifest exists for this intent. */
+  missingManifest: boolean;
 }
 
 /** Extract unique, valid Drift-Intent ids referenced by a set of commits. */
@@ -54,9 +87,30 @@ interface LoadedManifest {
 }
 
 /**
- * Load the public manifests referenced by a PR. Falls back to the commit
- * message subject as the summary when the manifest is missing (e.g. an
- * intent realized before ADR-009, or `.drift/public` not committed).
+ * Resolve the signature/trust state of a manifest against the trusted base
+ * key and the (untrusted) PR-head key.
+ */
+function signatureStateFor(
+  manifest: LoadedManifest | null,
+  baseKey: string | null,
+  headKey: string | null,
+): SignatureState {
+  if (!manifest) return "missing";
+  if (!manifest.signature) return "unsigned";
+  if (!baseKey && !headKey) return "unverifiable";
+  if (baseKey && verifyManifestSignature(manifest, baseKey)) return "valid";
+  if (headKey && verifyManifestSignature(manifest, headKey)) {
+    return baseKey ? "untrusted-key" : "bootstrap";
+  }
+  if (!baseKey) return "bootstrap";
+  return "invalid";
+}
+
+/**
+ * Load the public manifests referenced by a PR and verify them against the
+ * BASE-branch trust root (`baseRef`). When `baseRef` is omitted (tests, or a
+ * payload without base info) the head key is used with state "bootstrap" —
+ * callers should always pass the base SHA in production.
  */
 export async function fetchIntents(
   github: GitHubClientLike,
@@ -65,6 +119,7 @@ export async function fetchIntents(
   ref: string,
   commits: PullCommit[],
   ids: string[],
+  baseRef?: string,
 ): Promise<IntentView[]> {
   if (ids.length === 0) return [];
 
@@ -77,52 +132,54 @@ export async function fetchIntents(
       const parsed = JSON.parse(raw) as LoadedManifest;
       if (parsed && parsed.id === id) loaded.set(id, parsed);
     } catch {
-      // malformed manifest — fall back to the commit subject
+      // malformed manifest — treated as missing (generic fallback below)
     }
   }
 
-  // Public key for signature verification (when committed).
-  let publicKey: string | null = null;
-  const keyRaw = await github.getFileContent(owner, repo, ".drift/public/key.pem", ref);
-  if (keyRaw && keyRaw.includes("PUBLIC KEY")) publicKey = keyRaw.trim();
-
-  // subject fallback: map each intent id to the commit that introduced it
-  const subjectByIntent = new Map<string, string>();
-  for (const commit of commits) {
-    for (const id of extractDriftIntentIds(commit.message)) {
-      if (!subjectByIntent.has(id)) {
-        subjectByIntent.set(id, commit.message.split("\n")[0] ?? "");
-      }
-    }
-  }
+  // Trust root: the BASE-branch public key (never the untrusted PR head key).
+  const baseRefToUse = baseRef ?? ref;
+  const baseKey = await readKey(github, owner, repo, baseRefToUse);
+  // The head key is only used to DETECT a key replacement / rotation.
+  const headKey = ref === baseRefToUse ? baseKey : await readKey(github, owner, repo, ref);
 
   const views: IntentView[] = [];
   for (const id of ids) {
-    const manifest = loaded.get(id);
+    const manifest = loaded.get(id) ?? null;
+    const state = signatureStateFor(manifest, baseKey, headKey);
     views.push({
       id,
       authorType: manifest?.agent?.type ?? "unknown",
       authorId: manifest?.agent?.identifier ?? "unknown",
       model: manifest?.model ?? null,
-      summary: manifest?.summary ?? subjectByIntent.get(id) ?? "",
+      summary: manifest?.summary ?? `Drift intent ${id}`,
       verifyCmd: manifest?.verification ?? null,
       files: (manifest?.files ?? []).map((f) => ({
         path: f.path ?? "?",
         mutationType: f.mutationType ?? "MODIFIED",
         summary: f.summary ?? null,
       })),
-      signature:
-        Boolean(manifest?.signature) &&
-        Boolean(publicKey) &&
-        verifyManifestSignature(manifest as LoadedManifest & { id: string }, publicKey as string),
+      signature: state === "valid",
+      signatureState: state,
+      missingManifest: manifest === null,
     });
   }
   return views;
 }
 
-/** Verify a manifest's Ed25519 signature against the committed public key. */
+async function readKey(
+  github: GitHubClientLike,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<string | null> {
+  const keyRaw = await github.getFileContent(owner, repo, ".drift/public/key.pem", ref);
+  if (keyRaw && keyRaw.includes("PUBLIC KEY")) return keyRaw.trim();
+  return null;
+}
+
+/** Verify a manifest's Ed25519 signature against a PEM public key. */
 function verifyManifestSignature(
-  manifest: LoadedManifest & { id: string },
+  manifest: LoadedManifest,
   publicKey: string,
 ): boolean {
   const { signature, ...unsigned } = manifest;

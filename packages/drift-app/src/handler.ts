@@ -94,15 +94,31 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
       return { handled: true, action: "no-intents", intentsFound: 0 };
     }
 
-    const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids);
+    // Trust root: verify head-branch manifests against the BASE-branch public
+    // key. The PR head key is untrusted until a controlled rotation.
+    const baseSha = (payload.pull_request as { base?: { sha?: string } } | undefined)?.base?.sha;
+    const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids, baseSha);
 
-    const commentBody = summarizeIntents({
+    let commentBody = summarizeIntents({
       owner,
       repo: repoName,
       prNumber,
       prTitle: pr?.title ?? "",
       intents,
     });
+
+    // A PR that replaces .drift/public/key.pem is never silently trusted.
+    if (baseSha) {
+      const baseKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", baseSha);
+      const headKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", headSha);
+      const keyChanged =
+        Boolean(baseKey) && Boolean(headKey) && (baseKey as string).trim() !== (headKey as string).trim();
+      if (keyChanged) {
+        commentBody =
+          "⚠ **Warning: this pull request changes the Drift public signing key (.drift/public/key.pem).** New provenance on this PR is marked unverified until a controlled key-rotation process is approved.\n\n" +
+          commentBody;
+      }
+    }
 
     // Idempotent write: update the existing Drift comment when present,
     // otherwise post a new one.

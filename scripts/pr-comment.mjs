@@ -24,6 +24,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createPublicKey, verify as nodeVerify } from "node:crypto";
 import { readFileSync, existsSync, appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
@@ -190,35 +191,99 @@ export function readManifest(repoRoot, id) {
   }
 }
 
+/** Read a file's content at a git ref (`git show ref:path`), or null. */
+export function getFileAt(repoRoot, ref, path, gitImpl = git) {
+  const res = gitImpl(repoRoot, ["show", `${ref}:${path}`]);
+  if (res.status !== 0) return null;
+  return res.stdout;
+}
+
+/** Key-order-stable JSON stringify (mirrors @drift/core canonicalJson). */
+export function canonicalJson(value) {
+  const sort = (v) => {
+    if (Array.isArray(v)) return v.map(sort);
+    if (v !== null && typeof v === "object") {
+      const out = {};
+      for (const k of Object.keys(v).sort()) out[k] = sort(v[k]);
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(sort(value));
+}
+
+/** Verify a manifest's Ed25519 signature against a PEM public key. */
+export function verifyManifestSignature(manifest, publicKeyPem) {
+  if (!manifest || typeof manifest !== "object") return false;
+  if (typeof manifest.signature !== "string" || !manifest.signature) return false;
+  if (typeof publicKeyPem !== "string" || !publicKeyPem.includes("PUBLIC KEY")) return false;
+  const { signature, ...unsigned } = manifest;
+  try {
+    const key = createPublicKey(publicKeyPem.trim());
+    return nodeVerify(
+      null,
+      Buffer.from(canonicalJson(unsigned), "utf8"),
+      key,
+      Buffer.from(signature, "base64"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the signature/trust state of one manifest against the TRUSTED base
+ * key and the PR-head key (which is untrusted until a controlled rotation):
+ *   valid           — verifies against the base-branch trust root.
+ *   invalid         — a signature exists but verifies against neither key.
+ *   unsigned        — no signature recorded.
+ *   unverifiable    — no verification material available (no base key).
+ *   untrusted-key   — verifies ONLY against a PR-replaced key (rotation).
+ *   bootstrap       — base has no Drift key at all (initial adoption).
+ */
+export function signatureStateFor(manifest, { baseKey, headKey }) {
+  if (!manifest) return "missing";
+  if (typeof manifest.signature !== "string" || !manifest.signature) return "unsigned";
+  if (!baseKey && !headKey) return "unverifiable";
+  if (baseKey && verifyManifestSignature(manifest, baseKey)) return "valid";
+  if (headKey && verifyManifestSignature(manifest, headKey)) {
+    return baseKey ? "untrusted-key" : "bootstrap";
+  }
+  if (!baseKey) return "bootstrap";
+  return "invalid";
+}
+
 /**
  * Walk PR commits, collect their intent ids (in order, deduped), hydrate from
- * `.drift/public/intents/` and fall back to the introducing commit subject.
+ * `.drift/public/intents/`. When a public manifest is missing the summary is
+ * a generic NON-PROMPT fallback (`Drift intent <id>`) — the commit subject is
+ * never used, because in legacy `full`-mode commits the subject may contain a
+ * complete private prompt.
  */
 export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManifestImpl = readManifest }) {
   const ids = [];
   const seen = new Set();
-  const intro = new Map(); // intent id -> { subject, sha }
+  const intro = new Map(); // intent id -> sha (first PR commit referencing it)
   for (const sha of commits) {
     const res = gitImpl(repoRoot, ["log", "-1", "--format=%B", sha]);
     if (res.status !== 0) continue;
     const message = res.stdout;
-    const subject = (String(message).split("\n")[0] ?? "").trim();
     for (const id of extractDriftIntentIds(message, gitImpl, repoRoot)) {
       if (!seen.has(id)) {
         seen.add(id);
         ids.push(id);
       }
-      if (!intro.has(id)) intro.set(id, { subject, sha });
+      if (!intro.has(id)) intro.set(id, sha);
     }
   }
 
   const intents = [];
   for (const id of ids) {
     const manifest = readManifestImpl(repoRoot, id);
-    const fromCommit = intro.get(id);
     intents.push({
       id,
-      summary: manifest?.summary ?? fromCommit?.subject ?? "",
+      summary: manifest?.summary ?? `Drift intent ${id}`,
+      missingManifest: !manifest,
       model: manifest?.model ?? null,
       authorId: manifest?.agent?.identifier ?? null,
       authorType: manifest?.agent?.type ?? null,
@@ -230,7 +295,7 @@ export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManif
             summary: f?.summary ?? null,
           }))
         : [],
-      commit: fromCommit?.sha ?? manifest?.commit ?? null,
+      commit: intro.get(id) ?? (manifest && typeof manifest.commit === "string" ? manifest.commit : null),
     });
   }
   return intents;
@@ -239,6 +304,17 @@ export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManif
 // ---------------------------------------------------------------------------
 // Comment building (safe public data only)
 // ---------------------------------------------------------------------------
+
+/** Human label for a manifest signature/trust state (never the raw prompt). */
+const SIGNATURE_LABELS = {
+  valid: "✓ signed (trusted repository key)",
+  invalid: "⚠ invalid signature",
+  unsigned: "no signature",
+  unverifiable: "⚠ unverifiable (no verification key)",
+  "untrusted-key": "⚠ unverified — signed with a different key than the base branch",
+  bootstrap: "unverified bootstrap (base branch has no Drift key yet)",
+  missing: "⚠ public provenance manifest missing",
+};
 
 /** Build the summary comment body. Returns null when there is nothing to say. */
 export function buildSummary(intents) {
@@ -249,7 +325,14 @@ export function buildSummary(intents) {
   lines.push(`${shown.length} intent${shown.length === 1 ? "" : "s"} on this PR`);
   for (const intent of shown) {
     lines.push("", `### Intent \`${safe(intent.id, 12)}\``, "");
-    lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+    if (intent.missingManifest) {
+      lines.push("_(public provenance manifest missing — summary is a generic fallback)_");
+    } else {
+      lines.push(safe(intent.summary, SUMMARY_LIMIT) || "_(no public summary recorded)_");
+    }
+    if (intent.signatureState) {
+      lines.push("", `_${SIGNATURE_LABELS[intent.signatureState] ?? "signature status unknown"}_`);
+    }
 
     const meta = [];
     if (intent.authorId) meta.push(safe(intent.authorId, META_LIMIT));
@@ -398,11 +481,31 @@ async function main() {
 
   // 3. intents from PR commits only.
   const intents = intentsFromCommits({ repoRoot, commits: range.shas });
+
+  // 3b. Trust-root verification (ADR-009 PR key policy): manifests are
+  // verified against the BASE-branch key — the PR head key is untrusted until
+  // a controlled rotation. A PR that replaces .drift/public/key.pem is never
+  // silently trusted.
+  const baseKey = getFileAt(repoRoot, event.baseSha, ".drift/public/key.pem");
+  const headKey = getFileAt(repoRoot, "HEAD", ".drift/public/key.pem");
+  const keyChanged =
+    Boolean(baseKey) && Boolean(headKey) && baseKey.trim() !== headKey.trim();
+  for (const intent of intents) {
+    const manifest = readManifest(repoRoot, intent.id);
+    intent.signatureState = signatureStateFor(manifest, { baseKey, headKey });
+  }
   const body = buildSummary(intents);
   if (!body) {
     console.log("pr-comment: no Drift intents on this PR — nothing to summarize");
     appendStepSummary("_Drift: no Drift intents on this PR — nothing to summarize._");
     return;
+  }
+
+  // 3c. A PR that modifies the public trust root must be prominent.
+  if (keyChanged) {
+    appendStepSummary(
+      "⚠ **Warning: this pull request changes the Drift public signing key (.drift/public/key.pem).** New provenance on this PR is marked unverified until a controlled key-rotation process is approved.",
+    );
   }
 
   // 4. The safe summary always lands in the step summary.
