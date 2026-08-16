@@ -19,7 +19,7 @@ compatible). Every command below was **run**, not assumed._
 | CLI help | `drift --help` | ✅ shows `init` / `status` / `realize` / `log` / `blame` / `context` / `verify` / `replay` / `doctor` / `export` / `verify-intent` |
 | First-run | `drift status` before init | ✅ `Not a Drift repository yet. Next: drift init` (exit 1) |
 | Init + status | `drift init` → `drift status` | ✅ reports intents 0, `prompt mode: commit-summary`, `encryption: off`, branch @ short sha, next steps |
-| Privacy default | `drift realize -p "…"` | ✅ git commit message = `Intent: <first line>` + trailers; `.drift/public/intents/<id>.json` carries only the sanitized first-line summary; a unique secret marker is absent from `git log --all -p`, `git grep`, `git ls-tree -r HEAD` and default `--json` |
+| Privacy default | `drift realize -p "one-line secret…"` (no `--summary`) | ✅ git commit message = `Intent: Drift intent did_…` generic fallback + trailers — prompt text is never copied into history; a one-line raw prompt with a unique marker is absent from `git log --all -p`, `git grep`, `git ls-tree -r HEAD`, tracked files and default `--json` |
 | Storage safety | `git add .` after `drift init` | ✅ only `.drift/.gitignore`, `config.toml`, `public/**` are staged — `drift.db`, `objects/`, `keys/` never (ADR-009, tested with `git check-ignore`) |
 | Fresh clone | clone → `drift log` / `blame` / `verify-intent` | ✅ serves from committed public manifests without the private DB; prompt unavailable, no crash |
 | PR scope | `scripts/pr-comment.mjs` on a synthetic base/head | ✅ only `merge-base(base,head)..head` intents; base and unrelated-branch intents excluded; comment sanitized, size-limited, idempotent (update-in-place) |
@@ -99,7 +99,7 @@ Next:
   drift init
   (creates .drift/ — SQLite intent store, config, signing key)
 
-$ git log -1 --format=%B   # after `drift realize -p "Add logout flow…"`
+$ git log -1 --format=%B   # after `drift realize -p "…" --summary "Add logout flow…"`
 Intent: Add logout flow with session cleanup
 
 Model: claude-3-5-sonnet

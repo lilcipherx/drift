@@ -29,7 +29,7 @@ Every command accepts `--json` for machine-readable output and `--no-color`
 | :--- | :--- |
 | `drift init` | Create `.drift/` in the current git repo (SQLite DAG, `config.toml`, Ed25519 keypair). Idempotent. |
 | `drift status` | Show repo state — intents, head, prompt mode, encryption, git branch — and the next step. Friendly before `init`. |
-| `drift realize -p "<prompt>" [files...]` | Stage + commit changes with an intent. Rejects broken syntax (exit 2) before anything is committed. |
+| `drift realize -p "<prompt>" [--summary "<public text>"] [files...]` | Stage + commit changes with an intent. Rejects broken syntax (exit 2) before anything is committed. |
 | `drift log [--author a] [--model m] [--file f] [--limit n]` | List intents. |
 | `drift blame <file> --line N \| --function NAME` | Map a line/function to the intent that created it. |
 | `drift context <file> [--limit n]` | Last intents touching a file (reasoning ground for agents). |
@@ -44,7 +44,8 @@ Every command accepts `--json` for machine-readable output and `--no-color`
 
 | Flag | Meaning |
 | :--- | :--- |
-| `-p, --prompt <text>` | The intent: what changed and why (required). |
+| `-p, --prompt <text>` | The intent: what changed and why (required). **Private** — never leaves the local `.drift` store by default. |
+| `--summary <text>` | **Public** summary for the intent: redacted, sanitized, truncated; appears in git history, manifests, `log`/`blame`, PR comments. If omitted, a generic non-prompt fallback (`Drift intent did_…`) is used — the prompt is never copied. |
 | `--agent` | Mark the intent as authored by an agent. |
 | `--model <name>` | Model identifier (implies `--agent`), e.g. `claude-3-5-sonnet`. |
 | `--state <b64>` | base64 JSON cognitive state to checkpoint for `replay`. |
@@ -132,14 +133,16 @@ Controls how (and whether) the **full prompt** is persisted:
 
 | Mode | Full prompt in `.drift` (gitignored, local) | Public data in git history |
 | :--- | :---: | :--- |
-| `commit-summary` (default) | ✅ | `Intent:` first line (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers; sanitized first-line summary in the signed `.drift/public/intents/<id>.json` manifest |
+| `commit-summary` (default) | ✅ | `Intent:` <public summary> (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers; explicit summary (or generic fallback) in the signed `.drift/public/intents/<id>.json` manifest |
 | `full` | ✅ | full (redacted) prompt in the commit message — legacy, visibly unsafe |
-| `none` | ❌ (empty) | generic `Intent recorded` subject, empty manifest summary — nothing derived from the prompt |
+| `none` | ❌ (empty) | generic `Intent recorded` subject, empty manifest summary unless an explicit `--summary` is passed — nothing derived from the prompt |
 
-> The summary is derived from the **already-redacted** prompt, so a secret in
-> the first line is `[REDACTED]` before it can reach the commit message. For
-> a one-line prompt, `commit-summary`'s `Intent:` line *is* that line — use
-> `none` if even that must never appear.
+> The public summary is **never derived from the prompt** (ADR-009): pass
+> `drift realize --summary "safe public text"` for a meaningful summary, or
+> get a generic `Drift intent did_…` fallback. The summary is redacted first
+> (a secret in `--summary` becomes `[REDACTED]` before it can reach the
+> commit message), sanitized and truncated. A one-line prompt never appears
+> in git history.
 >
 > `drift init` writes a `.drift/.gitignore` that makes `.drift/public/` the
 > only trackable Drift data (ADR-009) — `git add .` can never stage the

@@ -65,7 +65,8 @@ Verified empirically with `git check-ignore` / `git add -A`: `drift.db`,
 type PublicIntentView = {
   schemaVersion: 1;
   id: string;
-  summary: string;        // redacted → sanitized → truncated (500 chars)
+  summary: string;        // explicit --summary (redacted → sanitized → truncated)
+                          // or a generic non-prompt fallback; NEVER prompt text
   model?: string;
   agent?: { type: "HUMAN" | "AGENT"; identifier: string };
   verification?: string;  // verify command metadata
@@ -76,10 +77,14 @@ type PublicIntentView = {
 };
 ```
 
-The `summary` is derived **only** from the already-redacted prompt, then stripped of
-control characters / ANSI escapes, HTML-comment markers and mention-spam tokens, and
-truncated. In `none` prompt mode the summary is empty (nothing derived from the
-prompt may persist anywhere).
+The `summary` is **never derived from the prompt** — the first line of a one-line
+prompt would otherwise be copied verbatim into git history. It comes from an
+explicit `drift realize --summary "…"` (redacted first, then stripped of control
+characters / ANSI escapes, HTML-comment markers and mention-spam tokens, and
+truncated to 200 chars) or, when omitted, a generic non-prompt fallback such as
+`Drift intent did_abcd1234 (3 files)` built only from the intent id and file count.
+In `none` prompt mode the summary is empty unless an explicit `--summary` is given
+(nothing derived from the prompt may persist anywhere).
 
 ### Why Option B over Option A (trailers)?
 
@@ -152,9 +157,15 @@ Both integrations switch to the same canonical source:
 - Removing files from the index does not remove them from old commits; repositories
   that already committed prompts must treat that history as exposed and rotate
   affected secrets.
-- The public summary is derived from the redacted prompt and truncated; it is not a
-  substitute for the full prompt (which stays local-only by default).
-- `none` mode keeps prompts out of everything, but public manifests then carry no
-  summary.
+- The public summary is an explicit user-supplied string (or a generic fallback),
+  redacted, sanitized and truncated; it is not a substitute for the full prompt
+  (which stays local-only by default). Without an explicit `--summary`, the summary
+  is deliberately generic so prompt text can never leak into history.
+- `none` mode keeps prompts out of everything; public manifests carry a summary only
+  when the user explicitly passes `--summary`.
+- Running `drift init` on a fresh clone regenerates the local signing key (the
+  private key never leaves the origin machine), so previously committed signatures
+  verify as `valid` before init (against the committed public key) and report
+  `invalid` after init — never falsely `valid` with a new key.
 - Fresh-clone `drift blame`/`log` can only show what the public manifest recorded
   (no private agent state, no prompt).

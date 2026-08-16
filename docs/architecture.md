@@ -80,15 +80,17 @@ What lands in public git history is configurable per-repo
 
 | Mode | `.drift` store (private) | Git commit message | Public manifest (`public/intents/<id>.json`) |
 | :--- | :--- | :--- | :--- |
-| `commit-summary` (**default**) | full (redacted) prompt | `Intent:` first line (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers | sanitized first-line summary + model/agent/files/verification, signed |
+| `commit-summary` (**default**) | full (redacted) prompt | `Intent:` <public summary> (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers | explicit summary (or generic fallback) + model/agent/files/verification, signed |
 | `full` | full (redacted) prompt | full (redacted) prompt (legacy behaviour — visibly unsafe, opt-in) | same as above |
-| `none` | nothing | generic `Intent recorded` subject + trailers only | empty summary (nothing derived from the prompt) |
+| `none` | nothing | generic `Intent recorded` subject + trailers only | empty summary unless an explicit `--summary` is given |
 
-The summary is computed **after** secret redaction and is **only the first
-line** of the redacted prompt (sanitized, truncated), so a multi-paragraph
-prompt can never fit into git history. Encryption at rest applies on top of
-any mode. The mode affects only new intents — history is never rewritten.
-`drift status` reports the active mode.
+The public summary is **never derived from the prompt** (ADR-009): it comes
+from an explicit `drift realize --summary "…"` (redacted, sanitized,
+truncated) or a generic non-prompt fallback like `Drift intent did_… (2
+files)`. The first line of a one-line prompt would otherwise be copied
+verbatim into git history. Encryption at rest applies on top of any mode.
+The mode affects only new intents — history is never rewritten. `drift
+status` reports the active mode.
 
 ## Encryption at rest (v0.2.0)
 

@@ -41,10 +41,10 @@ node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "Add login flow wi
 commit**), redacts secrets from your prompt, computes the AST delta, signs the
 intent, stores it in `.drift/objects/`, and commits with a `Drift-Intent: <id>`
 trailer. **By default the raw prompt stays in the private, gitignored
-`.drift/` store** — only the first line of the redacted prompt is public
-(ADR-009) —
-the git commit message carries only a safe `Intent:` / `Model:` /
-`Verification:` summary (see `[prompts] mode` in
+`.drift/` store** (ADR-009). What is public is your explicit `--summary` — or a
+generic `Drift intent did_…` fallback — never the prompt itself: pass
+`drift realize --summary "Add login flow with validation" -p "…"` to make
+`log`/`blame`/PR comments meaningful (see `[prompts] mode` in
 [api.md](api.md#configuration-driftconfigtoml)).
 
 ## 4. See the "why"

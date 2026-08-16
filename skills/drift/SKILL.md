@@ -31,10 +31,12 @@ drift realize -p "<prompt: what and why>" --agent --model <model>
 - `--verify-cmd "<cmd>"` records a verification command re-run by `drift verify`.
 - **Prompt storage** is controlled by `[prompts] mode` in `.drift/config.toml`:
   `commit-summary` (default — the raw prompt stays in the private, gitignored
-  `.drift/` store; only the first line of the redacted prompt is public),
-  `full` (prompt also in the commit message — legacy, unsafe), `none` (prompt
-  stored nowhere). `drift log`/`blame` return the safe public `summary` by
-  default; the private prompt needs `--include-private-prompt`.
+  `.drift/` store), `full` (prompt also in the commit message — legacy,
+  unsafe), `none` (prompt stored nowhere). The **public summary is never
+  derived from the prompt** (ADR-009): pass `--summary "safe public text"`
+  or get a generic `Drift intent did_…` fallback. `drift log`/`blame` return
+  the safe public `summary` by default; the private prompt needs
+  `--include-private-prompt`.
 
 ## blame / context — trace intent
 
