@@ -248,38 +248,48 @@ export async function fetchIntents(
 const INTENT_FILE_RE = /^did_[0-9a-f]{32}\.json$/;
 
 /**
- * Bounded per-PR audit limits (issue 8): manifests are compared by exact
- * content, never by filename presence alone, and the audit never inspects
- * more than `MAX_AUDITED_MANIFESTS` files or more than
- * `MAX_TOTAL_PROVENANCE_BYTES_PER_PR` total content. These same limits are
- * documented for the Action in `scripts/pr-comment.mjs` and in SECURITY.md.
+ * Bounded PER-PR audit limits. These apply ONLY to public provenance files
+ * CHANGED or INSPECTED by the current pull request — never to the repository's
+ * accumulated history. A repository with a million unchanged historical
+ * manifests must still allow an ordinary source-only PR without loading any
+ * of them. The Action documents the same semantics in SECURITY.md.
  */
-export const MAX_AUDITED_MANIFESTS = 200;
-export const MAX_TOTAL_PROVENANCE_BYTES_PER_PR = 50 * 1024 * 1024;
+export const MAX_CHANGED_PUBLIC_FILES_PER_PR = 200;
+export const MAX_TOTAL_CHANGED_PROVENANCE_BYTES_PER_PR = 50 * 1024 * 1024;
+
+const PUBLIC_INTENTS_PREFIX = ".drift/public/intents/";
+
+/** Extract the manifest id from a `.drift/public/intents/<id>.json` path. */
+function manifestIdFromPath(path: string): string | null {
+  const m = /^\.drift\/public\/intents\/(did_[0-9a-f]{32})\.json$/.exec(path);
+  return m ? (m[1] as string) : null;
+}
 
 /**
- * Audit EVERY change under `.drift/public/intents/` on the PR — not just
- * trailer-derived intents. A PR can tamper with existing provenance without
- * adding any `Drift-Intent:` trailer; that must be a FAILING condition, not
- * invisible. Rules (ADR-009 append-only model):
+ * Audit ONLY the public provenance CHANGED by this pull request — via the
+ * paginated Pull Request Files API as the primary changed-path source. A PR
+ * can tamper with existing provenance without adding any `Drift-Intent:`
+ * trailer; that must be a FAILING condition, not invisible. Rules (ADR-009
+ * append-only model):
  *
- *   unchanged          → file exists on base AND head with byte-identical
- *                        content — NOT a modification (presence alone is
- *                        never evidence of tampering; issue 4).
- *   modified           → exists on both sides with DIFFERENT content.
- *   deleted / renamed  → violation (append-only).
  *   added manifest     → orphan when NO PR commit references the id; the
  *                        introducing commit (the first PR commit where the
  *                        file exists) must carry exactly ONE matching
- *                        `Drift-Intent:` trailer; the head content must be
- *                        byte-identical to the introduction content — a
- *                        manifest added and then modified later in the same
- *                        PR ("added-then-modified") is a violation.
+ *                        `Drift-Intent:` trailer (intro-mismatch otherwise);
+ *                        the head content must be byte-identical to the
+ *                        introduction content (added-then-modified =
+ *                        `mutated` violation).
+ *   modified manifest  → violation (append-only).
+ *   deleted manifest   → violation (append-only).
+ *   renamed manifest   → violation (append-only).
  *   trailer for an id whose manifest exists on the base branch → replay.
  *   one id referenced by >1 distinct PR commit → ambiguous association.
  *
- * The result feeds `deriveProvenanceConclusion` so any integrity break fails
- * the Check Run (never silently green).
+ * Unchanged historical manifests are NEVER enumerated or compared: they are
+ * not in the changed-files response and therefore cannot produce a violation.
+ * Limits apply to changed files only; an incomplete changed-files listing
+ * (pagination cap hit) is reported as a violation, never inferred as "no
+ * public changes".
  */
 export async function auditProvenanceIntegrity(
   github: GitHubClientLike,
@@ -294,8 +304,8 @@ export async function auditProvenanceIntegrity(
   const replayIds: string[] = [];
   const ambiguousIds: string[] = [];
 
-  // How many PR commits reference each id, and which commits (atomic
-  // association requires exactly ONE referencing commit).
+  // Which PR commits reference each id (atomic association requires exactly
+  // ONE referencing commit).
   const refCommits = new Map<string, string[]>();
   for (const commit of commits) {
     for (const id of extractDriftIntentIds(commit.message)) {
@@ -305,33 +315,87 @@ export async function auditProvenanceIntegrity(
     }
   }
 
-  // File lists at base vs head (missing dirs → empty).
-  const baseFiles = await github.listDirectory(owner, repo, ".drift/public/intents", baseSha);
-  const headFiles = await github.listDirectory(owner, repo, ".drift/public/intents", headSha);
-  const baseSet = new Set(baseFiles.filter((f) => INTENT_FILE_RE.test(f)));
-  const headSet = new Set(headFiles.filter((f) => INTENT_FILE_RE.test(f)));
-  const audited = Math.max(baseSet.size, headSet.size);
-  if (audited > MAX_AUDITED_MANIFESTS) {
+  // PRIMARY SOURCE: the paginated PR changed-files listing. Incomplete
+  // pagination must fail safely — a partial listing is never treated as "no
+  // public changes".
+  const { files, truncated } = await github.getPullFiles(owner, repo, prNumber);
+  if (truncated) {
     violations.push({
       code: "modified",
       id: "(audit)",
-      detail: `more than ${MAX_AUDITED_MANIFESTS} public manifests on this PR — bounded audit`,
+      detail: "the changed-files listing is incomplete (pagination cap) — audit cannot conclude",
     });
     return { violations, replayIds, ambiguousIds };
   }
 
-  // Existing manifests are CONTENT-compared: same bytes on base and head ⇒
-  // unchanged; different bytes ⇒ modified. Filename presence alone is never
-  // proof of modification (issue 4).
-  const manifestPath = (name: string) => `.drift/public/intents/${name}`;
-  let totalBytes = 0;
-  for (const name of headSet) {
-    const id = name.slice(0, -".json".length);
-    const headRaw = await github.getFileContent(owner, repo, manifestPath(name), headSha);
-    if (headRaw !== null) totalBytes += Buffer.byteLength(headRaw, "utf8");
-    if (baseSet.has(name)) {
-      const baseRaw = await github.getFileContent(owner, repo, manifestPath(name), baseSha);
-      if (baseRaw === headRaw) continue; // byte-identical ⇒ unchanged
+  // Changed public-provenance paths only (key.pem is evaluated separately by
+  // the trust-root change detection — it is not an integrity violation).
+  const changed = files.filter(
+    (f) => f.filename.startsWith(PUBLIC_INTENTS_PREFIX) || (f.previous_filename ?? "").startsWith(PUBLIC_INTENTS_PREFIX),
+  );
+  if (changed.length > MAX_CHANGED_PUBLIC_FILES_PER_PR) {
+    violations.push({
+      code: "modified",
+      id: "(audit)",
+      detail: `more than ${MAX_CHANGED_PUBLIC_FILES_PER_PR} public provenance files changed by this PR — bounded audit`,
+    });
+    return { violations, replayIds, ambiguousIds };
+  }
+
+  let totalChangedBytes = 0;
+  for (const f of changed) {
+    const id = manifestIdFromPath(f.filename);
+    const oldId = manifestIdFromPath(f.previous_filename ?? "");
+    const status = f.status;
+    if (status === "renamed") {
+      violations.push({
+        code: "renamed",
+        id: oldId ?? id ?? f.filename,
+        detail: `${f.previous_filename ?? "?"} → ${f.filename}`,
+      });
+      continue;
+    }
+    if (!id) continue; // non-manifest public file (e.g. key.pem) — handled elsewhere
+    const headRaw = await github.getFileContent(owner, repo, f.filename, headSha);
+    if (headRaw !== null) totalChangedBytes += Buffer.byteLength(headRaw, "utf8");
+    if (status === "added") {
+      const refs = refCommits.get(id) ?? [];
+      if (refs.length === 0) {
+        violations.push({
+          code: "orphan",
+          id,
+          detail: "new public manifest added without any Drift-Intent trailer on this PR",
+        });
+        continue;
+      }
+      if (refs.length > 1) {
+        ambiguousIds.push(id);
+        continue;
+      }
+      const introSha = await introductionCommit(github, owner, repo, f.filename, commits, headSha);
+      if (!introSha) {
+        violations.push({ code: "orphan", id, detail: "could not determine the manifest's introducing commit" });
+        continue;
+      }
+      if (introSha !== refs[0]) {
+        violations.push({
+          code: "intro-mismatch",
+          id,
+          detail: `manifest introduced by ${introSha.slice(0, 7)} but its Drift-Intent trailer is on ${refs[0]!.slice(0, 7)} — the introducing commit must carry exactly one matching trailer`,
+        });
+        continue;
+      }
+      const introRaw = await github.getFileContent(owner, repo, f.filename, introSha);
+      if (introRaw !== headRaw) {
+        violations.push({
+          code: "mutated",
+          id,
+          detail: "manifest was modified after it was introduced in the same pull request (added-then-modified)",
+        });
+      }
+      continue;
+    }
+    if (status === "modified") {
       violations.push({
         code: "modified",
         id,
@@ -339,76 +403,24 @@ export async function auditProvenanceIntegrity(
       });
       continue;
     }
-    // Added manifest: find its introducing commit (the first PR commit where
-    // the file exists) and require atomic association.
-    const refs = refCommits.get(id) ?? [];
-    if (refs.length === 0) {
-      violations.push({
-        code: "orphan",
-        id,
-        detail: "new public manifest added without any Drift-Intent trailer on this PR",
-      });
-      continue;
-    }
-    if (refs.length > 1) {
-      ambiguousIds.push(id);
-      continue;
-    }
-    const introSha = await introductionCommit(github, owner, repo, manifestPath(name), commits, headSha);
-    if (!introSha) {
-      violations.push({ code: "orphan", id, detail: "could not determine the manifest's introducing commit" });
-      continue;
-    }
-    if (introSha !== refs[0]) {
-      violations.push({
-        code: "intro-mismatch",
-        id,
-        detail: `manifest introduced by ${introSha.slice(0, 7)} but its Drift-Intent trailer is on ${refs[0]!.slice(0, 7)} — the introducing commit must carry exactly one matching trailer`,
-      });
-      continue;
-    }
-    const introRaw = await github.getFileContent(owner, repo, manifestPath(name), introSha);
-    if (introRaw !== headRaw) {
-      violations.push({
-        code: "mutated",
-        id,
-        detail: "manifest was modified after it was introduced in the same pull request (added-then-modified)",
-      });
-    }
-  }
-  for (const name of baseSet) {
-    if (!headSet.has(name)) {
-      const id = name.slice(0, -".json".length);
+    if (status === "deleted") {
       violations.push({ code: "deleted", id, detail: "an existing public manifest must not be deleted by a pull request" });
     }
   }
-  if (totalBytes > MAX_TOTAL_PROVENANCE_BYTES_PER_PR) {
+  if (totalChangedBytes > MAX_TOTAL_CHANGED_PROVENANCE_BYTES_PER_PR) {
     violations.push({
       code: "modified",
       id: "(audit)",
-      detail: `total provenance content on this PR exceeds ${MAX_TOTAL_PROVENANCE_BYTES_PER_PR} bytes — bounded audit`,
+      detail: `total provenance content changed by this PR exceeds ${MAX_TOTAL_CHANGED_PROVENANCE_BYTES_PER_PR} bytes — bounded audit`,
     });
   }
 
-  // Renames via the PR files API (status "renamed").
-  const files = await github.getPullFiles(owner, repo, prNumber);
-  for (const f of files) {
-    if (f.status !== "renamed") continue;
-    const movedInto =
-      f.filename.startsWith(".drift/public/intents/") || (f.previous_filename ?? "").startsWith(".drift/public/intents/");
-    if (movedInto) {
-      violations.push({
-        code: "renamed",
-        id: (f.previous_filename ?? f.filename).split("/").pop() ?? "",
-        detail: `${f.previous_filename ?? "?"} → ${f.filename}`,
-      });
-    }
-  }
-
   // Replay: a PR commit references an intent whose manifest already exists
-  // on the base branch.
+  // on the base branch. Checked per trailer id (bounded by trailer count) —
+  // never by enumerating the repository's full manifest history.
   for (const id of refCommits.keys()) {
-    if (baseSet.has(`${id}.json`)) replayIds.push(id);
+    const baseRaw = await github.getFileContent(owner, repo, `.drift/public/intents/${id}.json`, baseSha);
+    if (baseRaw !== null) replayIds.push(id);
   }
 
   return { violations, replayIds, ambiguousIds };

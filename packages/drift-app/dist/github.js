@@ -87,6 +87,7 @@ export class GitHubAppClient {
         const token = await this.getInstallationToken(await this.requireInstallation());
         const files = [];
         let path = `/repos/${owner}/${repo}/pulls/${number}/files?per_page=100`;
+        let truncated = false;
         for (let page = 0; path && page < 20; page++) {
             const res = await this.request(path, token);
             if (!res.ok)
@@ -99,7 +100,13 @@ export class GitHubAppClient {
             })));
             path = nextPagePath(res.headers.get("link"));
         }
-        return files;
+        // Reaching the page cap with a next link still present means the response
+        // is INCOMPLETE — the caller must treat the audit as incomplete (a
+        // security policy that never infers "no public changes" from a partial
+        // listing).
+        if (path && path.length > 0)
+            truncated = true;
+        return { files, truncated };
     }
     /** File NAMES in a directory at a ref ([] when the dir does not exist). */
     async listDirectory(owner, repo, path, ref) {

@@ -33,13 +33,19 @@ export interface PullFile {
     status: string;
     previous_filename?: string;
 }
+export interface PullFilesResult {
+    files: PullFile[];
+    /** True when pagination hit its cap before all files were fetched — the
+     *  audit must then report itself INCOMPLETE instead of assuming success. */
+    truncated: boolean;
+}
 export interface GitHubClientLike {
     setInstallation(id: number): void;
     /** The configured GitHub App id (for exact comment-ownership matching). */
     getAppId(): string | null;
     getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
     /** All changed files of the PR (paginated, so PRs with >100 files work). */
-    getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
+    getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult>;
     getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
     /** File NAMES in a directory at a ref ([] when the dir does not exist). */
     listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
@@ -71,7 +77,7 @@ export declare class GitHubAppClient implements GitHubClientLike {
         title: string;
     }>;
     getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
-    getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
+    getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult>;
     /** File NAMES in a directory at a ref ([] when the dir does not exist). */
     listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
     /** Raw UTF-8 content of a file at a ref, or null when absent. */

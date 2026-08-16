@@ -35,13 +35,20 @@ export interface PullFile {
   previous_filename?: string;
 }
 
+export interface PullFilesResult {
+  files: PullFile[];
+  /** True when pagination hit its cap before all files were fetched — the
+   *  audit must then report itself INCOMPLETE instead of assuming success. */
+  truncated: boolean;
+}
+
 export interface GitHubClientLike {
   setInstallation(id: number): void;
   /** The configured GitHub App id (for exact comment-ownership matching). */
   getAppId(): string | null;
   getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
   /** All changed files of the PR (paginated, so PRs with >100 files work). */
-  getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]>;
+  getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult>;
   getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
   /** File NAMES in a directory at a ref ([] when the dir does not exist). */
   listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
@@ -138,10 +145,11 @@ export class GitHubAppClient implements GitHubClientLike {
     return commits;
   }
 
-  async getPullFiles(owner: string, repo: string, number: number): Promise<PullFile[]> {
+  async getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult> {
     const token = await this.getInstallationToken(await this.requireInstallation());
     const files: PullFile[] = [];
     let path: string | null = `/repos/${owner}/${repo}/pulls/${number}/files?per_page=100`;
+    let truncated = false;
     for (let page = 0; path && page < 20; page++) {
       const res = await this.request(path, token);
       if (!res.ok) throw new Error(`getPullFiles failed: ${res.status}`);
@@ -159,7 +167,12 @@ export class GitHubAppClient implements GitHubClientLike {
       );
       path = nextPagePath(res.headers.get("link"));
     }
-    return files;
+    // Reaching the page cap with a next link still present means the response
+    // is INCOMPLETE — the caller must treat the audit as incomplete (a
+    // security policy that never infers "no public changes" from a partial
+    // listing).
+    if (path && path.length > 0) truncated = true;
+    return { files, truncated };
   }
 
   /** File NAMES in a directory at a ref ([] when the dir does not exist). */

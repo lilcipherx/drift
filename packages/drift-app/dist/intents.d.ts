@@ -98,37 +98,39 @@ export declare function signatureStateFor(loaded: LoadedManifest, baseKey: strin
  */
 export declare function fetchIntents(github: GitHubClientLike, owner: string, repo: string, ref: string, commits: PullCommit[], ids: string[], baseRef?: string): Promise<IntentView[]>;
 /**
- * Bounded per-PR audit limits (issue 8): manifests are compared by exact
- * content, never by filename presence alone, and the audit never inspects
- * more than `MAX_AUDITED_MANIFESTS` files or more than
- * `MAX_TOTAL_PROVENANCE_BYTES_PER_PR` total content. These same limits are
- * documented for the Action in `scripts/pr-comment.mjs` and in SECURITY.md.
+ * Bounded PER-PR audit limits. These apply ONLY to public provenance files
+ * CHANGED or INSPECTED by the current pull request — never to the repository's
+ * accumulated history. A repository with a million unchanged historical
+ * manifests must still allow an ordinary source-only PR without loading any
+ * of them. The Action documents the same semantics in SECURITY.md.
  */
-export declare const MAX_AUDITED_MANIFESTS = 200;
-export declare const MAX_TOTAL_PROVENANCE_BYTES_PER_PR: number;
+export declare const MAX_CHANGED_PUBLIC_FILES_PER_PR = 200;
+export declare const MAX_TOTAL_CHANGED_PROVENANCE_BYTES_PER_PR: number;
 /**
- * Audit EVERY change under `.drift/public/intents/` on the PR — not just
- * trailer-derived intents. A PR can tamper with existing provenance without
- * adding any `Drift-Intent:` trailer; that must be a FAILING condition, not
- * invisible. Rules (ADR-009 append-only model):
+ * Audit ONLY the public provenance CHANGED by this pull request — via the
+ * paginated Pull Request Files API as the primary changed-path source. A PR
+ * can tamper with existing provenance without adding any `Drift-Intent:`
+ * trailer; that must be a FAILING condition, not invisible. Rules (ADR-009
+ * append-only model):
  *
- *   unchanged          → file exists on base AND head with byte-identical
- *                        content — NOT a modification (presence alone is
- *                        never evidence of tampering; issue 4).
- *   modified           → exists on both sides with DIFFERENT content.
- *   deleted / renamed  → violation (append-only).
  *   added manifest     → orphan when NO PR commit references the id; the
  *                        introducing commit (the first PR commit where the
  *                        file exists) must carry exactly ONE matching
- *                        `Drift-Intent:` trailer; the head content must be
- *                        byte-identical to the introduction content — a
- *                        manifest added and then modified later in the same
- *                        PR ("added-then-modified") is a violation.
+ *                        `Drift-Intent:` trailer (intro-mismatch otherwise);
+ *                        the head content must be byte-identical to the
+ *                        introduction content (added-then-modified =
+ *                        `mutated` violation).
+ *   modified manifest  → violation (append-only).
+ *   deleted manifest   → violation (append-only).
+ *   renamed manifest   → violation (append-only).
  *   trailer for an id whose manifest exists on the base branch → replay.
  *   one id referenced by >1 distinct PR commit → ambiguous association.
  *
- * The result feeds `deriveProvenanceConclusion` so any integrity break fails
- * the Check Run (never silently green).
+ * Unchanged historical manifests are NEVER enumerated or compared: they are
+ * not in the changed-files response and therefore cannot produce a violation.
+ * Limits apply to changed files only; an incomplete changed-files listing
+ * (pagination cap hit) is reported as a violation, never inferred as "no
+ * public changes".
  */
 export declare function auditProvenanceIntegrity(github: GitHubClientLike, owner: string, repo: string, prNumber: number, commits: PullCommit[], baseSha: string, headSha: string): Promise<ProvenanceAudit>;
 //# sourceMappingURL=intents.d.ts.map
