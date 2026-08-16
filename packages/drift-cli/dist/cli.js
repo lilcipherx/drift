@@ -188,8 +188,17 @@ function run(argv) {
                     console.log(colorize(!noColor, "green", "✓ Drift repository"));
                     console.log(`  repo:        ${result.repoRoot}`);
                     console.log(`  intents:     ${result.intents ?? 0}`);
-                    console.log(`    public:    ${result.publicIntents ?? 0} (committed provenance)`);
-                    console.log(`    local:     ${result.localIntents ?? 0} (private store)`);
+                    console.log(`    committed public intents: ${result.publicIntents ?? 0}`);
+                    console.log(`    local legacy records:    ${result.localIntents ?? 0}`);
+                    const diag = result.associationDiagnostics;
+                    const provenanceErrors = (result.malformedManifests?.length ?? 0) +
+                        (diag?.trailerWithoutManifest.length ?? 0) +
+                        (diag?.ambiguous.length ?? 0) +
+                        (diag?.replayed.length ?? 0) +
+                        (diag?.duplicateTrailers.length ?? 0);
+                    console.log(provenanceErrors > 0
+                        ? colorize(!noColor, "yellow", `    provenance errors:  ${provenanceErrors}`)
+                        : `    provenance errors:  ${provenanceErrors}`);
                     if (result.lastIntent) {
                         console.log(`  last intent: ${result.lastIntent.id} (${new Date(result.lastIntent.timestamp).toISOString().slice(0, 19).replace("T", " ")})`);
                     }
@@ -205,6 +214,28 @@ function run(argv) {
                             const first = m.errors[0];
                             console.error(colorize(!noColor, "yellow", `  warning: malformed public manifest .drift/public/intents/${m.id}.json (${first?.field}: ${first?.message})`));
                         }
+                    }
+                    if (result.associationDiagnostics) {
+                        const d = result.associationDiagnostics;
+                        const problems = [];
+                        if (d.trailerWithoutManifest.length > 0) {
+                            problems.push(`${d.trailerWithoutManifest.length} trailer-without-manifest (${d.trailerWithoutManifest.join(", ")})`);
+                        }
+                        if (d.ambiguous.length > 0)
+                            problems.push(`${d.ambiguous.length} ambiguous (${d.ambiguous.join(", ")})`);
+                        if (d.replayed.length > 0)
+                            problems.push(`${d.replayed.length} replayed (${d.replayed.join(", ")})`);
+                        if (d.duplicateTrailers.length > 0)
+                            problems.push(`${d.duplicateTrailers.length} duplicate-trailer (${d.duplicateTrailers.join(", ")})`);
+                        if (d.orphanManifests.length > 0)
+                            problems.push(`${d.orphanManifests.length} orphan-manifest`);
+                        console.log(problems.length > 0
+                            ? colorize(!noColor, "yellow", `  association diagnostics: ${problems.join("; ")} — inspect with \`drift log --json\``)
+                            : `  associations: ${result.intentAssociations?.unique ?? 0} unique, ${result.intentAssociations?.missing ?? 0} missing`);
+                    }
+                    else if (result.intentAssociations) {
+                        const a = result.intentAssociations;
+                        console.log(`  associations: ${a.unique} unique, ${a.missing} missing`);
                     }
                     const branch = result.gitBranch ?? "(detached)";
                     console.log(`  git:         ${branch} @ ${result.gitHead ?? "?"}${result.gitDirty ? " (uncommitted changes)" : " (clean)"}`);
@@ -283,13 +314,25 @@ function run(argv) {
                 else {
                     printTable([
                         ["ID", "AUTHOR", "MODEL", "TIME", "SUMMARY"],
-                        ...entries.map((e) => [
-                            e.id,
-                            `${e.authorId}(${e.authorType})`,
-                            e.model ?? "-",
-                            new Date(e.timestamp).toISOString().slice(0, 19).replace("T", " "),
-                            (includePrompt ? e.prompt : e.summary ?? "").slice(0, 60),
-                        ]),
+                        ...entries.map((e) => {
+                            // Ambiguous/replayed/duplicate trailer associations are a
+                            // provenance red flag — never silently collapse them to one
+                            // commit in human output.
+                            const flag = e.association?.state === "ambiguous"
+                                ? " ⚠ambiguous"
+                                : e.association?.state === "replayed"
+                                    ? " ⚠replayed"
+                                    : e.association?.state === "duplicate-in-commit"
+                                        ? " ⚠duplicate-trailer"
+                                        : "";
+                            return [
+                                `${e.id}${flag}`,
+                                `${e.authorId}(${e.authorType})`,
+                                e.model ?? "-",
+                                new Date(e.timestamp).toISOString().slice(0, 19).replace("T", " "),
+                                (includePrompt ? e.prompt : e.summary ?? "").slice(0, 60),
+                            ];
+                        }),
                     ]);
                 }
                 return EXIT.OK;
@@ -312,6 +355,7 @@ function run(argv) {
                         gitSha: result.gitSha,
                         committed: result.committed,
                         baseline: result.baseline,
+                        ...(result.association ? { association: result.association } : {}),
                         intent: result.intent
                             ? {
                                 ...omitKey(result.intent, "prompt"),
@@ -325,6 +369,10 @@ function run(argv) {
                     console.log(`${colorize(!noColor, "bold", result.file)}:${result.line}${result.functionName ? ` (${result.functionName})` : ""}`);
                     if (!result.committed) {
                         console.log(colorize(!noColor, "yellow", "  uncommitted change — not yet part of any intent"));
+                    }
+                    else if (result.association?.state === "ambiguous") {
+                        console.log(colorize(!noColor, "yellow", `  commit association: ambiguous — ${result.association.candidates?.length ?? 0} intents touch this file; no single intent is presented as the reason`));
+                        console.log(colorize(!noColor, "yellow", `    candidates: ${(result.association.candidates ?? []).join(", ")}`));
                     }
                     else if (result.baseline) {
                         console.log(colorize(!noColor, "yellow", "  pre-Drift baseline (no intent recorded)"));

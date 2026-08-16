@@ -4,7 +4,7 @@
  */
 import { type ASTDelta } from "@drift/ast";
 import { type DriftConfig, type PromptMode } from "./config.js";
-import { type IntentRecord, type LogEntry } from "./store.js";
+import { type IntentCommitAssociation, type IntentRecord, type LogEntry } from "./store.js";
 import { type ManifestValidationError } from "./public.js";
 /**
  * Environment allowlist for `drift verify --run`. Repository-provided
@@ -53,6 +53,19 @@ export interface BlameResult {
         summary: string;
     }) | null;
     baseline: boolean;
+    /**
+     * Structured commit→intent association for the blamed commit:
+     *   unique    — exactly one manifest candidate after file filtering.
+     *   ambiguous — more than one candidate touches the blamed file (no
+     *               arbitrary first intent is presented).
+     *   missing   — no manifest candidate touches the blamed file (baseline /
+     *               legacy local-only intent).
+     */
+    association?: {
+        state: "unique" | "ambiguous" | "missing";
+        commit?: string;
+        candidates?: string[];
+    };
 }
 export interface VerifyResult {
     intentId: string;
@@ -104,7 +117,7 @@ export interface InitResult {
  *   missing  — neither key present.
  *   mismatch — private key present but does NOT match the trust root.
  */
-export type SignerState = "ready" | "read-only" | "missing" | "mismatch";
+export type SignerState = "ready" | "read-only" | "missing" | "mismatch" | "malformed";
 /**
  * Cryptographic trust state of an intent's signature:
  *   valid        — verifies against the trusted repository public key.
@@ -156,6 +169,46 @@ export interface DriftStatus {
     publicProvenance?: boolean;
     /** Whether verification material (committed public key) is available. */
     verificationMaterial?: boolean;
+    /**
+     * Structured intent→commit association counts over every id referenced by a
+     * Drift-Intent trailer, plus public manifests with no trailer (missing). A
+     * non-zero ambiguous/replayed/duplicate count is a provenance red flag that
+     * must be surfaced, never silently mapped to one commit. Counts cover
+     * resolved associations only — trailer-only orphans are in
+     * `associationDiagnostics.trailerWithoutManifest`, never in `unique`.
+     */
+    intentAssociations?: {
+        unique: number;
+        missing: number;
+        ambiguous: number;
+        replayed: number;
+        duplicate: number;
+    };
+    /**
+     * Per-id provenance anomalies, exposed SEPARATELY from valid intents so
+     * diagnostics never inflate `publicIntents` / `intents`:
+     *   trailerWithoutManifest — a Drift-Intent trailer with no manifest, no
+     *                            local record and no malformed file on disk.
+     *   orphanManifests         — a valid manifest that no trailer references
+     *                            (V1 legacy manifests are the normal case).
+     *   ambiguous               — id referenced by >1 reachable commits, no
+     *                            manifest to establish the introduction.
+     *   replayed                — id referenced by a later commit after its
+     *                            original introduction.
+     *   duplicateTrailers       — id repeated >1× within a single commit.
+     *   malformedManifests      — tracked manifests failing strict validation.
+     */
+    associationDiagnostics?: {
+        trailerWithoutManifest: string[];
+        orphanManifests: string[];
+        ambiguous: string[];
+        replayed: string[];
+        duplicateTrailers: string[];
+        malformedManifests: {
+            id: string;
+            errors: ManifestValidationError[];
+        }[];
+    };
 }
 export declare class Drift {
     readonly repoRoot: string;
@@ -275,14 +328,33 @@ export declare class Drift {
      * (legacy pre-ADR-009) intents are kept so old repos keep working.
      */
     /**
-     * Canonical intent → commit association, derived ONLY from `Drift-Intent:`
-     * git trailers (never from an unverified manifest field). `byId` maps each
-     * intent id to the FIRST commit that references it (newest-first log order,
-     * i.e. the introducing commit). `byCommit` maps each commit to all ids its
-     * message references. Used by log, context, blame, status, export and the
-     * fresh-clone paths so every consumer shares one resolver.
+     * Deterministic intent → commit associations, derived ONLY from
+     * `Drift-Intent:` git trailers (never from an unverified manifest field or
+     * a "first value wins" map). Scans ALL trailers in chronological order
+     * (oldest first) so the introduction is always the oldest reference:
+     *
+     *   zero references      → missing
+     *   one reference        → unique
+     *   >1 distinct commits  → replayed when a committed public manifest
+     *                          establishes the introduction (oldest reference
+     *                          is the original), else ambiguous
+     *   duplicate trailer lines inside ONE commit → duplicate metadata
+     *
+     * `byCommit` (commit → referenced ids, deduplicated) is still exposed for
+     * consumers that map a commit to its intents (blame, context).
      */
     private intentCommitIndex;
+    /** Structured association for one intent id (unique/missing/duplicate-in-commit/ambiguous/replayed). */
+    intentCommitAssociation(id: string): IntentCommitAssociation;
+    /**
+     * The full deterministic intent→commit association map (MCP / JSON
+     * consumers). Keys: every id referenced by a `Drift-Intent:` trailer on a
+     * commit reachable from HEAD. Never silently collapses ambiguous, replayed
+     * or duplicate-in-commit ids to one commit.
+     */
+    intentAssociations(): Map<string, IntentCommitAssociation>;
+    /** The single authoritative commit for an id when one exists (intro first). */
+    private commitFor;
     /**
      * Public manifests referenced by a commit's `Drift-Intent:` trailers. Falls
      * back to the V1 embedded `commit` field only when no trailer-derived match

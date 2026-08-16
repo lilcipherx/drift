@@ -2,7 +2,7 @@
  * The Drift engine: orchestrates every command. Used by the CLI and wrapped
  * by the SDK. The MCP server delegates here through the CLI (PRD §11 contract).
  */
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, } from "node:fs";
 import { createPublicKey } from "node:crypto";
 import { dirname, isAbsolute, join, relative as relPath, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -14,7 +14,8 @@ import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitEx
 import { IntentStore } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
 import { buildPublicSummary, genericPublicSummary, PUBLIC_FILES_MAX, PublicStore, signingKeyIdFor, } from "./public.js";
-import { extractDriftIntentIds } from "./trailers.js";
+import { DRIFT_INTENT_ID_RE, extractDriftIntentIds, extractDriftIntentIdsRaw } from "./trailers.js";
+import { parseTrustRoot, tryParseTrustRoot } from "./trust-root.js";
 /** Default timeout for a `drift verify --run` verification command (ms). */
 const VERIFY_TIMEOUT_MS = 120_000;
 /**
@@ -151,6 +152,16 @@ export class Drift {
     deriveKeyState() {
         const committedPub = this.publicStore.publicKey();
         const keyPath = join(this.driftDir, "keys", "ed25519.pem");
+        // A strict parse is the ONLY key-identity source: a malformed committed
+        // trust root must never be treated as a usable (read-only) key with a
+        // fallback fingerprint.
+        const rootState = committedPub ? parseTrustRoot(committedPub) : { state: "absent" };
+        if (rootState.state === "malformed") {
+            this.privateKeyPem = "";
+            this.publicKeyPem = committedPub ?? "";
+            this.signerState = "malformed";
+            return;
+        }
         if (!existsSync(keyPath)) {
             this.privateKeyPem = "";
             this.publicKeyPem = committedPub ?? "";
@@ -252,6 +263,11 @@ export class Drift {
         const privateExists = existsSync(keyPath);
         let publicKeyPem;
         let signerState;
+        // A malformed committed trust root is a security state, not a cosmetic
+        // one: refuse to bootstrap a signer against it (no fallback identity).
+        if (committedPub && parseTrustRoot(committedPub).state === "malformed") {
+            throw new DriftError(`.drift/public/key.pem exists but is not a valid Drift public key — the repository trust root is malformed. Fix or remove it (e.g. re-import the correct key with \`drift key import --file <path>\`) before running drift init.`, EXIT.KEY);
+        }
         if (committedPub && privateExists) {
             const privateKeyPem = readFileSync(keyPath, "utf8");
             const derived = publicKeyFromPrivate(privateKeyPem).trim();
@@ -309,6 +325,9 @@ export class Drift {
         const committedPub = this.publicStore.publicKey();
         if (!committedPub) {
             throw new DriftError("No committed public trust root (.drift/public/key.pem) in this repository. Run `drift init` in a new repository first — there is nothing for this key to match.", EXIT.KEY);
+        }
+        if (parseTrustRoot(committedPub).state === "malformed") {
+            throw new DriftError(`.drift/public/key.pem is not a valid Drift public key — the repository trust root is malformed. Fix or remove it before importing a signing key.`, EXIT.KEY);
         }
         const pem = readFileSync(resolve(privateKeyFilePath), "utf8");
         let derived;
@@ -382,11 +401,66 @@ export class Drift {
             // Committed public manifests are canonical (ADR-009): an empty local
             // store (e.g. right after `drift init` in a fresh clone) must never
             // shadow them, so `intents` is the MERGED count, with the public and
-            // local-only parts reported separately.
-            const { errors: manifestErrors } = drift.publicStore.listWithErrors();
-            const publicIntents = drift.publicStore.list().length;
+            // local-only parts reported separately. ONLY strictly valid committed
+            // public manifests count as public intents; trailer-only ids,
+            // malformed/orphan manifests and ambiguous/replayed/duplicate
+            // associations are diagnostics, never valid intents.
+            const { views: validViews, errors: manifestErrors } = drift.publicStore.listWithErrors();
+            const publicIntents = validViews.length;
             const localIntents = drift.store ? drift.store.allRows().length : 0;
             const publicProvenance = drift.publicStore.exists();
+            // Structured trailer-derived associations over EVERY id referenced by a
+            // Drift-Intent trailer (ambiguous/replayed/duplicate-in-commit must be
+            // visible, never collapsed — including ambiguous ORPHAN ids that have
+            // no manifest and therefore no log entry).
+            const { byId: associationMap } = drift["intentCommitIndex"]();
+            const validIds = new Set(validViews.map((v) => v.id));
+            const malformedIds = new Set(manifestErrors.map((e) => e.id));
+            const localIds = new Set(drift.store ? drift.store.allRows().map((r) => r.id) : []);
+            // Per-id diagnostics — these are NEVER counted as valid intents.
+            const diagnostics = {
+                trailerWithoutManifest: [],
+                orphanManifests: [],
+                ambiguous: [],
+                replayed: [],
+                duplicateTrailers: [],
+                malformedManifests: manifestErrors,
+            };
+            for (const [id, assoc] of associationMap) {
+                if (assoc.state === "ambiguous")
+                    diagnostics.ambiguous.push(id);
+                else if (assoc.state === "replayed")
+                    diagnostics.replayed.push(id);
+                else if (assoc.state === "duplicate-in-commit") {
+                    diagnostics.duplicateTrailers.push(id);
+                    if (!validIds.has(id) && !localIds.has(id) && !malformedIds.has(id)) {
+                        diagnostics.trailerWithoutManifest.push(id);
+                    }
+                }
+                else if (assoc.state === "unique") {
+                    // unique trailer ref, but no valid manifest / local record /
+                    // malformed manifest on disk → a trailer pointing at nothing.
+                    if (!validIds.has(id) && !localIds.has(id) && !malformedIds.has(id)) {
+                        diagnostics.trailerWithoutManifest.push(id);
+                    }
+                }
+            }
+            // Orphan manifests: a valid public manifest that NO trailer references
+            // (V1 legacy manifests are the normal case).
+            for (const view of validViews) {
+                if (!associationMap.has(view.id))
+                    diagnostics.orphanManifests.push(view.id);
+            }
+            const associationCounts = {
+                // A "unique" association counts only when the id resolves to a valid
+                // manifest or a local legacy record — trailer-only orphans never
+                // inflate it.
+                unique: [...associationMap.entries()].filter(([id, a]) => a.state === "unique" && (validIds.has(id) || localIds.has(id))).length,
+                missing: diagnostics.orphanManifests.length,
+                ambiguous: diagnostics.ambiguous.length,
+                replayed: diagnostics.replayed.length,
+                duplicate: diagnostics.duplicateTrailers.length,
+            };
             return {
                 initialized: true,
                 repoRoot: root,
@@ -394,6 +468,7 @@ export class Drift {
                 publicIntents,
                 localIntents,
                 malformedManifests: manifestErrors.length > 0 ? manifestErrors : undefined,
+                associationDiagnostics: diagnostics,
                 head: drift.store?.getHead() ?? null,
                 encryption: drift.config.encryption.enabled,
                 promptMode: drift.config.prompts.mode,
@@ -404,11 +479,17 @@ export class Drift {
                     ? { id: last.id, timestamp: last.timestamp, summary: last.summary ?? "" }
                     : null,
                 signerState: drift.signerState,
-                publicKeyFingerprint: drift.publicKeyPem ? signingKeyIdFor(drift.publicKeyPem) : null,
+                publicKeyFingerprint: drift.publicKeyPem
+                    ? (() => {
+                        const parsed = tryParseTrustRoot(drift.publicKeyPem);
+                        return parsed.state === "valid" ? parsed.fingerprint : null;
+                    })()
+                    : null,
                 privateKeyAvailable: drift.privateKeyPem !== "",
                 signingAllowed: drift.signerState === "ready",
                 publicProvenance,
                 verificationMaterial: drift.publicStore.publicKey() !== null,
+                intentAssociations: associationCounts,
             };
         }
         finally {
@@ -452,8 +533,15 @@ export class Drift {
         // pre-landing, so it must restore the exact original index — a phase name
         // ("committing") must never classify a failed commit as post-commit.
         let commitLanded = false;
+        // Prompt-bearing private objects (and their leftover `.tmp-<pid>` files)
+        // created by THIS realization. A failed realize must remove them: an
+        // orphan private object whose commit never landed has no manifest, no DB
+        // row and no trailer — it is pure garbage with a prompt inside. A
+        // successful commit + local-DB failure KEEPS them (the commit is real).
+        const createdPrivatePaths = [];
         // Remove only the files this operation created (manifest + any of the
-        // generated candidates that did not exist before the operation).
+        // generated candidates that did not exist before the operation + the
+        // private objects above).
         const cleanupGenerated = () => {
             if (manifestPath) {
                 try {
@@ -473,6 +561,30 @@ export class Drift {
                     }
                 }
             }
+            for (const p of createdPrivatePaths) {
+                try {
+                    if (existsSync(p)) {
+                        rmSync(p, { force: true });
+                        // Best-effort: remove the now-empty operation-owned shard dirs.
+                        const parent = dirname(p);
+                        try {
+                            if (readdirSync(parent).length === 0)
+                                rmSync(parent, { force: true, recursive: false });
+                            const grand = dirname(parent);
+                            if (grand.endsWith("objects") && readdirSync(grand).length === 0) {
+                                rmSync(grand, { force: true, recursive: false });
+                            }
+                        }
+                        catch {
+                            /* best-effort */
+                        }
+                    }
+                }
+                catch {
+                    /* best-effort */
+                }
+            }
+            createdPrivatePaths.length = 0;
         };
         // Every operation after the snapshot is inside the protected scope below:
         // staging, no-staged-files validation, staged-file listing, AST analysis,
@@ -624,11 +736,34 @@ export class Drift {
             // stays portable across machines (ADR-007).
             const objectPath = join(".drift", "objects", objectSha.slice(0, 2), `${objectSha.slice(2)}.json`);
             const absObjectPath = join(this.repoRoot, objectPath);
-            mkdirSync(dirname(absObjectPath), { recursive: true });
             const objectData = JSON.stringify({ ...intentBase, gitCommitSha: "", signature }, null, 2);
-            const tmpPath = `${absObjectPath}.tmp-${process.pid}`;
-            writeFileSync(tmpPath, objectData);
-            renameSync(tmpPath, absObjectPath);
+            // Reference-safe object write: the object path is content-addressed, so a
+            // pre-existing file at that path is either the identical canonical object
+            // (reuse it — never overwrite bytes with the same bytes) or foreign
+            // content (fail safely, never overwrite silently). Only an object THIS
+            // operation created may be deleted by the pre-commit rollback.
+            if (existsSync(absObjectPath)) {
+                let existing;
+                try {
+                    existing = readFileSync(absObjectPath);
+                }
+                catch (err) {
+                    throw new DriftError(`private object ${objectPath} exists but is unreadable: ${err instanceof Error ? err.message : String(err)}`);
+                }
+                if (!existing.equals(Buffer.from(objectData, "utf8"))) {
+                    throw new DriftError(`private object ${objectPath} already exists with different content — refusing to overwrite a pre-existing object. Remove it deliberately or use a different prompt.`);
+                }
+                // Identical bytes: reuse the pre-existing object; the rollback must NOT
+                // delete it (it was not created by this operation).
+            }
+            else {
+                mkdirSync(dirname(absObjectPath), { recursive: true });
+                const tmpPath = `${absObjectPath}.tmp-${process.pid}`;
+                createdPrivatePaths.push(tmpPath);
+                writeFileSync(tmpPath, objectData);
+                renameSync(tmpPath, absObjectPath);
+                createdPrivatePaths.push(absObjectPath);
+            }
             // --- ADR-009 atomic transaction ---------------------------------------
             // Order is critical (docs/architecture.md "Realize transaction"):
             //   1. build the V2 public manifest (NEVER contains the containing commit
@@ -661,7 +796,7 @@ export class Drift {
             // Stage ONLY the approved public paths — never .drift/private, objects,
             // keys or drift.db. Staging uses explicit argument arrays, never shell
             // interpolation.
-            const stagedPublic = this.stagePublicFiles(id);
+            const stagedPublic = this.stagePublicFiles(id, generatedPreExisted);
             let gitSha;
             try {
                 gitSha = commit(this.repoRoot, commitMessage);
@@ -670,9 +805,10 @@ export class Drift {
                 // Commit failed: still pre-landing. The outer catch (commitLanded ===
                 // false) restores the EXACT original index — partially staged hunks,
                 // intent-to-add, renames, deletions, flags — and removes only the files
-                // this operation generated. The private object record is preserved for
-                // a safe retry.
-                throw new DriftError(`git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your staged changes were restored exactly; run \`drift realize\` again after fixing the problem.`);
+                // this operation generated (including the prompt-bearing private object
+                // created by this run; a pre-existing identical object is reused, never
+                // deleted).
+                throw new DriftError(`git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your staged changes were restored exactly and the private object created by this run was removed; run \`drift realize\` again after fixing the problem.`);
             }
             commitLanded = true;
             const intent = {
@@ -747,9 +883,17 @@ export class Drift {
      *                                  A config the user already staged rides
      *                                  along in the whole-index commit.
      */
-    stagePublicFiles(intentId) {
+    stagePublicFiles(intentId, preExisted) {
         const configAbs = join(this.driftDir, "config.toml");
-        const configIsUntouchedTemplate = existsSync(configAbs) && readFileSync(configAbs, "utf8") === CONFIG_TEMPLATE;
+        // Config is staged ONLY when THIS operation created it (it did not exist
+        // before the operation). A pre-existing config — tracked, untracked,
+        // already staged, or carrying an unstaged edit — is NEVER `git add`ed by
+        // Drift: adding a tracked config merely because its working-tree content
+        // equals the template would replace a user's staged version A with the
+        // working-tree version B, and adding an edited config would carry an
+        // unstaged user change into the Drift commit. An already-staged config
+        // rides along in the whole-index commit untouched.
+        const configCreatedByOperation = !(preExisted.get(configAbs) ?? false);
         const rel = (abs) => relPath(this.repoRoot, abs).replace(/\\/g, "/");
         const tracked = (abs) => execGit(this.repoRoot, ["ls-files", "--error-unmatch", "--", rel(abs)], true).status === 0;
         const changedVsHead = (abs) => execGit(this.repoRoot, ["diff", "--quiet", "HEAD", "--", rel(abs)], true).status !== 0;
@@ -765,7 +909,7 @@ export class Drift {
             { abs: gitignoreAbs, always: true }, // staged when new or unchanged (see filter below)
             { abs: keyAbs, always: true },
             { abs: this.publicStore.manifestPath(intentId), always: true },
-            { abs: configAbs, always: configIsUntouchedTemplate },
+            { abs: configAbs, always: configCreatedByOperation },
         ];
         const toStage = candidates
             .filter((c) => {
@@ -818,27 +962,103 @@ export class Drift {
      * (legacy pre-ADR-009) intents are kept so old repos keep working.
      */
     /**
-     * Canonical intent → commit association, derived ONLY from `Drift-Intent:`
-     * git trailers (never from an unverified manifest field). `byId` maps each
-     * intent id to the FIRST commit that references it (newest-first log order,
-     * i.e. the introducing commit). `byCommit` maps each commit to all ids its
-     * message references. Used by log, context, blame, status, export and the
-     * fresh-clone paths so every consumer shares one resolver.
+     * Deterministic intent → commit associations, derived ONLY from
+     * `Drift-Intent:` git trailers (never from an unverified manifest field or
+     * a "first value wins" map). Scans ALL trailers in chronological order
+     * (oldest first) so the introduction is always the oldest reference:
+     *
+     *   zero references      → missing
+     *   one reference        → unique
+     *   >1 distinct commits  → replayed when a committed public manifest
+     *                          establishes the introduction (oldest reference
+     *                          is the original), else ambiguous
+     *   duplicate trailer lines inside ONE commit → duplicate metadata
+     *
+     * `byCommit` (commit → referenced ids, deduplicated) is still exposed for
+     * consumers that map a commit to its intents (blame, context).
      */
     intentCommitIndex() {
         const byId = new Map();
         const byCommit = new Map();
-        for (const { sha, body } of gitLogMessages(this.repoRoot)) {
+        const duplicateInCommit = new Map();
+        // `gitLogMessages` is newest-first; reverse for chronological (oldest first).
+        // The scan covers commits reachable from the selected ref (HEAD by
+        // default) — never unrelated branches under `--all`.
+        const chronological = gitLogMessages(this.repoRoot).reverse();
+        const refs = new Map(); // id → referencing commits (chronological, distinct)
+        for (const { sha, body } of chronological) {
+            const raw = extractDriftIntentIdsRaw(body);
             const ids = extractDriftIntentIds(body);
-            if (ids.length === 0)
+            if (ids.length === 0 && raw.length === 0)
                 continue;
-            byCommit.set(sha, ids);
-            for (const id of ids) {
-                if (!byId.has(id))
-                    byId.set(id, sha);
+            const distinct = [...new Set(raw)];
+            byCommit.set(sha, distinct);
+            for (const id of distinct) {
+                const list = refs.get(id) ?? [];
+                if (!list.includes(sha))
+                    list.push(sha);
+                refs.set(id, list);
+                // duplicate identical trailer lines within one commit = malformed
+                // metadata (the whole commit is not a trustworthy single reference).
+                const occurrences = raw.filter((r) => r === id).length;
+                if (occurrences > 1 && !duplicateInCommit.has(id)) {
+                    duplicateInCommit.set(id, { sha, occurrences });
+                }
+            }
+        }
+        for (const [id, commits] of refs) {
+            const dup = duplicateInCommit.get(id);
+            if (dup) {
+                byId.set(id, {
+                    state: "duplicate-in-commit",
+                    commit: dup.sha,
+                    occurrences: dup.occurrences,
+                });
+                continue;
+            }
+            if (commits.length === 1) {
+                byId.set(id, { state: "unique", commit: commits[0] });
+                continue;
+            }
+            // >1 distinct commits: a committed public manifest establishes the
+            // oldest reference as the introduction → later ones are replays.
+            if (this.publicStore.getById(id) !== null) {
+                byId.set(id, {
+                    state: "replayed",
+                    originalCommit: commits[0],
+                    laterCommits: commits.slice(1),
+                });
+            }
+            else {
+                byId.set(id, { state: "ambiguous", commits });
             }
         }
         return { byId, byCommit };
+    }
+    /** Structured association for one intent id (unique/missing/duplicate-in-commit/ambiguous/replayed). */
+    intentCommitAssociation(id) {
+        const { byId } = this.intentCommitIndex();
+        return byId.get(id) ?? { state: "missing" };
+    }
+    /**
+     * The full deterministic intent→commit association map (MCP / JSON
+     * consumers). Keys: every id referenced by a `Drift-Intent:` trailer on a
+     * commit reachable from HEAD. Never silently collapses ambiguous, replayed
+     * or duplicate-in-commit ids to one commit.
+     */
+    intentAssociations() {
+        return this.intentCommitIndex().byId;
+    }
+    /** The single authoritative commit for an id when one exists (intro first). */
+    commitFor(id, byId) {
+        const assoc = byId.get(id);
+        if (!assoc)
+            return "";
+        if (assoc.state === "unique")
+            return assoc.commit;
+        if (assoc.state === "replayed")
+            return assoc.originalCommit;
+        return ""; // ambiguous/duplicate-in-commit/missing: never display an arbitrary commit
     }
     /**
      * Public manifests referenced by a commit's `Drift-Intent:` trailers. Falls
@@ -865,14 +1085,15 @@ export class Drift {
      */
     mergeIntents() {
         const byId = new Map();
-        const { byId: commitById } = this.intentCommitIndex();
+        const { byId: associations } = this.intentCommitIndex();
         for (const view of this.publicStore.list()) {
             if (byId.has(view.id))
                 continue;
-            const gitSha = commitById.get(view.id) ??
-                (view.schemaVersion === 1 ? view.commit : null) ??
+            const assoc = associations.get(view.id);
+            const gitSha = this.commitFor(view.id, associations) ||
+                (view.schemaVersion === 1 && !assoc ? view.commit : null) ||
                 "";
-            byId.set(view.id, publicViewToLogEntry(view, gitSha));
+            byId.set(view.id, publicViewToLogEntry(view, gitSha, assoc));
         }
         if (this.store) {
             for (const e of this.store.listIntents({})) {
@@ -982,6 +1203,7 @@ export class Drift {
         }
         const committed = sha !== "0000000000000000000000000000000000000000";
         let intent = null;
+        let blameAssociation = { state: "missing" };
         if (committed) {
             let record = null;
             let signatureValid = false;
@@ -991,7 +1213,30 @@ export class Drift {
             // (or invalid) by accident. The private store is only a legacy fallback
             // for pre-ADR-009 intents that have no manifest yet. The commit→intent
             // association comes from git trailers via the shared resolver.
-            const view = this.findManifestsForCommit(sha)[0] ?? null;
+            const manifestCandidates = this.findManifestsForCommit(sha);
+            // Blame attributes the INTENT that touched the blamed file. A commit
+            // can carry several distinct Drift-Intent trailers; an arbitrary first
+            // match must never be presented as the reason for a line, so the
+            // candidates are filtered by the blamed file path first and any
+            // remaining ambiguity is reported explicitly (association:
+            // ambiguous) instead of being picked silently. Zero candidates after
+            // filtering is an explicit no-match/baseline state.
+            const byFile = manifestCandidates.filter((m) => (m.files ?? []).some((f) => f.path === relative));
+            if (byFile.length === 1) {
+                blameAssociation = { state: "unique", commit: sha };
+            }
+            else if (byFile.length > 1) {
+                blameAssociation = {
+                    state: "ambiguous",
+                    candidates: byFile.map((m) => m.id),
+                };
+            }
+            else if (manifestCandidates.length > 0) {
+                // The commit records intents, but none touches the blamed file — the
+                // line predates (or falls outside) the recorded intent.
+                blameAssociation = { state: "missing" };
+            }
+            const view = byFile.length === 1 ? byFile[0] : null;
             const localRecord = this.store?.findByGitSha(sha) ?? null;
             if (view) {
                 record = publicViewToIntentRecord(view, sha);
@@ -1043,6 +1288,7 @@ export class Drift {
             committed,
             intent,
             baseline: committed && intent === null,
+            ...(committed ? { association: blameAssociation } : {}),
         };
     }
     // --------------------------------------------------------------- context
@@ -1225,6 +1471,103 @@ export class Drift {
                 ? `${views.length} manifest(s) with invalid signatures: ${badSigs.map((v) => v.id).join(", ")}`
                 : `${views.length} public manifest(s), all signatures valid`,
         });
+        // --- orphan private objects (prompt-bearing local files with no DB row,
+        // no public manifest and no Git trailer association — e.g. left behind by
+        // a failed realize). Never prints the prompt; `--fix` removes only
+        // orphan-before-commit objects. Categories:
+        //   orphan-before-commit   — no DB row, no manifest, no trailer (failed
+        //                            realize before the commit landed).
+        //   committed-but-db-missing— no DB row, no manifest, but a trailer
+        //                            exists (commit landed, DB update failed) —
+        //                            recoverable/reindexable, never auto-deleted.
+        //   referenced             — DB row or manifest present (healthy).
+        //   unknown/malformed      — unparseable object file (not provably a
+        //                            Drift object; left alone).
+        const { byId: assocMap } = this.intentCommitIndex();
+        const orphanObjects = [];
+        const objectsDir = join(this.driftDir, "objects");
+        // Bounded scan: a pathological objects/ directory must not stall doctor.
+        const MAX_OBJECT_FILES_SCANNED = 5000;
+        const MAX_OBJECT_FILE_BYTES = 4 * 1024 * 1024;
+        let scanned = 0;
+        let scanTruncated = false;
+        if (existsSync(objectsDir)) {
+            const walk = (dir) => {
+                const out = [];
+                for (const name of readdirSync(dir)) {
+                    const full = join(dir, name);
+                    try {
+                        if (statSync(full).isDirectory())
+                            out.push(...walk(full));
+                        else if (name.endsWith(".json"))
+                            out.push(full);
+                    }
+                    catch {
+                        /* unreadable entry — skip */
+                    }
+                }
+                return out;
+            };
+            for (const file of walk(objectsDir)) {
+                if (scanned >= MAX_OBJECT_FILES_SCANNED) {
+                    scanTruncated = true;
+                    break;
+                }
+                scanned += 1;
+                try {
+                    const st = statSync(file);
+                    if (st.size > MAX_OBJECT_FILE_BYTES)
+                        continue; // oversized — skip
+                    const obj = JSON.parse(readFileSync(file, "utf8"));
+                    const id = typeof obj?.id === "string" ? obj.id : "";
+                    if (!DRIFT_INTENT_ID_RE.test(id))
+                        continue; // not provably a Drift object
+                    const row = this.store?.getById(id) ?? null;
+                    const manifest = this.publicStore.getById(id);
+                    const assoc = assocMap.get(id);
+                    const referenced = assoc !== undefined && (assoc.state === "unique" || assoc.state === "replayed" || assoc.state === "duplicate-in-commit");
+                    if (!row && !manifest && !referenced) {
+                        orphanObjects.push({ path: relPath(this.repoRoot, file), id, kind: "orphan-before-commit" });
+                    }
+                    else if (!row && !manifest && assoc !== undefined) {
+                        orphanObjects.push({ path: relPath(this.repoRoot, file), id, kind: "committed-but-db-missing" });
+                    }
+                }
+                catch {
+                    // unparseable file — not provably an orphan; leave it alone
+                }
+            }
+        }
+        const safe = orphanObjects.filter((o) => o.kind === "orphan-before-commit");
+        const reindexable = orphanObjects.filter((o) => o.kind === "committed-but-db-missing");
+        const detailParts = [];
+        if (safe.length > 0) {
+            detailParts.push(`orphan-before-commit (no DB row, no manifest, no trailer): ${safe.map((o) => `${o.path} (${o.id})`).join(", ")}.\n  Fix: ${safe.map((o) => quotePath(o.path)).join(" ")} — or run \`drift doctor --fix\``);
+        }
+        if (reindexable.length > 0) {
+            detailParts.push(`committed-but-db-missing (commit landed, local DB update failed — recoverable, never auto-deleted): ${reindexable.map((o) => `${o.path} (${o.id})`).join(", ")}.\n  Fix: run \`drift doctor\` after re-creating the local store with \`drift init\`, or remove the local object deliberately.`);
+        }
+        if (scanTruncated) {
+            detailParts.push(`scan truncated at ${MAX_OBJECT_FILES_SCANNED} object files (bounded scan)`);
+        }
+        checks.push({
+            name: "orphan-objects",
+            ok: safe.length === 0 && reindexable.length === 0 && !scanTruncated,
+            detail: detailParts.length > 0 ? detailParts.join("\n") : "no orphan private objects",
+        });
+        // --fix removes ONLY orphan-before-commit objects — never a committed
+        // intent's object, never a reindexable one, never a pre-existing object.
+        if (opts.fix) {
+            for (const o of safe) {
+                try {
+                    rmSync(resolve(this.repoRoot, o.path), { force: true });
+                    fixed.push(`removed orphan object ${o.path}`);
+                }
+                catch {
+                    /* best-effort */
+                }
+            }
+        }
         if (!this.store) {
             checks.push({
                 name: "sqlite-store",
@@ -1376,18 +1719,25 @@ export class Drift {
             }));
             return JSON.stringify({ schemaVersion: 2, containsPrivatePrompts: true, exportedAt, intents: entries }, null, 2);
         }
-        const { byId: commitById } = this.intentCommitIndex();
+        const { byId: associations } = this.intentCommitIndex();
         const { views, errors } = this.publicStore.listWithErrors();
-        const entries = views.map((v) => ({
-            id: v.id,
-            gitSha: commitById.get(v.id) ?? (v.schemaVersion === 1 ? v.commit : null) ?? null,
-            authorType: v.agent?.type ?? "HUMAN",
-            authorId: v.agent?.identifier ?? "unknown",
-            model: v.model ?? null,
-            summary: v.summary,
-            timestamp: new Date(v.timestamp).toISOString(),
-            files: (v.files ?? []).map((f) => ({ path: f.path, mutationType: f.mutationType, summary: f.summary ?? null })),
-        }));
+        const entries = views.map((v) => {
+            const assoc = associations.get(v.id);
+            const gitSha = this.commitFor(v.id, associations) ||
+                (v.schemaVersion === 1 && !assoc ? v.commit : null) ||
+                null;
+            return {
+                id: v.id,
+                gitSha,
+                ...(assoc ? { association: assoc } : {}),
+                authorType: v.agent?.type ?? "HUMAN",
+                authorId: v.agent?.identifier ?? "unknown",
+                model: v.model ?? null,
+                summary: v.summary,
+                timestamp: new Date(v.timestamp).toISOString(),
+                files: (v.files ?? []).map((f) => ({ path: f.path, mutationType: f.mutationType, summary: f.summary ?? null })),
+            };
+        });
         const out = {
             schemaVersion: 2,
             containsPrivatePrompts: false,
@@ -1535,7 +1885,7 @@ export function ensureDriftGitignore(driftDir) {
     writeFileSync(path, existing.replace(/[\r\n]+$/, "") + block);
 }
 /** Map a public manifest to the shared LogEntry shape (no prompt). */
-function publicViewToLogEntry(v, gitSha) {
+function publicViewToLogEntry(v, gitSha, association) {
     return {
         id: v.id,
         gitSha,
@@ -1550,6 +1900,7 @@ function publicViewToLogEntry(v, gitSha) {
             mutationType: f.mutationType,
             summary: f.summary ?? null,
         })),
+        ...(association ? { association } : {}),
     };
 }
 /** Map a public manifest to an IntentRecord-shaped object (private fields empty). */

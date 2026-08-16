@@ -104,6 +104,27 @@ export interface LogFilters {
   limit?: number;
 }
 
+/**
+ * Deterministic intent → commit association, derived ONLY from
+ * `Drift-Intent:` git trailers (never from an unverified manifest field):
+ *
+ *   unique    — referenced by exactly one commit.
+ *   missing   — referenced by no commit.
+ *   ambiguous — referenced by multiple commits and no committed public
+ *               manifest establishes an introduction (orphan provenance).
+ *   replayed  — referenced by multiple commits AND a committed public
+ *               manifest exists: the oldest reference is the introduction,
+ *               later references are replays.
+ *   duplicate — the same id appears more than once in a single commit's
+ *               trailer block (malformed/duplicate metadata).
+ */
+export type IntentCommitAssociation =
+  | { state: "unique"; commit: string }
+  | { state: "missing" }
+  | { state: "duplicate-in-commit"; commit: string; occurrences: number }
+  | { state: "replayed"; originalCommit: string; laterCommits: string[] }
+  | { state: "ambiguous"; commits: string[] };
+
 export interface LogEntry {
   id: string;
   gitSha: string;
@@ -116,6 +137,8 @@ export interface LogEntry {
   summary?: string;
   timestamp: number;
   files: { path: string; mutationType: MutationType; summary: string | null }[];
+  /** Structured trailer-derived association (unique/missing/ambiguous/replayed/duplicate). */
+  association?: IntentCommitAssociation;
 }
 
 interface LogRow {

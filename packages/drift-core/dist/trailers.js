@@ -74,4 +74,21 @@ export function extractDriftIntentIds(message) {
     }
     return ids;
 }
+/**
+ * ALL valid `Drift-Intent:` ids referenced by a commit message, INCLUDING
+ * duplicates (a message with two identical trailer lines yields the id twice).
+ * Used by the deterministic association resolver to detect duplicate/ambiguous
+ * metadata that `extractDriftIntentIds` would silently collapse.
+ */
+export function extractDriftIntentIdsRaw(message) {
+    const ids = [];
+    for (const trailer of parseGitTrailers(message)) {
+        if (trailer.token !== "Drift-Intent")
+            continue;
+        const id = trailer.value.trim();
+        if (DRIFT_INTENT_ID_RE.test(id))
+            ids.push(id);
+    }
+    return ids;
+}
 //# sourceMappingURL=trailers.js.map

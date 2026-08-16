@@ -23,4 +23,11 @@ export declare const DRIFT_INTENT_ID_RE: RegExp;
  * while preserving order. Invalid ids are ignored (never surfaced).
  */
 export declare function extractDriftIntentIds(message: string): string[];
+/**
+ * ALL valid `Drift-Intent:` ids referenced by a commit message, INCLUDING
+ * duplicates (a message with two identical trailer lines yields the id twice).
+ * Used by the deterministic association resolver to detect duplicate/ambiguous
+ * metadata that `extractDriftIntentIds` would silently collapse.
+ */
+export declare function extractDriftIntentIdsRaw(message: string): string[];
 //# sourceMappingURL=trailers.d.ts.map
