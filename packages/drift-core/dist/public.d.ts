@@ -40,10 +40,6 @@ export declare const MANIFEST_META_MAX = 200;
 export declare const MANIFEST_VERIFY_MAX = 1000;
 /** Max length of a base64 signature. */
 export declare const MANIFEST_SIGNATURE_MAX = 4096;
-/** Max number of `symbols` entries when present. */
-export declare const MANIFEST_SYMBOLS_MAX = 200;
-/** Max length of one symbol string. */
-export declare const MANIFEST_SYMBOL_MAX = 300;
 /** Upper bound for `timestamp` (Date.MAX_VALUE) — rejects absurd values. */
 export declare const MANIFEST_TIMESTAMP_MAX = 8640000000000000;
 /** Max nesting depth walked by the validator (bounded recursion). */

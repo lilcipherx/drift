@@ -102,8 +102,10 @@ export function captureIndexSnapshot(repoRoot) {
     return { backupPath };
 }
 /**
- * Restore the index captured by `captureIndexSnapshot`. Safe to call once.
- * Never overwrites another git process's lock; never touches the worktree.
+ * Restore the index captured by `captureIndexSnapshot`. Safe to call once;
+ * a second call is a no-op (the backup directory is removed by the first
+ * restore). Never overwrites another git process's lock; never touches the
+ * worktree.
  */
 export function restoreIndexSnapshot(repoRoot, snap) {
     const indexPath = gitIndexPath(repoRoot);
@@ -120,11 +122,29 @@ export function restoreIndexSnapshot(repoRoot, snap) {
             rmSync(indexPath, { force: true });
         return;
     }
+    if (!existsSync(snap.backupPath))
+        return; // already restored / already discarded
     // Atomic replace in the same directory (fs.rename replaces atomically on
     // POSIX and Windows). Never a plain overwrite of a live index.
     const tmp = `${indexPath}.drift-restore-${process.pid}`;
     copyFileSync(snap.backupPath, tmp);
     renameSync(tmp, indexPath);
+    try {
+        rmSync(dirname(snap.backupPath), { recursive: true, force: true });
+    }
+    catch {
+        /* best-effort cleanup */
+    }
+}
+/**
+ * Discard a captured index snapshot WITHOUT restoring it (successful commit
+ * path). Removes the temporary backup directory so no `drift-idx-*` residue
+ * survives on disk — including on a persistent self-hosted runner.
+ */
+export function discardIndexSnapshot(repoRoot, snap) {
+    void repoRoot;
+    if (!snap.backupPath)
+        return;
     try {
         rmSync(dirname(snap.backupPath), { recursive: true, force: true });
     }

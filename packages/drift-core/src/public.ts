@@ -55,10 +55,6 @@ export const MANIFEST_META_MAX = 200;
 export const MANIFEST_VERIFY_MAX = 1000;
 /** Max length of a base64 signature. */
 export const MANIFEST_SIGNATURE_MAX = 4096;
-/** Max number of `symbols` entries when present. */
-export const MANIFEST_SYMBOLS_MAX = 200;
-/** Max length of one symbol string. */
-export const MANIFEST_SYMBOL_MAX = 300;
 /** Upper bound for `timestamp` (Date.MAX_VALUE) — rejects absurd values. */
 export const MANIFEST_TIMESTAMP_MAX = 8_640_000_000_000_000;
 /** Max nesting depth walked by the validator (bounded recursion). */
@@ -166,6 +162,12 @@ function validateFiles(errors: ManifestValidationError[], value: unknown, depth:
       ok = false;
       return;
     }
+    for (const key of Object.keys(f)) {
+      if (key !== "path" && key !== "mutationType" && key !== "summary") {
+        push(errors, `files[${i}].${key}`, "unknown field");
+        ok = false;
+      }
+    }
     const path = checkString(errors, f.path, `files[${i}].path`, {
       required: true,
       max: MANIFEST_FILE_PATH_MAX,
@@ -216,6 +218,41 @@ export function parsePublicIntentManifest(
     push(errors, "schemaVersion", `unsupported schema version ${String(json.schemaVersion)}`);
     return fail();
   }
+  // Strict unknown-field policy (ADR-009): every semantically accepted field
+  // of a supported schema is enumerated here. Unknown fields are REJECTED
+  // outright — they cannot silently join the signed payload via canonical
+  // JSON, and a post-signing insertion would break the signature anyway. If a
+  // future version needs extension points it must define an explicit,
+  // versioned `extensions` object whose contents participate in the signed
+  // payload.
+  const V1_FIELDS = new Set([
+    "schemaVersion",
+    "id",
+    "summary",
+    "timestamp",
+    "signature",
+    "agent",
+    "model",
+    "verification",
+    "files",
+    "commit",
+  ]);
+  const V2_FIELDS = new Set([
+    "schemaVersion",
+    "id",
+    "summary",
+    "timestamp",
+    "signature",
+    "agent",
+    "model",
+    "verification",
+    "files",
+    "signingKeyId",
+  ]);
+  const allowed = schemaVersion === 2 ? V2_FIELDS : V1_FIELDS;
+  for (const key of Object.keys(json)) {
+    if (!allowed.has(key)) push(errors, key, `unknown field (schema v${schemaVersion})`);
+  }
   const id = checkString(errors, json.id, "id", {
     required: true,
     max: 64,
@@ -262,6 +299,11 @@ export function parsePublicIntentManifest(
     if (!isRecord(json.agent)) {
       push(errors, "agent", "expected an object");
     } else {
+      for (const key of Object.keys(json.agent)) {
+        if (key !== "type" && key !== "identifier") {
+          push(errors, `agent.${key}`, "unknown field");
+        }
+      }
       const type = checkString(errors, json.agent.type, "agent.type", { required: true, max: 20 });
       if (type !== null && schemaVersion === 2 && type !== "HUMAN" && type !== "AGENT") {
         push(errors, "agent.type", `unsupported agent type "${type}"`);
@@ -283,18 +325,6 @@ export function parsePublicIntentManifest(
     });
   }
   validateFiles(errors, json.files, 0);
-  if (json.symbols !== undefined) {
-    if (!Array.isArray(json.symbols)) {
-      push(errors, "symbols", "expected an array");
-    } else {
-      if (json.symbols.length > MANIFEST_SYMBOLS_MAX) {
-        push(errors, "symbols", `exceeds maximum ${MANIFEST_SYMBOLS_MAX} entries`);
-      }
-      json.symbols.forEach((s, i) => {
-        checkString(errors, s, `symbols[${i}]`, { max: MANIFEST_SYMBOL_MAX, noControl: true });
-      });
-    }
-  }
   if (schemaVersion === 1) {
     checkString(errors, json.commit, "commit", { max: 64 });
   }

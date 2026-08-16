@@ -39,10 +39,18 @@ export interface IndexSnapshot {
 }
 export declare function captureIndexSnapshot(repoRoot: string): IndexSnapshot;
 /**
- * Restore the index captured by `captureIndexSnapshot`. Safe to call once.
- * Never overwrites another git process's lock; never touches the worktree.
+ * Restore the index captured by `captureIndexSnapshot`. Safe to call once;
+ * a second call is a no-op (the backup directory is removed by the first
+ * restore). Never overwrites another git process's lock; never touches the
+ * worktree.
  */
 export declare function restoreIndexSnapshot(repoRoot: string, snap: IndexSnapshot): void;
+/**
+ * Discard a captured index snapshot WITHOUT restoring it (successful commit
+ * path). Removes the temporary backup directory so no `drift-idx-*` residue
+ * survives on disk — including on a persistent self-hosted runner.
+ */
+export declare function discardIndexSnapshot(repoRoot: string, snap: IndexSnapshot): void;
 export interface StagedFile {
     status: string;
     path: string;

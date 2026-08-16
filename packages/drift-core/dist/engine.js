@@ -10,7 +10,7 @@ import { computeDelta, detectLanguage, isBinary, parseSymbols, ParseError, textD
 import { canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";
 import { CONFIG_TEMPLATE, loadConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
-import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitExists, currentHead, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, restoreIndexSnapshot, stageAll, stagedNameStatus, } from "./git.js";
+import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitExists, currentHead, discardIndexSnapshot, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, restoreIndexSnapshot, stageAll, stagedNameStatus, } from "./git.js";
 import { IntentStore } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
 import { buildPublicSummary, genericPublicSummary, PUBLIC_FILES_MAX, PublicStore, signingKeyIdFor, } from "./public.js";
@@ -436,78 +436,86 @@ export class Drift {
             throw new DriftError("the git index has unmerged (conflict) entries — resolve the merge conflict and run drift realize again");
         }
         const indexSnapshot = captureIndexSnapshot(this.repoRoot);
-        stageAll(this.repoRoot, opts.files);
-        const staged = stagedNameStatus(this.repoRoot);
-        if (staged.length === 0) {
-            throw new DriftError("No changes to realize. Edit (or stage) a file first.", EXIT.NO_CHANGES);
-        }
-        const head = currentHead(this.repoRoot);
-        const deltas = [];
-        const syntaxErrors = [];
-        for (const { status, path } of staged) {
-            // Deleted files have no working-tree content; record a DELETED delta.
-            if (status === "D") {
-                const pre = head ? readFileAt(this.repoRoot, path, head) : null;
-                deltas.push(...textDelta(path, pre, null).changes);
-                continue;
-            }
-            let post;
-            try {
-                post = readFileSync(resolve(this.repoRoot, path));
-            }
-            catch {
-                continue; // unreadable (e.g. race with another process)
-            }
-            const postText = post.toString("utf8");
-            const pre = head ? readFileAt(this.repoRoot, path, head) : null;
-            const preBuffer = pre ? Buffer.from(pre, "utf8") : null;
-            const binary = isBinary(post) || (preBuffer ? isBinary(preBuffer) : false);
-            if (binary) {
-                deltas.push(...textDelta(path, pre, postText).changes);
-                continue;
-            }
-            const lang = detectLanguage(path);
-            if (!lang || opts.noAst) {
-                deltas.push(...textDelta(path, pre, postText).changes);
-                continue;
-            }
-            try {
-                const syntaxErr = validateSyntax(postText, lang);
-                if (syntaxErr) {
-                    syntaxErrors.push({ file: path, message: syntaxErr });
-                    continue;
-                }
-                const preSyms = pre === null ? null : parseSymbols(pre, lang);
-                const postSyms = parseSymbols(postText, lang);
-                deltas.push(...computeDelta(path, preSyms, postSyms).changes);
-            }
-            catch (err) {
-                if (err instanceof ParseError) {
-                    syntaxErrors.push({ file: path, message: err.message });
-                }
-                else {
-                    throw err;
-                }
-            }
-        }
-        if (syntaxErrors.length > 0) {
-            // Restore the user's exact pre-Drift index state — never `git reset`
-            // wholesale, which would discard their staged selections.
-            restoreIndexSnapshot(this.repoRoot, indexSnapshot);
-            throw new DriftError(`Syntax error — commit aborted, no history was polluted (your staged changes were preserved):\n  - ${syntaxErrors
-                .map((e) => `${e.file}: ${e.message}`)
-                .join("\n  - ")}\nFix the code and run realize again.`, EXIT.SYNTAX);
-        }
-        // Any failure BEFORE the git commit (redaction, store access, signing,
-        // manifest write, staging public files) must restore the user's index
-        // exactly and remove only the manifest this operation generated — never
-        // the user's source selections. Once the commit lands (phase
-        // "committing"/"recorded") the index restore is NOT performed: the source
-        // changes stay staged for a safe retry and a landed commit is never
-        // rewritten.
         let manifestPath = null;
+        // Every operation after the snapshot is inside the protected scope below:
+        // staging, no-staged-files validation, staged-file listing, AST analysis,
+        // syntax parsing, redaction, private-object writing, manifest
+        // construction, signing, manifest writing, public-file staging and the
+        // git commit. Any failure while `phase` is "building" (before the commit
+        // lands) restores the user's index byte-for-byte; once the commit lands
+        // ("committing"/"recorded") the index is left as-is and the snapshot is
+        // discarded.
         let phase = "building";
         try {
+            stageAll(this.repoRoot, opts.files);
+            const staged = stagedNameStatus(this.repoRoot);
+            if (staged.length === 0) {
+                throw new DriftError("No changes to realize. Edit (or stage) a file first.", EXIT.NO_CHANGES);
+            }
+            const head = currentHead(this.repoRoot);
+            const deltas = [];
+            const syntaxErrors = [];
+            for (const { status, path } of staged) {
+                // Deleted files have no working-tree content; record a DELETED delta.
+                if (status === "D") {
+                    const pre = head ? readFileAt(this.repoRoot, path, head) : null;
+                    deltas.push(...textDelta(path, pre, null).changes);
+                    continue;
+                }
+                let post;
+                try {
+                    post = readFileSync(resolve(this.repoRoot, path));
+                }
+                catch {
+                    continue; // unreadable (e.g. race with another process)
+                }
+                const postText = post.toString("utf8");
+                const pre = head ? readFileAt(this.repoRoot, path, head) : null;
+                const preBuffer = pre ? Buffer.from(pre, "utf8") : null;
+                const binary = isBinary(post) || (preBuffer ? isBinary(preBuffer) : false);
+                if (binary) {
+                    deltas.push(...textDelta(path, pre, postText).changes);
+                    continue;
+                }
+                const lang = detectLanguage(path);
+                if (!lang || opts.noAst) {
+                    deltas.push(...textDelta(path, pre, postText).changes);
+                    continue;
+                }
+                try {
+                    const syntaxErr = validateSyntax(postText, lang);
+                    if (syntaxErr) {
+                        syntaxErrors.push({ file: path, message: syntaxErr });
+                        continue;
+                    }
+                    const preSyms = pre === null ? null : parseSymbols(pre, lang);
+                    const postSyms = parseSymbols(postText, lang);
+                    deltas.push(...computeDelta(path, preSyms, postSyms).changes);
+                }
+                catch (err) {
+                    if (err instanceof ParseError) {
+                        syntaxErrors.push({ file: path, message: err.message });
+                    }
+                    else {
+                        throw err;
+                    }
+                }
+            }
+            if (syntaxErrors.length > 0) {
+                // Thrown inside the protected scope: the catch below restores the user's
+                // exact pre-Drift index state — never `git reset` wholesale, which
+                // would discard their staged selections.
+                throw new DriftError(`Syntax error — commit aborted, no history was polluted (your staged changes were preserved):\n  - ${syntaxErrors
+                    .map((e) => `${e.file}: ${e.message}`)
+                    .join("\n  - ")}\nFix the code and run realize again.`, EXIT.SYNTAX);
+            }
+            // Any failure BEFORE the git commit (redaction, store access, signing,
+            // manifest write, staging public files) must restore the user's index
+            // exactly and remove only the manifest this operation generated — never
+            // the user's source selections. Once the commit lands (phase
+            // "committing"/"recorded") the index restore is NOT performed: the source
+            // changes stay staged for a safe retry and a landed commit is never
+            // rewritten.
             const redactionResult = redact(prompt, this.redactionPatterns);
             const safePrompt = redactionResult.text;
             const safeState = opts.agentState
@@ -661,7 +669,17 @@ export class Drift {
             // rewritten (the commit/insert failure paths above already handled
             // their own cleanup).
             if (phase === "building") {
-                restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+                try {
+                    restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+                }
+                catch (restoreErr) {
+                    // A failed restore must produce an actionable diagnostic — the
+                    // original failure is preserved and the index lock is surfaced so
+                    // the user can resolve it before retrying.
+                    throw new DriftError(`realize aborted before committing AND the git index could not be restored: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}. ` +
+                        `Original failure: ${err instanceof Error ? err.message : String(err)}. ` +
+                        `Run \`git status\` and resolve the index lock first; Drift's staging may not have been rolled back.`);
+                }
                 if (manifestPath) {
                     try {
                         rmSync(manifestPath, { force: true });
@@ -675,6 +693,13 @@ export class Drift {
                     : new DriftError(`realize aborted before committing — your staged changes were preserved: ${err instanceof Error ? err.message : String(err)}`);
             }
             throw err;
+        }
+        finally {
+            // A successful commit discards the snapshot (no restore); a pre-commit
+            // failure already restored it (restore removes the backup dir). Either
+            // way no `drift-idx-*` backup may survive — including on a persistent
+            // self-hosted runner across many realizations.
+            discardIndexSnapshot(this.repoRoot, indexSnapshot);
         }
     }
     /**

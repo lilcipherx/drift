@@ -49,6 +49,7 @@ import {
   commit,
   commitExists,
   currentHead,
+  discardIndexSnapshot,
   execGit,
   findRepoRoot,
   gitIdentity,
@@ -676,7 +677,17 @@ export class Drift {
       );
     }
     const indexSnapshot = captureIndexSnapshot(this.repoRoot);
-
+    let manifestPath: string | null = null;
+    // Every operation after the snapshot is inside the protected scope below:
+    // staging, no-staged-files validation, staged-file listing, AST analysis,
+    // syntax parsing, redaction, private-object writing, manifest
+    // construction, signing, manifest writing, public-file staging and the
+    // git commit. Any failure while `phase` is "building" (before the commit
+    // lands) restores the user's index byte-for-byte; once the commit lands
+    // ("committing"/"recorded") the index is left as-is and the snapshot is
+    // discarded.
+    let phase: "building" | "committing" | "recorded" = "building";
+    try {
     stageAll(this.repoRoot, opts.files);
     const staged = stagedNameStatus(this.repoRoot);
     if (staged.length === 0) {
@@ -736,9 +747,9 @@ export class Drift {
     }
 
     if (syntaxErrors.length > 0) {
-      // Restore the user's exact pre-Drift index state — never `git reset`
-      // wholesale, which would discard their staged selections.
-      restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+      // Thrown inside the protected scope: the catch below restores the user's
+      // exact pre-Drift index state — never `git reset` wholesale, which
+      // would discard their staged selections.
       throw new DriftError(
         `Syntax error — commit aborted, no history was polluted (your staged changes were preserved):\n  - ${syntaxErrors
           .map((e) => `${e.file}: ${e.message}`)
@@ -754,9 +765,6 @@ export class Drift {
     // "committing"/"recorded") the index restore is NOT performed: the source
     // changes stay staged for a safe retry and a landed commit is never
     // rewritten.
-    let manifestPath: string | null = null;
-    let phase: "building" | "committing" | "recorded" = "building";
-    try {
     const redactionResult: RedactResult = redact(prompt, this.redactionPatterns);
     const safePrompt = redactionResult.text;
     const safeState = opts.agentState
@@ -924,7 +932,18 @@ export class Drift {
       // rewritten (the commit/insert failure paths above already handled
       // their own cleanup).
       if (phase === "building") {
-        restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+        try {
+          restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+        } catch (restoreErr) {
+          // A failed restore must produce an actionable diagnostic — the
+          // original failure is preserved and the index lock is surfaced so
+          // the user can resolve it before retrying.
+          throw new DriftError(
+            `realize aborted before committing AND the git index could not be restored: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}. ` +
+              `Original failure: ${err instanceof Error ? err.message : String(err)}. ` +
+              `Run \`git status\` and resolve the index lock first; Drift's staging may not have been rolled back.`,
+          );
+        }
         if (manifestPath) {
           try {
             rmSync(manifestPath, { force: true });
@@ -939,6 +958,12 @@ export class Drift {
             );
       }
       throw err;
+    } finally {
+      // A successful commit discards the snapshot (no restore); a pre-commit
+      // failure already restored it (restore removes the backup dir). Either
+      // way no `drift-idx-*` backup may survive — including on a persistent
+      // self-hosted runner across many realizations.
+      discardIndexSnapshot(this.repoRoot, indexSnapshot);
     }
   }
 
