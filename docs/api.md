@@ -88,7 +88,17 @@ drift realize -p "Add login flow" --agent --model claude-3-5-sonnet --json
 ```
 
 `drift log --json` → `{ "status": "ok", "intents": [{ "id", "gitSha",
-"authorType", "authorId", "model", "summary", "timestamp", "files" }] }`.
+"authorType", "authorId", "model", "summary", "timestamp", "files",
+"association" }] }`. `association` is the deterministic trailer-derived
+commit association — `{ "state": "unique", "commit" } | { "state":
+"missing" } | { "state": "ambiguous", "commits" } | { "state":
+"replayed", "originalCommit", "laterCommits" } | { "state":
+"duplicate", "commit" }` — and is never silently collapsed: when the
+association is ambiguous or the id was replayed, `gitSha` holds the
+introducing commit (or is empty) and the state is visible in the JSON. Human
+output appends `⚠ambiguous` / `⚠replayed` / `⚠duplicate-trailer`.
+`drift status --json` reports `intentAssociations` counts (unique / missing /
+ambiguous / replayed / duplicate) over every trailer-referenced id.
 The private `prompt` is **omitted by default** (ADR-009); add
 `--include-private-prompt` to include it (local repos only, warns on stderr).
 `drift verify --json` → `{ "status": "ok", "intentId", "verifyStatus":
@@ -98,10 +108,11 @@ The private `prompt` is **omitted by default** (ADR-009); add
 status is `not-executed` — a recorded verification command never runs without
 `--run`.
 `drift export --json` → `{ "schemaVersion": 2, "containsPrivatePrompts":
-false, "exportedAt", "intents": [{ "id", "gitSha", "authorType",
-"authorId", "model", "summary", "timestamp", "files" }] }` — no prompt
-field by default; `--include-private-prompt` sets `containsPrivatePrompts` to
-true and adds the local prompt (requires the local store).
+false, "exportedAt", "intents": [{ "id", "gitSha", "association",
+"authorType", "authorId", "model", "summary", "timestamp", "files" }] }`
+— no prompt field by default; `--include-private-prompt` sets
+`containsPrivatePrompts` to true and adds the local prompt (requires the
+local store).
 `drift replay --json` → `{ "status": "ok", "intentId", "gitSha",
 "agentState", "checkedOut" }`.
 

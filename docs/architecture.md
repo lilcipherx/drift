@@ -147,22 +147,35 @@ malformed authenticated JSON → `400`). Only an explicit
 allows unsigned requests. On `pull_request` `opened` / `synchronize` /
 `reopened`:
 
-1. Evaluates the trust root (base vs head `.drift/public/key.pem`) and runs a
-   public-provenance **integrity audit** (append-only: modified / deleted /
-   renamed / orphan manifests, replayed or ambiguously-referenced intents)
+1. Evaluates the trust root (base vs head `.drift/public/key.pem`) with the
+   SHARED strict parser (`evaluateTrustRootChange`: absent / valid /
+   malformed, canonical SPKI-DER fingerprints; malformed initial keys,
+   malformed replacements and a malformed base root are explicit failures)
+   and runs a public-provenance **integrity audit** (append-only: modified /
+   deleted / renamed / orphan manifests, replayed or ambiguously-referenced
+   intents, new trailers without their manifest, incomplete commit listings)
    BEFORE any "no intents" early return — a key-only or tampering PR is never
-   invisible.
-2. Reads `Drift-Intent: <id>` trailers from the PR commits (paginated,
-   git-trailer aligned) and hydrates the **public manifests** from
-   `.drift/public/intents/<id>.json` at the PR head. When a manifest is
-   missing it uses a generic non-prompt fallback (`Drift intent <id>`) — the
-   commit subject is NEVER used, because legacy `full`-mode subjects may
-   contain a complete private prompt. Never touches private objects or
-   prompts.
+   invisible. The audit is PR-scoped (paginated changed-files API) and never
+   enumerates unchanged historical manifests.
+2. Reads `Drift-Intent: <id>` trailers from the PR commits and hydrates the
+   **public manifests** from `.drift/public/intents/<id>.json` at the PR
+   head. Commit enumeration carries a completeness proof (the REST commits
+   endpoint caps at 250): a truncated list is an `incomplete-commit-audit`
+   failure, and the introduction commit is never guessed from the head SHA.
+   A NEW trailer (its commit is ahead of base via `compare base...head`)
+   with no manifest anywhere is a `trailer-without-manifest` failure; only a
+   reference carried in from base history (legacy pre-V2 intent) stays a
+   neutral missing state. When a manifest is missing, rendering uses a
+   generic non-prompt fallback (`Drift intent <id>`) — the commit subject is
+   NEVER used, because legacy `full`-mode subjects may contain a complete
+   private prompt. Never touches private objects or prompts.
 3. Creates the **Check Run** (derived from the shared trust policy — never
    unconditional success; any integrity violation fails it) INDEPENDENTLY of
    the comment: a comment failure never suppresses the check result and vice
-   versa.
+   versa. Write outcomes are STRUCTURED (`GitHubWriteResult`): a failed Check
+   Run is never hidden by a successful comment — transient failures
+   (network / 5xx / 429) make the webhook retryable (500 → GitHub
+   redelivers), permanent 4xx failures are acknowledged.
 4. Posts/updates a **privacy-safe summary comment** (marker
    `<!-- drift:app-summary:v2 -->`, sanitized, `summary` only).
 
@@ -182,7 +195,9 @@ summary + warning, no `pull_request_target`). By default the composite
 Action **fails the workflow** on invalid/tampered provenance
 (`fail-on-provenance-error`, default `true`) — the safe step summary and PR
 comment are always generated before the non-zero exit; neutral states
-(bootstrap, unsigned/unverifiable/missing manifests, no intents) never fail.
+(valid bootstrap, unsigned/unverifiable/legacy-missing manifests, no intents)
+never fail. The failure policy applies even when `GITHUB_TOKEN` is absent
+and is independent of comment failures.
 
 ## Cross-component trust contract (Core ⇄ Action ⇄ App)
 

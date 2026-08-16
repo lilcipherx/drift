@@ -173,6 +173,28 @@ agnostic for consumers. The example in `docs/installation.md` uses
   future ARM64 run exposes an issue, fall back to `ubuntu-latest` for
   `test-linux-arm64` until resolved — the fork/Windows jobs are unaffected.
 
+### Trust boundary update (PR #7 final completeness pass)
+
+A same-repository condition alone is NOT a trust boundary: Dependabot and
+other automation bots open same-repository PRs, and an untrusted author
+association must not receive persistent-host execution. The gate now allows
+ONLY:
+
+- push to trusted protected branches;
+- `workflow_dispatch` (requires write access to dispatch);
+- same-repository `pull_request` authored by a real `User` (not a bot) with
+  `author_association` `OWNER | MEMBER | COLLABORATOR` and a login that is
+  not `dependabot[bot]`, `renovate[bot]` or `github-actions[bot]`.
+
+The hosted fallback job was renamed from `test (Linux x64, node 24, fork PR)`
+(and `test-linux-fork`) to **`test (Linux x64, node 24, untrusted PR)`**
+(`test-linux-untrusted`) and now covers EVERY untrusted PR class — external
+forks, Dependabot, other bots, and untrusted same-repo associations — with
+identical validation, so dependency PRs never silently skip CI. The policy is
+pinned by `scripts/ci-trust-policy.mjs` + `tests/unit/ci-trust-policy.test.mjs`
+and the workflow expressions are asserted to match it. `pull_request_target`
+is never used.
+
 ## 10. Triggering a manual run
 
 When a maintainer's GitHub authentication is restored, trigger a full check
@@ -191,7 +213,8 @@ gh workflow run ci.yml --ref fix/privacy-pr-provenance
 
 ## 11. Branch-protection note
 
-Splitting the old matrix job into `test-linux-arm64`, `test-linux-fork` and
-`test-windows` changes the check names. If branch protection on `main` lists
+Splitting the old matrix job into `test-linux-arm64`, `test-linux-untrusted`
+and `test-windows` changes the check names (and renames the fork job). If
+branch protection on `main` lists
 the old `test (ubuntu-latest, node 24)` / `test (windows-latest, node 24)`
 checks, a maintainer must update the required checks to the new job names.

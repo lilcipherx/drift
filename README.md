@@ -123,18 +123,25 @@ intent, not 2,000 lines of diff.
 
 Public provenance is **append-only and integrity-audited**: the App and the
 Action require every new manifest to be introduced in the same commit as its
-`Drift-Intent:` trailer, and flag modified/deleted/renamed/orphan/replayed
-manifests as violations. The App audits only what the pull request changed
-(never the repository's accumulated history), and the Action reads trust
-data exclusively from the immutable `pull_request.base.sha` / `.head.sha`
-commits — never from `HEAD` or the working tree. The composite Action fails
-the workflow on tampered provenance by default (`fail-on-provenance-error:
-true`), even without a `GITHUB_TOKEN`, after generating the safe summary and
-comment; an initial trust-root bootstrap is visible and neutral while
-replacement/removal are blocking. Key identity is canonical — an SPKI-DER
-fingerprint shared by Core, the Action and the App, so formatting
-differences can never change a key's identity. See
-[SECURITY.md](SECURITY.md) for the full trust contract.
+`Drift-Intent:` trailer, flag modified/deleted/renamed/orphan/replayed
+manifests as violations, and treat a NEW trailer without its public manifest
+as a failure (only legacy base-history references stay neutral). The App
+audits only what the pull request changed (never the repository's
+accumulated history), proves the PR commit listing is complete (the REST
+commits endpoint caps at 250 — a truncated list is a failing
+`incomplete-commit-audit`), and the Action reads trust data exclusively from
+the immutable `pull_request.base.sha` / `.head.sha` commits — never from
+`HEAD` or the working tree. The composite Action fails the workflow on
+tampered provenance by default (`fail-on-provenance-error: true`), even
+without a `GITHUB_TOKEN`, after generating the safe summary and comment; an
+initial trust-root bootstrap is visible and neutral while replacement /
+removal / any **malformed** key state are blocking (keys are strictly parsed
+— malformed material never gets a fallback identity). Key identity is
+canonical — an SPKI-DER fingerprint shared by Core, the Action and the App,
+so formatting differences can never change a key's identity. The self-hosted
+ARM64 CI runner executes only trusted human PRs; Dependabot, other bots,
+forks and untrusted associations run identical validation on GitHub-hosted
+runners. See [SECURITY.md](SECURITY.md) for the full trust contract.
 
 ---
 
