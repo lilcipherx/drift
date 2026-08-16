@@ -20,6 +20,7 @@
  *     association is derived from `Drift-Intent:` git trailers. Adds
  *     `signingKeyId` (fingerprint of the signing public key).
  */
+import { type KeyObject } from "node:crypto";
 /** Maximum length of a public summary (explicit `--summary` or fallback). */
 export declare const PUBLIC_SUMMARY_MAX = 200;
 /** Maximum number of files recorded in a public manifest. */
@@ -214,15 +215,24 @@ export declare class PublicStore {
     verifySignature(view: PublicIntentView): boolean;
 }
 /**
- * Canonical short fingerprint of an Ed25519 public key (first 16 hex chars
- * of the SHA-256 of its SPKI DER subject-public-key bytes). Hashing the DER
+ * Canonical short fingerprint of an ALREADY-VALIDATED Ed25519 public key
+ * (first 16 hex chars of the SHA-256 of its SPKI DER bytes). Hashing the DER
  * bytes — NOT the textual PEM — means LF/CRLF line endings and harmless
  * surrounding whitespace can never produce a different key identity, and two
- * PEM encodings of the same key always agree. Used as `signingKeyId` in V2
- * manifests and by `drift status` / key-state output — never the private key
- * material. A malformed PEM falls back to a stable hash of the text so the
- * identifier is still deterministic (consumers treat such a key as
- * unverifiable, never trusted).
+ * PEM encodings of the same key always agree. This is the ONLY function
+ * security decisions may use as a key identity: it accepts a validated
+ * `KeyObject` and can never fall back to a textual hash.
+ */
+export declare function signingKeyIdForValidKey(key: KeyObject): string;
+/**
+ * DIAGNOSTIC-ONLY fingerprint used by `drift status` output and the V2
+ * manifest `signingKeyId` field. For a key that parses as a public key it is
+ * the canonical SPKI-DER fingerprint; for malformed material it is a stable
+ * hash of the text so the identifier stays deterministic. This fallback is
+ * NEVER a key identity: security decisions (bootstrap evaluation, key
+ * comparison, signature verification) must use `tryParseTrustRoot` +
+ * `signingKeyIdForValidKey` so malformed PEM can never produce bootstrap /
+ * unchanged / valid / trusted / signing-allowed.
  */
 export declare function signingKeyIdFor(publicKeyPem: string): string;
 //# sourceMappingURL=public.d.ts.map

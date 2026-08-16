@@ -132,5 +132,18 @@ export declare const MAX_TOTAL_CHANGED_PROVENANCE_BYTES_PER_PR: number;
  * (pagination cap hit) is reported as a violation, never inferred as "no
  * public changes".
  */
-export declare function auditProvenanceIntegrity(github: GitHubClientLike, owner: string, repo: string, prNumber: number, commits: PullCommit[], baseSha: string, headSha: string): Promise<ProvenanceAudit>;
+export interface AuditScopeOptions {
+    /** SHAs reachable from head but NOT from base (compare base...head) — a
+     *  trailer reference is NEW when its referencing commit is in this set. */
+    aheadShas?: Set<string>;
+    /** True when the PR commit enumeration is provably incomplete — the audit
+     *  must fail, never conclude from a partial commit list. */
+    commitAuditIncomplete?: boolean;
+    /** Expected changed-file count from PR metadata — when provided and the
+     *  fetched changed-files listing has a different unique count, the audit
+     *  fails closed instead of inferring "no public changes" from a partial
+     *  listing. */
+    expectedFiles?: number;
+}
+export declare function auditProvenanceIntegrity(github: GitHubClientLike, owner: string, repo: string, prNumber: number, commits: PullCommit[], baseSha: string, headSha: string, opts?: AuditScopeOptions): Promise<ProvenanceAudit>;
 //# sourceMappingURL=intents.d.ts.map

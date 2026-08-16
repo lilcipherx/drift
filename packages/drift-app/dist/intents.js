@@ -13,7 +13,7 @@
  * validation (the same rules as `@drift/core`): malformed repository data
  * is reported as `malformed`, never rendered as valid, never a crash.
  */
-import { MANIFEST_MAX_BYTES, canonicalJson, extractDriftIntentIds, parsePublicIntentManifest, signingKeyIdFor, verifyPayload, } from "@drift/core";
+import { MANIFEST_MAX_BYTES, canonicalJson, extractDriftIntentIds, parsePublicIntentManifest, signingKeyIdFor, tryParseTrustRoot, verifyPayload, } from "@drift/core";
 /** Extract unique, valid Drift-Intent ids referenced by a set of commits. */
 export function extractIntentIds(commits) {
     const ids = [];
@@ -56,9 +56,13 @@ export function parseLoadedManifest(raw, expectedId) {
     const result = parsePublicIntentManifest(parsed, { expectedId });
     return result.ok ? { manifest: result.value, errors: null } : { manifest: null, errors: result.errors };
 }
-/** Whether a PEM string looks like a usable public key (never trusts garbage). */
+/**
+ * Whether a PEM string is a usable Drift trust root — decided ONLY by the
+ * shared strict parser (valid Ed25519 public key). A malformed base key is
+ * unusable verification material and is never treated as trusted.
+ */
 function looksLikePublicKey(pem) {
-    return typeof pem === "string" && pem.includes("PUBLIC KEY");
+    return tryParseTrustRoot(pem).state === "valid";
 }
 /**
  * Resolve the signature/trust state of a manifest against the trusted base
@@ -175,36 +179,20 @@ function manifestIdFromPath(path) {
     const m = /^\.drift\/public\/intents\/(did_[0-9a-f]{32})\.json$/.exec(path);
     return m ? m[1] : null;
 }
-/**
- * Audit ONLY the public provenance CHANGED by this pull request — via the
- * paginated Pull Request Files API as the primary changed-path source. A PR
- * can tamper with existing provenance without adding any `Drift-Intent:`
- * trailer; that must be a FAILING condition, not invisible. Rules (ADR-009
- * append-only model):
- *
- *   added manifest     → orphan when NO PR commit references the id; the
- *                        introducing commit (the first PR commit where the
- *                        file exists) must carry exactly ONE matching
- *                        `Drift-Intent:` trailer (intro-mismatch otherwise);
- *                        the head content must be byte-identical to the
- *                        introduction content (added-then-modified =
- *                        `mutated` violation).
- *   modified manifest  → violation (append-only).
- *   deleted manifest   → violation (append-only).
- *   renamed manifest   → violation (append-only).
- *   trailer for an id whose manifest exists on the base branch → replay.
- *   one id referenced by >1 distinct PR commit → ambiguous association.
- *
- * Unchanged historical manifests are NEVER enumerated or compared: they are
- * not in the changed-files response and therefore cannot produce a violation.
- * Limits apply to changed files only; an incomplete changed-files listing
- * (pagination cap hit) is reported as a violation, never inferred as "no
- * public changes".
- */
-export async function auditProvenanceIntegrity(github, owner, repo, prNumber, commits, baseSha, headSha) {
+export async function auditProvenanceIntegrity(github, owner, repo, prNumber, commits, baseSha, headSha, opts = {}) {
     const violations = [];
     const replayIds = [];
     const ambiguousIds = [];
+    // An INCOMPLETE commit enumeration can never support a trust conclusion:
+    // a truncated list must not be treated as "no trailer". Fail closed.
+    if (opts.commitAuditIncomplete) {
+        violations.push({
+            code: "incomplete-commit-audit",
+            id: "(audit)",
+            detail: "the pull-request commit listing is incomplete (endpoint cap or interrupted pagination) — the audit cannot conclude",
+        });
+        return { violations, replayIds, ambiguousIds };
+    }
     // Which PR commits reference each id (atomic association requires exactly
     // ONE referencing commit).
     const refCommits = new Map();
@@ -226,6 +214,20 @@ export async function auditProvenanceIntegrity(github, owner, repo, prNumber, co
             detail: "the changed-files listing is incomplete (pagination cap) — audit cannot conclude",
         });
         return { violations, replayIds, ambiguousIds };
+    }
+    // PR-metadata completeness: when the expected changed-file count is known
+    // and differs from the fetched unique listing, the listing is incomplete —
+    // fail closed rather than conclude "no public provenance changes".
+    if (opts.expectedFiles !== undefined && opts.expectedFiles >= 0) {
+        const uniqueFiles = new Set(files.map((f) => f.filename)).size;
+        if (uniqueFiles !== opts.expectedFiles) {
+            violations.push({
+                code: "modified",
+                id: "(audit)",
+                detail: `the changed-files listing reports ${uniqueFiles} unique files but PR metadata reports ${opts.expectedFiles} — the listing is incomplete, audit cannot conclude`,
+            });
+            return { violations, replayIds, ambiguousIds };
+        }
     }
     // Changed public-provenance paths only (key.pem is evaluated separately by
     // the trust-root change detection — it is not an integrity violation).
@@ -312,13 +314,37 @@ export async function auditProvenanceIntegrity(github, owner, repo, prNumber, co
             detail: `total provenance content changed by this PR exceeds ${MAX_TOTAL_CHANGED_PROVENANCE_BYTES_PER_PR} bytes — bounded audit`,
         });
     }
-    // Replay: a PR commit references an intent whose manifest already exists
-    // on the base branch. Checked per trailer id (bounded by trailer count) —
-    // never by enumerating the repository's full manifest history.
+    // Replay + trailer-without-manifest: every referenced id must have its
+    // manifest either on the base branch (then this PR re-references an
+    // existing intent = replay) or at the immutable PR head. A NEW trailer —
+    // referenced by a commit that is ahead of base (in compare base...head) —
+    // whose manifest exists NOWHERE is a hard violation: newly introduced
+    // intents must carry their manifest in the same commit. Only a reference
+    // carried in from base history (legacy pre-V2 intent) stays neutral.
     for (const id of refCommits.keys()) {
-        const baseRaw = await github.getFileContent(owner, repo, `.drift/public/intents/${id}.json`, baseSha);
-        if (baseRaw !== null)
+        const path = `.drift/public/intents/${id}.json`;
+        const baseRaw = await github.getFileContent(owner, repo, path, baseSha);
+        if (baseRaw !== null) {
             replayIds.push(id);
+            continue;
+        }
+        const headRaw = await github.getFileContent(owner, repo, path, headSha);
+        if (headRaw !== null)
+            continue; // added manifest — validated by the entry loop
+        const referencing = refCommits.get(id) ?? [];
+        // A reference is NEW when its commit is ahead of base. When the caller
+        // does not supply the ahead set at all, fail safe: treat references as
+        // new (a hard violation) rather than silently classifying them as legacy.
+        const newlyIntroduced = opts.aheadShas === undefined
+            ? referencing.length > 0
+            : referencing.some((sha) => opts.aheadShas.has(sha));
+        if (newlyIntroduced) {
+            violations.push({
+                code: "trailer-without-manifest",
+                id,
+                detail: "a new Drift-Intent trailer on this PR has no public manifest at the PR head — newly introduced intents must carry their manifest in the same commit",
+            });
+        }
     }
     return { violations, replayIds, ambiguousIds };
 }
@@ -327,23 +353,24 @@ export async function auditProvenanceIntegrity(github, owner, repo, prNumber, co
  * chronological order) whose tree contains the manifest path. Used to verify
  * that the manifest was introduced by the same commit that carries its
  * `Drift-Intent:` trailer and that head content is byte-identical to the
- * introduced content. Falls back to `headSha` when the commit list is
- * incomplete.
+ * introduced content. NEVER falls back to `headSha` as the introduction
+ * commit: with a complete commit list, a manifest not found in any listed
+ * commit is a violation (the caller reports it), never a silent guess.
  */
-async function introductionCommit(github, owner, repo, path, commits, headSha) {
+async function introductionCommit(github, owner, repo, path, commits, _headSha) {
     for (const commit of commits) {
         const raw = await github.getFileContent(owner, repo, path, commit.sha);
         if (raw !== null)
             return commit.sha;
     }
-    // Not found in the listed commits — check the head itself as a last resort
-    // (some PRs have commits outside the listed range).
-    const headRaw = await github.getFileContent(owner, repo, path, headSha);
-    return headRaw !== null ? headSha : null;
+    return null;
 }
 async function readKey(github, owner, repo, ref) {
     const keyRaw = await github.getFileContent(owner, repo, ".drift/public/key.pem", ref);
-    if (keyRaw && keyRaw.includes("PUBLIC KEY"))
+    // ONLY a strictly-valid Ed25519 public key is usable verification material;
+    // malformed / private / wrong-algorithm keys return null (unverifiable) and
+    // the key-change detection flags them as a failure state separately.
+    if (keyRaw && tryParseTrustRoot(keyRaw).state === "valid")
         return keyRaw.trim();
     return null;
 }

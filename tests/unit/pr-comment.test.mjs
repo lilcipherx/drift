@@ -19,6 +19,7 @@ import {
   auditPublicProvenance,
   validateManifest,
   signingKeyIdFor,
+  parseTrustRootPem,
   hasProvenanceError,
 } from "../../scripts/pr-comment.mjs";
 import { generateKeyPair, newIntentId, PublicStore } from "@drift/core";
@@ -1079,4 +1080,130 @@ test("hasProvenanceError: trust/integrity state → workflow-failure mapping (is
   function emptyAudit() {
     return { violations: [], replayIds: [], ambiguousIds: [] };
   }
+});
+
+// --------------------------------------------- final completeness regressions
+test("auditPublicProvenance: NEW PR trailer without a manifest is a hard violation", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // head introduces a trailer for ID_NEW but ships NO manifest file
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 90;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `feat\n\nDrift-Intent: ${ID_C}`]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.ok(
+    audit.violations.some((v) => v.code === "trailer-without-manifest" && v.id === ID_C),
+    JSON.stringify(audit.violations),
+  );
+});
+
+test("auditPublicProvenance: a historical legacy trailer (from base history) with no manifest stays neutral", () => {
+  const repo = makeRepo();
+  // base commit references a legacy pre-V2 intent id with NO manifest — this
+  // is historical data, and the PR range carries it in without re-introducing it.
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 90;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `legacy full-mode intent\n\nDrift-Intent: ${ID_B}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 91;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "plain source change"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  // PR range includes the legacy commit (ancestor of base) + the new commit
+  const audit = auditOf(repo, { baseSha, headSha, commits: [baseSha, headSha] });
+  assert.equal(audit.violations.length, 0, JSON.stringify(audit.violations));
+  assert.ok(!audit.replayIds.includes(ID_B), "no manifest anywhere → not a replay");
+});
+
+test("auditPublicProvenance: a manifest placed at the WRONG filename is a violation", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // the manifest's OWN id is ID_B but it is stored as ID_A.json (and the
+  // trailer says ID_B) — the filename/id mismatch must not silently associate
+  writePublicProvenance(repo, { manifests: { [ID_A]: { id: ID_B } } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `feat\n\nDrift-Intent: ${ID_B}`]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.ok(
+    audit.violations.some((v) => v.id === ID_B && v.detail.includes("wrong filename")),
+    JSON.stringify(audit.violations),
+  );
+});
+
+test("Action malformed trust-root states: malformed initial key fails, valid bootstrap stays neutral", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // head introduces a MALFORMED key file (not a real key)
+  writeKey(repo, "-----BEGIN PUBLIC KEY-----\nNOT_A_REAL_KEY\n-----END PUBLIC KEY-----\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "introduce malformed key"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.notEqual(r.status, 0, "a malformed initial key is NOT a bootstrap — it must fail");
+  assert.ok(r.summary.includes("initial trust root is malformed"), r.summary);
+  assert.ok(!r.summary.includes("unverified bootstrap"), "malformed must never be labeled bootstrap");
+  // no token must not bypass the failure either
+  const rNoToken = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.notEqual(rNoToken.status, 0);
+});
+
+test("Action malformed base trust root: base-malformed fails even with a valid head key", () => {
+  const repo = makeRepo();
+  writeKey(repo, "-----BEGIN PUBLIC KEY-----\nGARBAGE\n-----END PUBLIC KEY-----\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "base with malformed key"]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writeKey(repo, KEY);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "head with valid key"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const r = runAction({ repo, event: eventForSha(repo, baseSha, headSha) });
+  assert.notEqual(r.status, 0, "a malformed base root must never silently trust the head key");
+  assert.ok(r.summary.includes("trust root is malformed on the base branch"), r.summary);
+});
+
+test("hasProvenanceError: malformed key states fail; trailer-without-manifest fails", () => {
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "malformed-bootstrap", audit: { violations: [], replayIds: [], ambiguousIds: [] } }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "malformed-replacement", audit: { violations: [], replayIds: [], ambiguousIds: [] } }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "base-malformed", audit: { violations: [], replayIds: [], ambiguousIds: [] } }), true);
+  assert.equal(
+    hasProvenanceError({
+      intents: [],
+      keyChange: "unchanged",
+      audit: { violations: [{ code: "trailer-without-manifest", id: ID_C, detail: "x" }], replayIds: [], ambiguousIds: [] },
+    }),
+    true,
+  );
+});
+test("Action parseTrustRootPem: accepts ONLY validated Ed25519 public keys (Core parity)", () => {
+  const { privateKey: pk, publicKey: pub } = generateKeyPairSync("ed25519");
+  const valid = pub.export({ type: "spki", format: "pem" }).toString();
+  const privatePem = pk.export({ type: "pkcs8", format: "pem" }).toString();
+  const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const rsaPem = rsa.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const ec = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const ecPem = ec.publicKey.export({ type: "spki", format: "pem" }).toString();
+
+  assert.equal(parseTrustRootPem(valid).state, "valid", "Ed25519 SPKI PEM is valid");
+  assert.equal(parseTrustRootPem(valid.replace(/\n/g, "\r\n")).state, "valid", "CRLF is valid");
+  assert.equal(
+    parseTrustRootPem(valid).fingerprint,
+    parseTrustRootPem(valid.replace(/\n/g, "\r\n")).fingerprint,
+    "CRLF never changes the identity",
+  );
+  // A private key PEM must NOT be accepted even though createPublicKey would
+  // derive a public key from it (Node quirk the parser must guard against).
+  const priv = parseTrustRootPem(privatePem);
+  assert.equal(priv.state, "malformed");
+  assert.equal(priv.errorCode, "not-public-key");
+  assert.equal(parseTrustRootPem(rsaPem).errorCode, "unsupported-key-type", "RSA is rejected");
+  assert.equal(parseTrustRootPem(ecPem).errorCode, "unsupported-key-type", "EC is rejected");
+  assert.equal(parseTrustRootPem("garbage").state, "malformed");
+  assert.equal(parseTrustRootPem(null).state, "absent");
+  assert.equal(parseTrustRootPem("").state, "absent");
+  // oversized PEM
+  const big = `-----BEGIN PUBLIC KEY-----\n${"A".repeat(20 * 1024)}\n-----END PUBLIC KEY-----`;
+  assert.equal(parseTrustRootPem(big).errorCode, "oversized");
 });

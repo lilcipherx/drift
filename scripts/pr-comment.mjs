@@ -420,8 +420,11 @@ export function signatureStateFor(manifest, { baseKey, headKey, malformed = fals
   if (malformed) return "malformed";
   if (!manifest) return "missing";
   if (typeof manifest.signature !== "string" || !manifest.signature) return "unsigned";
-  const baseUsable = baseKey != null && looksLikePublicKey(baseKey);
-  const headUsable = headKey != null && looksLikePublicKey(headKey);
+  // Usability is decided by STRICT parsing (never a fallback identity): a key
+  // that merely contains the text "PUBLIC KEY" but does not parse is NOT
+  // usable verification material.
+  const baseUsable = baseKey != null && parseTrustRootPem(baseKey).state === "valid";
+  const headUsable = headKey != null && parseTrustRootPem(headKey).state === "valid";
   // A malformed base trust root is unusable — mark unverifiable rather than
   // guessing. (If the PR also replaced it, the key-change warning fires
   // separately.)
@@ -445,17 +448,14 @@ export function signatureStateFor(manifest, { baseKey, headKey, malformed = fals
   return "unverifiable";
 }
 
-function looksLikePublicKey(pem) {
-  return typeof pem === "string" && pem.includes("PUBLIC KEY");
-}
-
 /**
  * Canonical short fingerprint of an Ed25519 public key: the first 16 hex
  * chars of the SHA-256 of its SPKI DER bytes — NOT the textual PEM — exactly
  * mirroring @drift/core `signingKeyIdFor`. LF/CRLF line endings and harmless
  * surrounding whitespace can never change a key's identity, and a real
- * Core-generated V2 manifest always matches. Malformed PEM falls back to a
- * stable hash of the text (consumers treat such a key as unverifiable).
+ * Core-generated V2 manifest always matches. DIAGNOSTIC-ONLY: the fallback
+ * hash of malformed text is never a key identity (security decisions use
+ * `parseTrustRootPem`, which never produces a fallback identity).
  */
 export function signingKeyIdFor(publicKeyPem) {
   try {
@@ -470,14 +470,62 @@ export function signingKeyIdFor(publicKeyPem) {
   }
 }
 
+const TRUST_ROOT_MAX_BYTES = 16 * 1024;
+const PRIVATE_KEY_MARKER = /PRIVATE KEY/;
+const CERTIFICATE_MARKER = /BEGIN CERTIFICATE/;
+
 /**
- * Canonical trust-root identity of a PEM key (or null when absent). Uses the
- * SPKI-DER fingerprint, never textual comparison, so the same key with
- * LF/CRLF or whitespace differences is never mistaken for a replacement.
+ * Strictly parse a trust-root PEM (dependency-free mirror of @drift/core
+ * `parseTrustRoot`): absent/empty → absent; a valid Ed25519 PUBLIC key →
+ * valid with the canonical SPKI-DER fingerprint; anything else → malformed
+ * with a stable error code. NEVER fabricates a fallback identity for
+ * malformed material, NEVER accepts a private key (Node's `createPublicKey`
+ * would happily derive a public key from one), a certificate, a different
+ * algorithm (RSA/EC/DSA/…) or an oversized PEM — the malformed text hash is
+ * diagnostics only.
  */
-export function trustRootIdentity(publicKeyPem) {
-  if (publicKeyPem == null) return null;
-  return signingKeyIdFor(publicKeyPem);
+export function parseTrustRootPem(publicKeyPem) {
+  const text = String(publicKeyPem ?? "");
+  if (text.trim().length === 0) return { state: "absent" };
+  if (Buffer.byteLength(text, "utf8") > TRUST_ROOT_MAX_BYTES) {
+    return { state: "malformed", errorCode: "oversized" };
+  }
+  if (PRIVATE_KEY_MARKER.test(text)) return { state: "malformed", errorCode: "not-public-key" };
+  if (CERTIFICATE_MARKER.test(text)) return { state: "malformed", errorCode: "not-public-key" };
+  if (!text.includes("PUBLIC KEY")) return { state: "malformed", errorCode: "not-public-key" };
+  let key;
+  try {
+    key = createPublicKey(text.trim());
+  } catch {
+    return { state: "malformed", errorCode: "parse-error" };
+  }
+  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+    return { state: "malformed", errorCode: "unsupported-key-type" };
+  }
+  const der = key.export({ type: "spki", format: "der" });
+  if (der.byteLength > 128) return { state: "malformed", errorCode: "oversized" };
+  return { state: "valid", fingerprint: signingKeyIdFor(text) };
+}
+
+/**
+ * Full base/head trust-root relationship (mirror of @drift/core
+ * `evaluateTrustRootChange`): none / unchanged / bootstrap / replaced /
+ * removed / malformed-bootstrap / malformed-replacement / base-malformed.
+ * A malformed base root is always a failure state — the audit cannot
+ * establish a valid trust root and must never silently trust the head key.
+ */
+export function evaluateTrustRootChange(baseKey, headKey) {
+  const base = parseTrustRootPem(baseKey);
+  const head = parseTrustRootPem(headKey);
+  if (base.state === "malformed") return "base-malformed";
+  if (base.state === "absent") {
+    if (head.state === "absent") return "none";
+    if (head.state === "valid") return "bootstrap";
+    return "malformed-bootstrap";
+  }
+  if (head.state === "absent") return "removed";
+  if (head.state === "malformed") return "malformed-replacement";
+  return base.fingerprint === head.fingerprint ? "unchanged" : "replaced";
 }
 
 /**
@@ -614,6 +662,25 @@ export function auditPublicProvenance({ repoRoot, baseSha, headSha, commits, git
     }
     const id = manifestId(entry.path);
     if (entry.status === "A" && id) {
+      // Filename ID must match the manifest's OWN id (a manifest placed at
+      // the wrong filename is a distinct failure, not a silent association).
+      const addedRaw = getFileAt(repoRoot, headSha, entry.path, gitImpl);
+      if (addedRaw != null) {
+        try {
+          const parsedContent = JSON.parse(addedRaw);
+          if (typeof parsedContent?.id === "string" && parsedContent.id !== id) {
+            violations.push({
+              code: "orphan",
+              id: parsedContent.id,
+              detail: `manifest placed at the wrong filename ${entry.path} (its content id is ${parsedContent.id})`,
+            });
+            orphanIds.push(parsedContent.id);
+            continue;
+          }
+        } catch {
+          /* malformed JSON — the strict validator reports it separately */
+        }
+      }
       const n = commitCount.get(id) ?? 0;
       if (n === 0) {
         violations.push({
@@ -660,11 +727,43 @@ export function auditPublicProvenance({ repoRoot, baseSha, headSha, commits, git
     }
   }
 
-  // Replay: a PR commit references an intent whose manifest already exists
-  // on the base branch.
+  // Replay + trailer-without-manifest: for every trailer id, the manifest
+  // must exist either on the base branch (then this PR re-references an
+  // existing intent = replay) or at the immutable PR head. A NEW trailer —
+  // introduced by a PR commit that is NOT an ancestor of the base branch —
+  // whose manifest exists NOWHERE is a hard violation: newly introduced
+  // intents must carry their manifest in the same commit. Only a reference
+  // carried in from base history (a legacy pre-V2 intent, no manifest
+  // anywhere) stays neutral as `legacy-missing`.
   for (const [id] of commitCount) {
-    const exists = gitImpl(repoRoot, ["cat-file", "-e", `${baseSha}:.drift/public/intents/${id}.json`]).status === 0;
-    if (exists) replayIds.push(id);
+    const path = `.drift/public/intents/${id}.json`;
+    const baseExists = gitImpl(repoRoot, ["cat-file", "-e", `${baseSha}:${path}`]).status === 0;
+    if (baseExists) {
+      replayIds.push(id);
+      continue;
+    }
+    const headExists = gitImpl(repoRoot, ["cat-file", "-e", `${headSha}:${path}`]).status === 0;
+    if (headExists) continue; // added manifest — validated by the entry loop
+    let newlyIntroduced = false;
+    for (const sha of commits) {
+      const res = gitImpl(repoRoot, ["log", "-1", "--format=%B", sha]);
+      if (res.status !== 0) continue;
+      if (!extractDriftIntentIds(res.stdout, gitImpl, repoRoot).includes(id)) continue;
+      // A referencing commit that is NOT an ancestor of base is NEW to this
+      // PR → the missing manifest is a violation, not a legacy state.
+      const ancestor = gitImpl(repoRoot, ["merge-base", "--is-ancestor", sha, baseSha]);
+      if (ancestor.status !== 0) {
+        newlyIntroduced = true;
+        break;
+      }
+    }
+    if (newlyIntroduced) {
+      violations.push({
+        code: "trailer-without-manifest",
+        id,
+        detail: "a new Drift-Intent trailer on this PR has no public manifest at the PR head — newly introduced intents must carry their manifest in the same commit",
+      });
+    }
   }
   // Ambiguous: the same intent id referenced from multiple distinct commits.
   for (const [id, n] of commitCount) {
@@ -700,14 +799,29 @@ export const TRUST_ROOT_WARNING =
 const FAILING_SIGNATURE_STATES = new Set(["invalid", "untrusted-key", "malformed"]);
 
 /**
+ * Trust-root states that are provenance ERRORS. A valid bootstrap is NEUTRAL;
+ * anything malformed (malformed initial key, malformed replacement, malformed
+ * base root) is a failure — malformed key material never gets a fallback
+ * identity and never counts as a trusted change.
+ */
+const FAILING_KEY_CHANGES = new Set([
+  "replaced",
+  "removed",
+  "malformed-bootstrap",
+  "malformed-replacement",
+  "base-malformed",
+]);
+
+/**
  * Whether the PR carries a provenance error that should fail the workflow
  * when `fail-on-provenance-error` is true (the default): invalid signatures,
- * untrusted/malformed manifests, trust-root replacement/removal, or ANY
- * public-provenance integrity violation. Neutral states (bootstrap, unsigned,
- * unverifiable, missing manifests, no intents) are NOT errors.
+ * untrusted/malformed manifests, trust-root replacement/removal/malformed
+ * states, a NEW trailer without its manifest, or ANY public-provenance
+ * integrity violation. Neutral states (valid bootstrap, unsigned,
+ * unverifiable, legacy-missing manifests, no intents) are NOT errors.
  */
 export function hasProvenanceError({ intents, keyChange, audit }) {
-  if (keyChange === "replaced" || keyChange === "removed") return true;
+  if (FAILING_KEY_CHANGES.has(keyChange)) return true;
   if (Array.isArray(intents) && intents.some((i) => FAILING_SIGNATURE_STATES.has(i.signatureState))) return true;
   if (
     audit &&
@@ -732,12 +846,24 @@ export function buildSummary(intents, { keyChange, audit } = {}) {
     audit &&
     (audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0);
   const keyState = keyChange ?? "none";
-  const blockingKey = keyState === "replaced" || keyState === "removed";
+  // Failure states: replacement, removal, and ANY malformed key state (an
+  // initial malformed key, a malformed replacement, or a malformed base
+  // root). Only a cryptographically parseable initial key is a neutral
+  // bootstrap.
+  const blockingKey = FAILING_KEY_CHANGES.has(keyState);
   const bootstrapping = keyState === "bootstrap";
   if (!hasIntents && !blockingKey && !bootstrapping && !integrityIssues) return null;
   const lines = [SUMMARY_MARKER];
   if (blockingKey) {
-    lines.push(TRUST_ROOT_WARNING);
+    lines.push(
+      keyState === "base-malformed"
+        ? "## ⚠ Drift trust root is malformed on the base branch\n\n`.drift/public/key.pem` on the base branch is not a valid Drift public key — no trust root can be established, so this PR's provenance is unverifiable and blocked."
+        : keyState === "malformed-bootstrap"
+          ? "## ⚠ Drift initial trust root is malformed\n\nThis pull request introduces `.drift/public/key.pem`, but the file is not a valid Drift public key. A malformed initial key is NOT a bootstrap — provenance on this PR is blocked until a valid key is introduced."
+          : keyState === "malformed-replacement"
+            ? "## ⚠ Drift trust-root replacement is malformed\n\nThis pull request replaces `.drift/public/key.pem` with content that is not a valid Drift public key. The malformed replacement cannot be trusted — blocked until a valid key is introduced through the rotation process."
+            : TRUST_ROOT_WARNING,
+    );
     if (!hasIntents && !integrityIssues) return lines.join("\n");
     lines.push("", "---", "");
   }
@@ -799,7 +925,7 @@ export function buildSummary(intents, { keyChange, audit } = {}) {
   if (integrityIssues) {
     lines.push("", "## ⚠ Public provenance integrity violations", "");
     for (const v of audit.violations) {
-      lines.push(`- **${safe(v.code, 16)}** \`${safe(v.id, 40)}\` — ${safe(v.detail, 200)}`);
+      lines.push(`- **${safe(v.code, 32)}** \`${safe(v.id, 40)}\` — ${safe(v.detail, 200)}`);
     }
     for (const id of audit.replayIds) {
       lines.push(`- **replayed** \`${safe(id, 40)}\` — this intent's manifest already exists on the base branch; a new commit must not re-reference it`);
@@ -987,15 +1113,11 @@ async function main() {
   // PR (no intents at all) must still surface its full key-change state.
   const baseKey = getFileAt(repoRoot, event.baseSha, ".drift/public/key.pem");
   const headKey = getFileAt(repoRoot, event.headSha, ".drift/public/key.pem");
-  // Canonical trust-root comparison: SPKI-DER fingerprints, never PEM text —
-  // the same key with LF/CRLF or whitespace formatting differences must not
-  // register as a replacement.
-  const baseId = trustRootIdentity(baseKey);
-  const headId = trustRootIdentity(headKey);
-  let keyChange = "none";
-  if (!baseId && headId) keyChange = "bootstrap";
-  else if (baseId && !headId) keyChange = "removed";
-  else if (baseId && headId && baseId !== headId) keyChange = "replaced";
+  // Canonical trust-root comparison: STRICT PEM parsing + SPKI-DER
+  // fingerprints, never text presence and never a fallback identity for
+  // malformed material. Malformed bootstrap/replacement keys and a malformed
+  // base root are explicit failure states.
+  const keyChange = evaluateTrustRootChange(baseKey, headKey);
 
   // 4. intents from PR commits only; manifests read at the immutable HEAD
   // commit (`readManifestAt`), so uncommitted working-tree mutations are
