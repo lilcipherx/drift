@@ -1,13 +1,16 @@
 /**
- * drift-app tests: trailer extraction, summary building, HMAC verification,
- * JWT creation, the webhook handler with a fake GitHub client, and an HTTP
- * server smoke test.
+ * drift-app tests: trailer extraction, public-manifest hydration, summary
+ * building, HMAC verification, JWT creation, the webhook handler with a fake
+ * GitHub client, and an HTTP server smoke test.
+ *
+ * ADR-009: the app reads ONLY `.drift/public/` manifests; the full prompt is
+ * never loaded, never rendered, never posted.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac, generateKeyPairSync } from "node:crypto";
-import { deriveMasterKey, encryptAesGcm } from "@drift/core";
+import { createHmac, generateKeyPairSync, sign as nodeSign } from "node:crypto";
+import { canonicalJson } from "@drift/core";
 
 // The app package exposes its internals via its built dist modules (index.ts
 // is the CLI entrypoint and must not be imported).
@@ -16,18 +19,20 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const appDist = join(here, "..", "..", "packages", "drift-app", "dist");
 const mod = (name) => import(pathToFileURL(join(appDist, name)).href);
-const { extractIntentIds, fetchIntents, decryptPrompt } = await mod("intents.js");
-const { summarizeIntents } = await mod("summarize.js");
+const { extractIntentIds, fetchIntents } = await mod("intents.js");
+const { summarizeIntents, SUMMARY_MARKER } = await mod("summarize.js");
 const { verifyWebhookSignature, handleWebhook } = await mod("handler.js");
 const { createAppJwt, decodeJwt } = await mod("jwt.js");
 const { createWebhookServer } = await mod("server.js");
 
 // ------------------------------------------------------------- unit: trailers
-test("extractIntentIds: parses Drift-Intent trailers across commits, dedupes", () => {
+test("extractIntentIds: parses Drift-Intent trailers across commits, dedupes, ignores invalid ids", () => {
   const commits = [
     { sha: "a", message: "Add TokenPayload\n\nDrift-Intent: did_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     { sha: "b", message: "Fix race\n\nDrift-Intent: did_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nDrift-Intent: did_cccccccccccccccccccccccccccccccc" },
     { sha: "c", message: "no trailer here" },
+    { sha: "d", message: "bad id\n\nDrift-Intent: did_NOT_A_REAL_ID" },
+    { sha: "e", message: "duplicate\n\nDrift-Intent: did_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   ];
   assert.deepEqual(extractIntentIds(commits), [
     "did_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -40,18 +45,36 @@ test("extractIntentIds: empty when no trailers", () => {
   assert.deepEqual(extractIntentIds([{ sha: "x", message: "plain commit" }]), []);
 });
 
-// --------------------------------------------------------- unit: decryptPrompt
-test("decryptPrompt: plaintext passthrough, encrypted needs key + aad", () => {
-  assert.deepEqual(decryptPrompt("plain prompt"), { prompt: "plain prompt", encrypted: false });
-  const key = deriveMasterKey("ab".repeat(32));
-  const enc = encryptAesGcm("top secret", key, "did_a");
-  assert.deepEqual(decryptPrompt(enc), { prompt: "🔒 [encrypted]", encrypted: true });
-  assert.deepEqual(decryptPrompt(enc, "ab".repeat(32), "did_a"), { prompt: "top secret", encrypted: true });
-  assert.equal(decryptPrompt(enc, "ab".repeat(32), "did_wrong").prompt, "🔒 [encrypted: invalid key]");
+// ------------------------------------------------------- fixtures (real keys)
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+const PUBLIC_KEY_PEM = publicKey.export({ type: "spki", format: "pem" }).toString();
+
+function signedManifest(body) {
+  const { signature: _sig, ...unsigned } = body;
+  const signature = nodeSign(null, Buffer.from(canonicalJson(unsigned), "utf8"), privateKey).toString("base64");
+  return { ...unsigned, signature };
+}
+
+const INTENT_ID = "did_43102f533af8feb75e084d07b670c29c";
+const MANIFEST_PATH = `.drift/public/intents/${INTENT_ID}.json`;
+const MANIFEST = signedManifest({
+  schemaVersion: 1,
+  id: INTENT_ID,
+  summary: "Fix race condition in token refresh by de-duplicating in-flight refreshes",
+  model: "claude-3-5-sonnet",
+  agent: { type: "AGENT", identifier: "Drift Demo" },
+  verification: "npm test",
+  files: [{ path: "src/auth.ts", mutationType: "ADDED", summary: 'function "refreshToken" added (line 12)' }],
+  commit: "abc123def",
+  timestamp: 1786000000000,
 });
 
+function manifestJson(extra = {}) {
+  return JSON.stringify({ ...MANIFEST, ...extra });
+}
+
 // ------------------------------------------------------------- unit: summarize
-test("summarizeIntents: groups intents with prompt, model and file table", () => {
+test("summarizeIntents: groups intents with safe summary, model and file table — never prompt", () => {
   const body = summarizeIntents({
     owner: "lilcipherx",
     repo: "drift",
@@ -59,31 +82,61 @@ test("summarizeIntents: groups intents with prompt, model and file table", () =>
     prTitle: "Fix race",
     intents: [
       {
-        id: "did_43102f533af8feb75e084d07b670c29c",
+        id: INTENT_ID,
         authorType: "AGENT",
         authorId: "Drift Demo",
         model: "claude-3-5-sonnet",
-        prompt: "Fix race condition in token refresh",
-        encryptedPrompt: false,
-        verifyCmd: null,
+        summary: "Fix race condition in token refresh",
+        verifyCmd: "npm test",
         signature: true,
         files: [{ path: "src/auth.ts", mutationType: "ADDED", summary: 'function "refreshToken" added (line 12)' }],
       },
     ],
   });
-  assert.ok(body.includes("Drift intent summary"));
-  assert.ok(body.includes("did_4310…"));
+  assert.ok(body.includes("Drift — Why this changed"));
+  assert.ok(body.includes("did_43102f5…"));
   assert.ok(body.includes("Fix race condition in token refresh"));
   assert.ok(body.includes("claude-3-5-sonnet"));
-  assert.ok(body.includes("| `src/auth.ts` | **ADDED**"));
+  assert.ok(body.includes("- `src/auth.ts` (**ADDED**)"), "files are listed");
+  assert.ok(!body.includes("prompt"), "the word prompt must not appear as data");
 });
 
-test("summarizeIntents: marks encrypted prompts", () => {
+test("summarizeIntents: neutralizes injected markdown, HTML comments, mentions and control chars", () => {
   const body = summarizeIntents({
     owner: "o", repo: "r", prNumber: 1, prTitle: "t",
-    intents: [{ id: "did_11111111111111111111111111111111", authorType: "AGENT", authorId: "a", model: null, prompt: "🔒 [encrypted]", encryptedPrompt: true, verifyCmd: null, signature: true, files: [] }],
+    intents: [{
+      id: "did_11111111111111111111111111111111",
+      authorType: "AGENT",
+      authorId: "alice",
+      model: null,
+      summary: "real text <!-- hidden --> @everyone @here\n\x1b[31mred\x1b[0m \x07 bell",
+      verifyCmd: null,
+      signature: false,
+      files: [],
+    }],
   });
-  assert.ok(body.includes("🔒"));
+  assert.ok(body.includes("real text"));
+  assert.ok(!body.includes("hidden"), "injected HTML comment content must be neutralized");
+  assert.ok(!body.includes("\x1b["), "ANSI escapes must be stripped");
+  assert.ok(!body.includes("@everyone") || body.includes("@\u200beveryone"), "mention spam must be neutralized");
+  assert.ok(!body.includes("\x07"), "control chars must be stripped");
+});
+
+test("summarizeIntents: caps intents, files and summary length", () => {
+  const many = Array.from({ length: 25 }, (_, i) => ({
+    id: `did_${String(i).padStart(32, "0")}`,
+    authorType: "HUMAN",
+    authorId: `a${i}`,
+    model: null,
+    summary: `s${i}`,
+    verifyCmd: null,
+    signature: false,
+    files: Array.from({ length: 30 }, (_, j) => ({ path: `src/f${j}.ts`, mutationType: "ADDED", summary: null })),
+  }));
+  const body = summarizeIntents({ owner: "o", repo: "r", prNumber: 1, prTitle: "t", intents: many });
+  assert.ok(body.includes("not shown"), "extra intents must be reported as truncated");
+  assert.ok(body.split("### Intent").length - 1 <= 10, "max 10 intents shown");
+  assert.ok(body.length < 15000, "comment stays bounded");
 });
 
 // ------------------------------------------------------- unit: webhook sig
@@ -98,8 +151,8 @@ test("verifyWebhookSignature: valid, invalid, missing", () => {
 
 // ---------------------------------------------------------------- unit: JWT
 test("createAppJwt: RS256 header, iss/iat/exp claims, TTL capped at 600s", () => {
-  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const { privateKey: rsaKey, publicKey: rsaPub } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = rsaKey.export({ type: "pkcs8", format: "pem" }).toString();
   const token = createAppJwt("12345", pem);
   const { header, payload } = decodeJwt(token);
   assert.equal(header.alg, "RS256");
@@ -108,14 +161,15 @@ test("createAppJwt: RS256 header, iss/iat/exp claims, TTL capped at 600s", () =>
   const long = createAppJwt("12345", pem, 900);
   const longClaims = decodeJwt(long).payload;
   assert.ok(longClaims.exp - longClaims.iat <= 600);
-  void publicKey;
+  void rsaPub;
 });
 
 // ------------------------------------------------------- handler (fake GH)
 class FakeGitHub {
-  constructor(commits, objects, existingComments = []) {
+  constructor(commits, manifests, existingComments = [], opts = {}) {
     this.commits = commits;
-    this.objects = objects;
+    this.manifests = manifests; // path -> JSON string
+    this.publicKeyPem = opts.publicKeyPem ?? null;
     // issue comments already on the PR (id ascending)
     this.existing = existingComments.map((body, i) => ({ id: i + 1, body }));
     this.nextId = this.existing.length + 1;
@@ -124,9 +178,10 @@ class FakeGitHub {
   }
   setInstallation(id) { this.installation = id; }
   async getPullCommits() { return this.commits; }
-  async getObjectPaths() { return Object.keys(this.objects); }
-  async getFileContent(owner, repo, path) { return this.objects[path] ?? null; }
-  async listIssueComments() { return [...this.existing]; }
+  async getFileContent(owner, repo, path) {
+    if (path === ".drift/public/key.pem") return this.publicKeyPem;
+    return this.manifests[path] ?? null;
+  }
   async postComment(owner, repo, issueNumber, body) {
     this.calls.comments.push({ issueNumber, body });
     this.existing.push({ id: this.nextId++, body });
@@ -143,7 +198,6 @@ class FakeGitHub {
   }
 }
 
-const INTENT_ID = "did_43102f533af8feb75e084d07b670c29c";
 const PAYLOAD = {
   action: "opened",
   installation: { id: 77 },
@@ -155,23 +209,23 @@ function eventFor(payload, raw = JSON.stringify(payload)) {
   return { event: "pull_request", payload, rawBody: raw };
 }
 
+const COMMITS = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
+
+function makeGitHub(opts = {}, manifestOverride = null) {
+  return new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestOverride ?? manifestJson() }, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    ...opts,
+  });
+}
+
 test("handler: readOnly (dev --dry-run) builds the summary without writing", async () => {
-  const commits = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
-  const objects = {
-    ".drift/objects/64/b1.json": JSON.stringify({
-      id: INTENT_ID,
-      prompt: "Fix race condition in token refresh by de-duplicating in-flight refreshes",
-      author: { type: "AGENT", identifier: "Drift Demo", model: "claude-3-5-sonnet" },
-      astDelta: [{ filePath: "src/auth.ts", type: "ADDED", nodeIds: [], summary: 'function "refreshToken" added (line 12)' }],
-      signature: "fake-ed25519",
-    }),
-  };
-  const github = new FakeGitHub(commits, objects);
+  const github = makeGitHub();
   const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
   assert.equal(result.action, "dry-run");
   assert.equal(result.intentsFound, 1);
-  assert.ok(result.commentBody.includes("Drift intent summary"));
+  assert.ok(result.commentBody.includes("Drift — Why this changed"));
   assert.ok(result.commentBody.includes("de-duplicating in-flight refreshes"));
+  assert.ok(!result.commentBody.includes("intent.prompt"));
   // nothing was written: no comment, no check run
   assert.equal(github.calls.comments.length, 0);
   assert.equal(github.calls.updates.length, 0);
@@ -180,53 +234,37 @@ test("handler: readOnly (dev --dry-run) builds the summary without writing", asy
   assert.equal(github.calls.list ?? 0, 0);
 });
 
-test("handler: posts intent summary comment + check run", async () => {
-  const commits = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
-  const objects = {
-    ".drift/objects/64/b1b7db2e1546464c729a960997cd3eae7af102613f2d66b6ff3062ea3dee5d.json": JSON.stringify({
-      id: INTENT_ID,
-      prompt: "Fix race condition in token refresh by de-duplicating in-flight refreshes",
-      author: { type: "AGENT", identifier: "Drift Demo", model: "claude-3-5-sonnet" },
-      astDelta: [{ filePath: "src/auth.ts", type: "ADDED", nodeIds: [], summary: 'function "refreshToken" added (line 12)' }],
-      signature: "fake-ed25519",
-    }),
-  };
-  const github = new FakeGitHub(commits, objects);
+test("handler: posts intent summary comment + check run, never the prompt", async () => {
+  const github = makeGitHub();
   const result = await handleWebhook(eventFor(PAYLOAD), { github, checkRun: true });
   assert.equal(result.action, "commented");
   assert.equal(result.intentsFound, 1);
   assert.equal(github.installation, 77);
   assert.equal(github.calls.comments.length, 1);
   assert.equal(github.calls.comments[0].issueNumber, 7);
-  assert.ok(github.calls.comments[0].body.includes("Drift intent summary"));
+  assert.ok(github.calls.comments[0].body.includes("Drift — Why this changed"));
   assert.ok(github.calls.comments[0].body.includes("de-duplicating in-flight refreshes"));
+  assert.ok(!github.calls.comments[0].body.includes("PRIVATE_MARKER_NEVER_RENDERED"));
   // the summary embeds the idempotency marker
-  assert.ok(github.calls.comments[0].body.includes("<!-- drift:summary -->"));
+  assert.ok(github.calls.comments[0].body.includes(SUMMARY_MARKER));
   assert.equal(github.calls.checks.length, 1);
   assert.equal(github.calls.checks[0].headSha, "abc123def");
 });
 
-test("handler: decrypts encrypted prompts with DRIFT_MASTER_KEY", async () => {
-  const key = deriveMasterKey("ab".repeat(32));
-  const encPrompt = encryptAesGcm("secret agent prompt", key, INTENT_ID);
-  const commits = [{ sha: "s1", message: `secret work\n\nDrift-Intent: ${INTENT_ID}` }];
-  const objects = {
-    ".drift/objects/aa/bb.json": JSON.stringify({
-      id: INTENT_ID,
-      prompt: encPrompt,
-      author: { type: "AGENT", identifier: "Agent", model: "m1" },
-      astDelta: [],
-      signature: "sig",
-    }),
-  };
-  const github = new FakeGitHub(commits, objects);
-  const result = await handleWebhook(eventFor(PAYLOAD), { github, masterKey: "ab".repeat(32) });
-  assert.equal(result.action, "commented");
-  assert.ok(result.commentBody.includes("secret agent prompt"));
-  // without the key the same intent shows as encrypted
-  const github2 = new FakeGitHub(commits, objects);
-  const result2 = await handleWebhook(eventFor(PAYLOAD), { github: github2 });
-  assert.ok(result2.commentBody.includes("🔒"));
+test("handler: never renders the full prompt even when the manifest summary is attacker-controlled", async () => {
+  // manifest summary is safe by construction (first line, sanitized), but a
+  // malicious summary still cannot break out or inject HTML/marker syntax
+  const github = makeGitHub(null, manifestJson({ summary: `clean summary\n<!-- injected --> @everyone` }));
+  const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
+  assert.ok(result.commentBody.includes("clean summary"));
+  assert.ok(!result.commentBody.includes("injected"), "injected HTML comment must be neutralized");
+  assert.ok(!result.commentBody.includes("@everyone") || result.commentBody.includes("@\u200beveryone"));
+});
+
+test("handler: signature verified against the committed public key", async () => {
+  const github = makeGitHub();
+  const result = await handleWebhook(eventFor(PAYLOAD), { github, readOnly: true });
+  assert.ok(result.commentBody.includes("✓ signed"), "valid manifest signature must be shown");
 });
 
 test("handler: no intents → no comment", async () => {
@@ -237,7 +275,7 @@ test("handler: no intents → no comment", async () => {
 });
 
 test("handler: rejects wrong signature and non-PR events", async () => {
-  const github = new FakeGitHub([], {});
+  const github = makeGitHub();
   const bad = await handleWebhook(
     { ...eventFor(PAYLOAD), signature: "sha256=nope" },
     { github, webhookSecret: "s3cret" },
@@ -248,24 +286,15 @@ test("handler: rejects wrong signature and non-PR events", async () => {
 });
 
 test("handler: synchronize updates the existing Drift comment instead of posting", async () => {
-  const commits = [{ sha: "abc123def", message: `Fix race condition in token refresh\n\nDrift-Intent: ${INTENT_ID}` }];
-  const objects = {
-    ".drift/objects/64/b1.json": JSON.stringify({
-      id: INTENT_ID,
-      prompt: "Fix race condition in token refresh by de-duplicating in-flight refreshes",
-      author: { type: "AGENT", identifier: "Drift Demo", model: "claude-3-5-sonnet" },
-      astDelta: [],
-      signature: "fake-ed25519",
-    }),
-  };
-  const existing = [`old draft\n<!-- drift:summary -->\n(previous summary)`, "a human comment, no marker"];
-  const github = new FakeGitHub(commits, objects, existing);
+  const existing = [`old draft\n${SUMMARY_MARKER}\n(previous summary)`, "a human comment, no marker"];
+  const github = new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, existing, {
+    publicKeyPem: PUBLIC_KEY_PEM,
+  });
   const result = await handleWebhook(
     { ...eventFor(PAYLOAD), payload: { ...PAYLOAD, action: "synchronize" } },
     { github },
   );
   assert.equal(result.action, "updated");
-  // updated in place: 2 updates? no — exactly one PATCH on the marker comment
   assert.equal(github.calls.updates.length, 1);
   assert.equal(github.calls.updates[0].commentId, 1);
   assert.ok(github.calls.updates[0].body.includes("de-duplicating in-flight refreshes"));
@@ -276,17 +305,9 @@ test("handler: synchronize updates the existing Drift comment instead of posting
 });
 
 test("handler: synchronize with no prior Drift comment posts a new one", async () => {
-  const commits = [{ sha: "s", message: `Add validation\n\nDrift-Intent: ${INTENT_ID}` }];
-  const objects = {
-    ".drift/objects/aa/bb.json": JSON.stringify({
-      id: INTENT_ID,
-      prompt: "Add JWT validation",
-      author: { type: "AGENT", identifier: "Bot", model: "m" },
-      astDelta: [],
-      signature: "sig",
-    }),
-  };
-  const github = new FakeGitHub(commits, objects, ["just a human comment"]);
+  const github = new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, ["just a human comment"], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+  });
   const result = await handleWebhook(
     { ...eventFor(PAYLOAD), payload: { ...PAYLOAD, action: "synchronize" } },
     { github },
@@ -297,8 +318,7 @@ test("handler: synchronize with no prior Drift comment posts a new one", async (
 });
 
 test("handler: permanent 4xx GitHub API errors are not retryable", async () => {
-  // repo deleted / bad permissions — retrying for days would be pointless
-  const github = new FakeGitHub([], {});
+  const github = makeGitHub();
   github.getPullCommits = async () => {
     throw new Error("getPullCommits failed: 404");
   };
@@ -309,7 +329,7 @@ test("handler: permanent 4xx GitHub API errors are not retryable", async () => {
 });
 
 test("handler: transient 5xx / network errors are retryable", async () => {
-  const github = new FakeGitHub([], {});
+  const github = makeGitHub();
   github.getPullCommits = async () => {
     throw new Error("getPullCommits failed: 503");
   };
@@ -317,8 +337,7 @@ test("handler: transient 5xx / network errors are retryable", async () => {
   assert.equal(result.action, "error");
   assert.equal(result.retryable, true);
 
-  // network-level failure without a status code is transient too
-  const github2 = new FakeGitHub([], {});
+  const github2 = makeGitHub();
   github2.getPullCommits = async () => {
     throw new TypeError("fetch failed");
   };
@@ -326,28 +345,34 @@ test("handler: transient 5xx / network errors are retryable", async () => {
   assert.equal(result2.retryable, true);
 });
 
-test("fetchIntents: falls back to commit subject when object missing", async () => {
+test("fetchIntents: falls back to commit subject when the public manifest is missing", async () => {
   const commits = [{ sha: "s", message: `Fallback subject here\n\nDrift-Intent: ${INTENT_ID}` }];
-  const github = new FakeGitHub(commits, {}); // no objects
+  const github = new FakeGitHub(commits, {}); // no manifests at all
   const views = await fetchIntents(github, "lilcipherx", "drift", "s", commits, [INTENT_ID]);
-  assert.equal(views[0].prompt, "Fallback subject here");
+  assert.equal(views[0].summary, "Fallback subject here");
   assert.equal(views[0].files.length, 0);
   assert.equal(views[0].signature, false);
 });
 
+test("fetchIntents: never loads or returns a prompt from a legacy object", async () => {
+  // a legacy repo might still have .drift/objects/ committed — the app must
+  // ignore it entirely and use the public manifest instead
+  const commits = [{ sha: "s", message: `Subject\n\nDrift-Intent: ${INTENT_ID}` }];
+  const legacyObject = `.drift/objects/aa/bb.json`;
+  const github = new FakeGitHub(commits, {
+    [legacyObject]: JSON.stringify({
+      id: INTENT_ID,
+      prompt: "DRIFT_PRIVATE_SECRET_7f2c91 legacy prompt must never surface",
+    }),
+  });
+  const views = await fetchIntents(github, "lilcipherx", "drift", "s", commits, [INTENT_ID]);
+  assert.ok(!JSON.stringify(views).includes("DRIFT_PRIVATE_SECRET_7f2c91"));
+  assert.equal(views[0].summary, "Subject", "falls back to the commit subject, not the object prompt");
+});
+
 // ------------------------------------------------------------ server smoke
 test("webhook server: POST /webhook with valid signature returns 200 + posts comment", async () => {
-  const commits = [{ sha: "abc123def", message: `Add JWT validation\n\nDrift-Intent: ${INTENT_ID}` }];
-  const objects = {
-    ".drift/objects/aa/cc.json": JSON.stringify({
-      id: INTENT_ID,
-      prompt: "Add JWT validation to auth middleware",
-      author: { type: "AGENT", identifier: "Bot", model: "deepseek" },
-      astDelta: [{ filePath: "src/auth.ts", type: "MODIFIED", nodeIds: [], summary: 'function "verifyToken" modified' }],
-      signature: "sig",
-    }),
-  };
-  const github = new FakeGitHub(commits, objects);
+  const github = makeGitHub();
   const secret = "webhook-secret";
   const { server, port, close } = await createWebhookServer({ github, webhookSecret: secret, port: 0, log: () => {} });
   try {
@@ -384,7 +409,7 @@ test("webhook server: POST /webhook with valid signature returns 200 + posts com
 });
 
 test("webhook server: oversized body is rejected with 413 (not retryable)", async () => {
-  const github = new FakeGitHub([], {});
+  const github = makeGitHub();
   const { port, close } = await createWebhookServer({ github, port: 0, log: () => {}, maxBodyBytes: 1024 });
   try {
     const big = JSON.stringify({ action: "opened", padding: "x".repeat(4096) });

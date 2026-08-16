@@ -175,14 +175,15 @@ test("drift_verify with unknown intent returns a JSON error", async () => {
   assert.equal(data.status, "error");
 });
 
-test("drift_blame returns originating prompt", async () => {
+test("drift_blame returns the safe public summary, never the private prompt", async () => {
   const result = await client.request("tools/call", {
     name: "drift_blame",
     arguments: { file: "src/util.ts", functionName: "answer" },
   });
   const data = JSON.parse(result.content[0].text);
   assert.equal(data.status, "ok");
-  assert.equal(data.intent.prompt, "Add answer constant via MCP");
+  assert.equal(data.intent.summary, "Add answer constant via MCP");
+  assert.ok(!("prompt" in data.intent), "MCP blame must not expose the private prompt");
 });
 
 test("drift_log lists intents", async () => {

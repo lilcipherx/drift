@@ -24,37 +24,31 @@ const SECRET = "test-webhook-secret";
 // ---------------------------------------------------------------- mock GitHub
 const ID1 = "did_11111111111111111111111111111111";
 const ID2 = "did_22222222222222222222222222222222";
-const ID3 = "did_33333333333333333333333333333333"; // object missing → subject fallback
+const ID3 = "did_33333333333333333333333333333333"; // manifest missing → subject fallback
 const HEAD1 = "a".repeat(40);
 const HEAD2 = "b".repeat(40);
 const HEAD3 = "c".repeat(40); // PR 8 head
 const HEAD4 = "d".repeat(40); // PR 9 head
-const objectPath1 = ".drift/objects/11/1111111111111111111111111111111111111111.json";
-const objectPath2 = ".drift/objects/22/2222222222222222222222222222222222222222.json";
-// NOTE: objectPath3 deliberately has NO entry in `objects` below
-const objectPath3 = ".drift/objects/33/3333333333333333333333333333333333333333.json";
 
 // per-PR comment stores (id ascending) + global counters
 const prComments = { 7: [], 8: [], 9: [] };
 let nextCommentId = 1000;
 const state = { posted: 0, updated: 0, checkRuns: 0, log: [] };
 
-const intentObj = (id, prompt, file) => ({
+const manifestObj = (id, summary, file) => ({
+  schemaVersion: 1,
   id,
-  parentId: null,
-  author: { type: "AGENT", identifier: "claude", model: "claude-3-5-sonnet" },
-  prompt,
-  astDelta: [{ filePath: file, type: "ADDED", summary: "add login handler" }],
-  agentState: null,
-  verifyCmd: null,
+  agent: { type: "AGENT", identifier: "claude", model: "claude-3-5-sonnet" },
+  summary,
+  files: [{ path: file, mutationType: "ADDED", summary: "add login handler" }],
   timestamp: 123,
-  gitCommitSha: "",
+  commit: HEAD1,
   signature: "MOCK-SIG",
 });
 
-const objects = {
-  [objectPath1]: intentObj(ID1, "add login flow with validation", "src/auth.ts"),
-  [objectPath2]: intentObj(ID2, "wire token refresh middleware", "src/token.ts"),
+const manifests = {
+  [`.drift/public/intents/${ID1}.json`]: manifestObj(ID1, "add login flow with validation", "src/auth.ts"),
+  [`.drift/public/intents/${ID2}.json`]: manifestObj(ID2, "wire token refresh middleware", "src/token.ts"),
 };
 
 // page 1: 100 commits, only ID1 trailer; page 2: 50 commits, only ID2 trailer
@@ -147,23 +141,17 @@ before(async () => {
         });
         return res.end(JSON.stringify(commitsPage1));
       }
-      // trees: PR 8 head references the missing object path, others the two real ones
-      if (req.method === "GET" && path.includes("/git/trees/")) {
-        const tree =
-          path.includes(HEAD3) ? [{ path: objectPath3, type: "blob" }] :
-          [
-            { path: objectPath1, type: "blob" },
-            { path: objectPath2, type: "blob" },
-          ];
-        return json(res, 200, { tree });
-      }
+      // contents: public manifests + key.pem only (ADR-009); anything else 404
       if (req.method === "GET" && path.includes("/contents/")) {
-        const obj = objects[decodeURIComponent(path.split("/contents/")[1].split("?")[0])];
+        const filePath = decodeURIComponent(path.split("/contents/")[1].split("?")[0]);
+        const obj =
+          filePath === ".drift/public/key.pem"
+            ? { content: Buffer.from("-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n", "utf8").toString("base64"), encoding: "base64" }
+            : manifests[filePath]
+              ? { content: Buffer.from(JSON.stringify(manifests[filePath]), "utf8").toString("base64"), encoding: "base64" }
+              : null;
         if (!obj) return json(res, 404, { message: "Not Found" });
-        return json(res, 200, {
-          content: Buffer.from(JSON.stringify(obj), "utf8").toString("base64"),
-          encoding: "base64",
-        });
+        return json(res, 200, obj);
       }
       // issue comments per PR
       const commentsMatch = path.match(/\/issues\/(\d+)\/comments$/);
@@ -228,7 +216,7 @@ test("opened: posts summary comment, pagination finds page-2 trailer", async () 
   assert.equal(r.data.intentsFound, 2, "page-2 trailer must be found via pagination");
   assert.equal(state.posted, 1);
   assert.ok(prComments[7].some((c) => c.body.includes(SUMMARY_MARKER)));
-  assert.ok(prComments[7].some((c) => c.body.includes("Drift intent summary")));
+  assert.ok(prComments[7].some((c) => c.body.includes("Drift — Why this changed")));
   assert.equal(state.checkRuns, 1);
   assert.ok(state.log.some((l) => l.includes("page=2")), state.log.join(" | "));
   assert.ok(state.log.some((l) => l.includes("access_tokens")));
@@ -279,8 +267,8 @@ test("payload without installation.id: clean error, not retryable", async () => 
   assert.equal(state.checkRuns, checkRunsBefore);
 });
 
-// ------------------------------------------------------------- 3d) object missing → subject fallback
-test("intent object missing: falls back to the commit subject as prompt", async () => {
+// ------------------------------------------------------------- 3d) manifest missing → subject fallback
+test("intent manifest missing: falls back to the commit subject as summary", async () => {
   const r = await sendWebhook("pull_request", basePayload("opened", HEAD3, 8));
   assert.equal(r.status, 200, JSON.stringify(r.data));
   assert.equal(r.data.action, "commented");
