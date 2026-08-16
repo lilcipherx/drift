@@ -96,8 +96,15 @@ explicit `drift realize --summary "…"` (redacted first, then stripped of contr
 characters / ANSI escapes, HTML-comment markers and mention-spam tokens, and
 truncated to 200 chars) or, when omitted, a generic non-prompt fallback such as
 `Drift intent did_abcd1234 (3 files)` built only from the intent id and file count.
-In `none` prompt mode the summary is empty unless an explicit `--summary` is given
-(nothing derived from the prompt may persist anywhere).
+The public summary is **never empty**: in `none` prompt mode (which means "do not
+persist the raw prompt") the generic fallback is still used, and the manifest
+validator rejects empty/whitespace summaries as malformed.
+
+`signingKeyId` is a canonical key fingerprint: the first 16 hex chars of the
+SHA-256 of the **SPKI DER** subject-public-key bytes (not a hash of the textual
+PEM), so LF/CRLF line endings and harmless surrounding whitespace can never
+change a key's identity, and `manifest.signingKeyId` must match
+`fingerprint(verificationKey)` or the manifest is not reported as valid.
 
 ### Why Option B over Option A (trailers)?
 

@@ -96,13 +96,14 @@ What lands in public git history is configurable per-repo
 | :--- | :--- | :--- | :--- |
 | `commit-summary` (**default**) | full (redacted) prompt | `Intent:` <public summary> (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers | explicit summary (or generic fallback) + model/agent/files/verification, signed |
 | `full` | full (redacted) prompt | full (redacted) prompt (legacy behaviour — visibly unsafe, opt-in) | same as above |
-| `none` | nothing | generic `Intent recorded` subject + trailers only | empty summary unless an explicit `--summary` is given |
+| `none` | nothing | generic `Intent recorded` subject + trailers only | generic non-prompt fallback (never empty — `none` means "do not persist the raw prompt", not "no public summary") |
 
 The public summary is **never derived from the prompt** (ADR-009): it comes
 from an explicit `drift realize --summary "…"` (redacted, sanitized,
 truncated) or a generic non-prompt fallback like `Drift intent did_… (2
-files)`. The first line of a one-line prompt would otherwise be copied
-verbatim into git history. Encryption at rest applies on top of any mode.
+files)`. A public manifest with an empty/whitespace summary is **malformed**
+— the validator rejects it, so blank PR comments / check-run lines are
+impossible. Encryption at rest applies on top of any mode.
 The mode affects only new intents — history is never rewritten. `drift
 status` reports the active mode.
 
@@ -131,29 +132,45 @@ text, so agents can parse them.
 
 ## The GitHub App (drift-app)
 
-`drift-app start` runs a small HTTP server (`POST /webhook`) that verifies the
-GitHub HMAC signature, then on `pull_request` `opened` / `synchronize` /
+`drift-app start` runs a small HTTP server (`POST /webhook`) that **fails
+closed**: production REQUIRES `GITHUB_WEBHOOK_SECRET`, and the raw body's
+`X-Hub-Signature-256` HMAC is verified BEFORE any JSON is parsed (missing /
+invalid signature → `401`, missing secret → `403`, oversized body → `413`,
+malformed authenticated JSON → `400`). Only an explicit
+`DRIFT_APP_INSECURE_DEV_MODE=true` (loudly warned, local development only)
+allows unsigned requests. On `pull_request` `opened` / `synchronize` /
 `reopened`:
 
-1. Reads `Drift-Intent: <id>` trailers from the PR commits (paginated,
-   git-trailer aligned).
-2. Hydrates the **public manifests** from `.drift/public/intents/<id>.json`
-   at the PR head. When a manifest is missing it uses a generic non-prompt
-   fallback (`Drift intent <id>`) — the commit subject is NEVER used, because
-   legacy `full`-mode subjects may contain a complete private prompt. Never
-   touches private objects or prompts.
-3. Posts a **privacy-safe summary comment** (marker `<!-- drift:summary -->`,
-   sanitized, `summary` only) plus a check run.
+1. Evaluates the trust root (base vs head `.drift/public/key.pem`) and runs a
+   public-provenance **integrity audit** (append-only: modified / deleted /
+   renamed / orphan manifests, replayed or ambiguously-referenced intents)
+   BEFORE any "no intents" early return — a key-only or tampering PR is never
+   invisible.
+2. Reads `Drift-Intent: <id>` trailers from the PR commits (paginated,
+   git-trailer aligned) and hydrates the **public manifests** from
+   `.drift/public/intents/<id>.json` at the PR head. When a manifest is
+   missing it uses a generic non-prompt fallback (`Drift intent <id>`) — the
+   commit subject is NEVER used, because legacy `full`-mode subjects may
+   contain a complete private prompt. Never touches private objects or
+   prompts.
+3. Creates the **Check Run** (derived from the shared trust policy — never
+   unconditional success; any integrity violation fails it) INDEPENDENTLY of
+   the comment: a comment failure never suppresses the check result and vice
+   versa.
+4. Posts/updates a **privacy-safe summary comment** (marker
+   `<!-- drift:app-summary:v2 -->`, sanitized, `summary` only).
 
-The summary is **idempotent**: if a Drift comment already exists on the PR it
-is updated in place (PATCH), so repeated deliveries and force-pushes never
-stack duplicate comments. Oversized payloads get `413` (no endless GitHub
-retries); client-side errors are acked with `200`.
+The summary is **idempotent**: the App PATCHes its own marker comment in
+place (a comment is only updated when GitHub attests the App authored it via
+`performed_via_github_app.id` — user-authored spoofed markers are never
+touched, and the App never edits the Action's `<!-- drift:action-summary:v2
+-->` comment). The Action posts as `github-actions[bot]` and follows the
+same ownership rule in reverse.
 
 The GitHub **Action** (`scripts/pr-comment.mjs`) uses the same public-manifest
-source but is scoped to **only the PR's commits** (`merge-base(base,head)..head`)
-and degrades gracefully on forks (step summary + warning, no
-`pull_request_target`).
+source and integrity audit but is scoped to **only the PR's commits**
+(`merge-base(base,head)..head`) and degrades gracefully on forks (step
+summary + warning, no `pull_request_target`).
 
 ## Git compatibility contract
 

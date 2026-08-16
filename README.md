@@ -150,7 +150,9 @@ Drift records exactly that, at commit time:
    `.drift/public/intents/`, and commits with a `Drift-Intent:` trailer.
 3. **`drift blame` / `drift context`** map any line or function back to the
    intent that created it.
-4. **`drift verify`** re-runs the recorded verification command.
+4. **`drift verify`** reports the recorded verification command and its
+   signature/trust state (informational — execution requires an explicit
+   `drift verify <id> --run`).
 5. **`drift doctor`** checks store integrity and repairs orphans (`--fix`).
 
 Deeper: [docs/architecture.md](docs/architecture.md) (storage, crypto, the
@@ -183,7 +185,8 @@ MCP tool).
   non-prompt fallback (`Drift intent did_… (2 files)`).
 - **`[prompts] mode`** in `.drift/config.toml`: `commit-summary` (default),
   `full` (opt-in, legacy, writes the prompt into the commit message), `none`
-  (prompt stored nowhere).
+  (prompt stored nowhere — the public manifest still carries the generic
+  non-prompt summary; empty summaries are never written).
 - **Secrets are redacted** (AWS, OpenAI, GitHub, Slack, JWT, PEM, …) before
   any storage.
 - **Encryption at rest** (optional): `[encryption] enabled = true` +

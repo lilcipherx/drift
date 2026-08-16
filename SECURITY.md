@@ -57,7 +57,7 @@ setting controls persistence:
 | :--- | :---: | :--- |
 | `commit-summary` (default) | ✅ | `Intent:` <explicit public summary or generic fallback> + trailers in the commit; the same safe summary (never prompt text) in `.drift/public/intents/<id>.json` |
 | `full` | ✅ | Full (redacted) prompt in the commit message (opt-in, legacy) — visibly unsafe |
-| `none` | ❌ | Generic `Intent recorded` subject; empty public summary |
+| `none` | ❌ | Generic `Intent recorded` subject; generic non-prompt public summary (never empty) |
 
 The summary is built **after** secret redaction, so secrets cannot leak via
 it. It is **never derived from the prompt**: the first line of a one-line
