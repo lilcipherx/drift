@@ -118,7 +118,9 @@ test("ci trust policy: the workflow expressions match the pure policy (no drift)
   );
   // The aggregate `test-linux` gate must depend on BOTH routing jobs, run on
   // hosted infrastructure with always(), and never check out PR code.
-  const aggregate = yml.match(/test-linux:\n[\s\S]*?timeout-minutes: 10[\s\S]*?(?=\n  #|\n  [a-z-]+:)/)?.[0] ?? "";
+  // Normalize CRLF (Windows checkouts) before regex matching.
+  const norm = yml.replace(/\r\n/g, "\n");
+  const aggregate = norm.match(/test-linux:\n[\s\S]*?timeout-minutes: 10[\s\S]*?(?=\n  #|\n  [a-z-]+:)/)?.[0] ?? "";
   assert.ok(aggregate.includes("needs: [test-linux-arm64, test-linux-untrusted]"), "aggregate must depend on both Linux jobs");
   assert.ok(aggregate.includes("if: always()"), "aggregate must run even when one routing job is skipped");
   assert.ok(aggregate.includes("runs-on: ubuntu-latest"), "aggregate must run on GitHub-hosted infrastructure");
