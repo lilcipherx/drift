@@ -159,13 +159,15 @@ agnostic for consumers. The example in `docs/installation.md` uses
 
 - The classification of `test-linux-arm64` as `MOVE_TO_SELF_HOSTED` was
   **static** plus **locally tested on Windows/x64** before the first push.
-- **Verified on ARM64 self-hosted runner** — workflow run
-  https://github.com/lilcipherx/drift/actions/runs/31941092554 (PR #7,
+- **Verified on ARM64 self-hosted runner** — workflow runs
+  https://github.com/lilcipherx/drift/actions/runs/31941092554 and
+  https://github.com/lilcipherx/drift/actions/runs/31944862922 (PR #7,
   2026-08-16): the `test (Linux ARM64, node 24)` job ran on the persistent
   Oracle runner (`instance-20260816-0446`, labels `self-hosted`/`Linux`/
-  `ARM64`, status `online`) and completed **success** in ~1m25s — `npm ci`,
-  `tsc -b`, the full 147-test suite, eval gate, MVS acceptance and the
-  package smoke test all passed on the ARM64 host. Node 24 is present (§7).
+  `ARM64`, status `online`) and completed **success** (~1m25s, then ~1m18s
+  after the merge-blocker fix commits) — `npm ci`, `tsc -b`, the full test
+  suite (147 then 158 tests), eval gate, MVS acceptance and the package
+  smoke test all passed on the ARM64 host. Node 24 is present (§7).
 - Remaining risk: low. The same toolchain is pure JavaScript; the only
   environment-sensitive input (Node 24) is now confirmed on the host. If a
   future ARM64 run exposes an issue, fall back to `ubuntu-latest` for
