@@ -437,15 +437,51 @@ export class Drift {
         }
         const indexSnapshot = captureIndexSnapshot(this.repoRoot);
         let manifestPath = null;
+        // Generated public files this operation MAY create on disk. Their
+        // pre-operation existence is recorded so a failed realize removes only
+        // what it created and never deletes pre-existing files (issue: generated
+        // public file rollback).
+        const generatedCandidates = [
+            join(this.driftDir, ".gitignore"),
+            join(this.driftDir, "config.toml"),
+            this.publicStore.keyPath,
+        ];
+        const generatedPreExisted = new Map(generatedCandidates.map((p) => [p, existsSync(p)]));
+        // The transaction fact: `commitLanded` flips to true ONLY when `git
+        // commit` successfully returned. A failed `git commit` is still
+        // pre-landing, so it must restore the exact original index — a phase name
+        // ("committing") must never classify a failed commit as post-commit.
+        let commitLanded = false;
+        // Remove only the files this operation created (manifest + any of the
+        // generated candidates that did not exist before the operation).
+        const cleanupGenerated = () => {
+            if (manifestPath) {
+                try {
+                    rmSync(manifestPath, { force: true });
+                }
+                catch {
+                    /* best-effort */
+                }
+            }
+            for (const [p, existed] of generatedPreExisted) {
+                if (!existed && existsSync(p)) {
+                    try {
+                        rmSync(p, { force: true });
+                    }
+                    catch {
+                        /* best-effort */
+                    }
+                }
+            }
+        };
         // Every operation after the snapshot is inside the protected scope below:
         // staging, no-staged-files validation, staged-file listing, AST analysis,
         // syntax parsing, redaction, private-object writing, manifest
         // construction, signing, manifest writing, public-file staging and the
-        // git commit. Any failure while `phase` is "building" (before the commit
-        // lands) restores the user's index byte-for-byte; once the commit lands
-        // ("committing"/"recorded") the index is left as-is and the snapshot is
-        // discarded.
-        let phase = "building";
+        // git commit. Any failure while `commitLanded` is false restores the
+        // user's index byte-for-byte and removes only this operation's generated
+        // public files; once the commit lands the index is left as-is and the
+        // snapshot is discarded.
         try {
             stageAll(this.repoRoot, opts.files);
             const staged = stagedNameStatus(this.repoRoot);
@@ -626,25 +662,19 @@ export class Drift {
             // keys or drift.db. Staging uses explicit argument arrays, never shell
             // interpolation.
             const stagedPublic = this.stagePublicFiles(id);
-            phase = "committing";
             let gitSha;
             try {
                 gitSha = commit(this.repoRoot, commitMessage);
             }
             catch (err) {
-                // Commit failed: unstage + remove ONLY the manifest this operation just
-                // generated (and only if we staged it). The user's source changes stay
-                // staged; the private object record is preserved for a safe retry.
-                execGit(this.repoRoot, ["reset", "-q", "--", relPath(this.repoRoot, manifestPath).replace(/\\/g, "/")], true);
-                try {
-                    rmSync(manifestPath, { force: true });
-                }
-                catch {
-                    /* best-effort */
-                }
-                throw new DriftError(`git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your source changes are still staged; run \`drift realize\` again after fixing the problem.`);
+                // Commit failed: still pre-landing. The outer catch (commitLanded ===
+                // false) restores the EXACT original index — partially staged hunks,
+                // intent-to-add, renames, deletions, flags — and removes only the files
+                // this operation generated. The private object record is preserved for
+                // a safe retry.
+                throw new DriftError(`git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your staged changes were restored exactly; run \`drift realize\` again after fixing the problem.`);
             }
-            phase = "recorded";
+            commitLanded = true;
             const intent = {
                 ...intentBase,
                 gitCommitSha: gitSha,
@@ -664,11 +694,12 @@ export class Drift {
             return { gitSha, intentId: id, astDelta: deltas, redactions: redactionResult.count };
         }
         catch (err) {
-            // Only failures BEFORE the commit restore the index. Once the commit
-            // landed, the source changes must stay staged and the commit is never
-            // rewritten (the commit/insert failure paths above already handled
-            // their own cleanup).
-            if (phase === "building") {
+            // Any failure while the commit has NOT landed restores the user's exact
+            // pre-Drift index (never a broad `git reset` that discards staged
+            // selections). Once the commit landed, the index is left as-is and the
+            // commit is never rewritten or deleted — the local-DB failure path
+            // above already reports the recoverable indexing problem.
+            if (!commitLanded) {
                 try {
                     restoreIndexSnapshot(this.repoRoot, indexSnapshot);
                 }
@@ -680,14 +711,7 @@ export class Drift {
                         `Original failure: ${err instanceof Error ? err.message : String(err)}. ` +
                         `Run \`git status\` and resolve the index lock first; Drift's staging may not have been rolled back.`);
                 }
-                if (manifestPath) {
-                    try {
-                        rmSync(manifestPath, { force: true });
-                    }
-                    catch {
-                        /* best-effort */
-                    }
-                }
+                cleanupGenerated();
                 throw err instanceof DriftError
                     ? err
                     : new DriftError(`realize aborted before committing — your staged changes were preserved: ${err instanceof Error ? err.message : String(err)}`);
