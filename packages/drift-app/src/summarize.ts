@@ -18,8 +18,10 @@ export interface SummaryInput {
   prTitle: string;
   intents: IntentView[];
   repoUrl?: string;
-  /** Trust-root warning is prepended when the PR modifies key.pem. */
-  keyChange?: "replaced" | "removed";
+  /** Trust-root warning is prepended when the PR modifies key.pem. A malformed
+   *  key state (malformed bootstrap / malformed replacement / malformed base
+   *  root) renders its own blocking warning — never a neutral bootstrap. */
+  keyChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
   /** Public-provenance integrity violations (append-only rules). */
   audit?: ProvenanceAudit;
 }
@@ -56,6 +58,21 @@ export function summarizeIntents(input: SummaryInput): string {
   lines.push(SUMMARY_MARKER);
   if (input.keyChange === "replaced" || input.keyChange === "removed") {
     lines.push(TRUST_ROOT_WARNING);
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  } else if (input.keyChange === "malformed-bootstrap") {
+    lines.push("## ⚠ Drift initial trust root is malformed\n\nThis pull request introduces `.drift/public/key.pem`, but the file is not a valid Drift public key. A malformed initial key is NOT a bootstrap — provenance on this PR is blocked until a valid key is introduced.");
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  } else if (input.keyChange === "malformed-replacement") {
+    lines.push("## ⚠ Drift trust-root replacement is malformed\n\nThis pull request replaces `.drift/public/key.pem` with content that is not a valid Drift public key. The malformed replacement cannot be trusted — blocked until a valid key is introduced through the rotation process.");
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  } else if (input.keyChange === "base-malformed") {
+    lines.push("## ⚠ Drift trust root is malformed on the base branch\n\n`.drift/public/key.pem` on the base branch is not a valid Drift public key — no trust root can be established, so this PR's provenance is unverifiable and blocked.");
     lines.push("");
     lines.push("---");
     lines.push("");
@@ -132,7 +149,7 @@ export function summarizeIntents(input: SummaryInput): string {
     lines.push("## ⚠ Public provenance integrity violations");
     lines.push("");
     for (const v of audit.violations) {
-      lines.push(`- **${safe(v.code, 16)}** \`${safe(v.id, 40)}\` — ${safe(v.detail, 200)}`);
+      lines.push(`- **${safe(v.code, 32)}** \`${safe(v.id, 40)}\` — ${safe(v.detail, 200)}`);
     }
     for (const id of audit.replayIds) {
       lines.push(`- **replayed** \`${safe(id, 40)}\` — this intent's manifest already exists on the base branch`);

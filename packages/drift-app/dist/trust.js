@@ -10,7 +10,7 @@
  *    to a Check Run conclusion. The App never reports unconditional success:
  *    invalid/untrusted/malformed/key-change provenance fails the check.
  */
-import { signingKeyIdFor } from "@drift/core";
+import { evaluateTrustRootChange } from "@drift/core";
 /** Comment marker version 2 — the App owns the app-specific marker and must
  * never edit the Action's comment (and vice versa). Legacy markers are
  * recognized for in-place migration ONLY when ownership is independently
@@ -19,26 +19,8 @@ export const SUMMARY_MARKER = "<!-- drift:app-summary:v2 -->";
 export const ACTION_MARKER = "<!-- drift:action-summary:v2 -->";
 export const LEGACY_SUMMARY_MARKERS = ["<!-- drift:pr-summary:v2 -->", "<!-- drift:summary -->"];
 export const TRUST_ROOT_WARNING = "## ⚠ Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
-/**
- * Trust-root relationship between the base branch and the PR head, computed
- * from CANONICAL SPKI-DER key fingerprints (`signingKeyIdFor`) — never from
- * textual PEM bytes. The same key with LF/CRLF line endings or harmless
- * surrounding whitespace is therefore "unchanged" (issue 6), while a
- * genuinely different public key is a replacement. A malformed key hashes to
- * a deterministic fallback id that never equals a real key, so a malformed
- * head key is a replacement/unverifiable change, never a trusted state.
- */
 export function evaluateKeyChange(baseKey, headKey) {
-    if (!baseKey && !headKey)
-        return "none";
-    if (!baseKey && headKey)
-        return "bootstrap";
-    if (baseKey && !headKey)
-        return "removed";
-    if (baseKey && headKey) {
-        return signingKeyIdFor(baseKey) === signingKeyIdFor(headKey) ? "unchanged" : "replaced";
-    }
-    return "none";
+    return evaluateTrustRootChange(baseKey, headKey);
 }
 /**
  * A comment belongs to the APP ONLY when GitHub itself attests that THIS App
@@ -108,7 +90,17 @@ export function deriveProvenanceConclusion(input) {
     const audit = input.audit ?? NO_AUDIT;
     const failing = intents.filter((i) => FAILING_STATES.has(i.signatureState));
     const validCount = intents.filter((i) => i.signatureState === "valid").length;
-    const blockingKeyChange = keyChange === "replaced" || keyChange === "removed";
+    // Failure key states: replacement, removal and ANY malformed key state
+    // (malformed initial key, malformed replacement, malformed base root). Only
+    // a cryptographically parseable initial key is a neutral bootstrap.
+    const FAILING_KEY_STATES = new Set([
+        "replaced",
+        "removed",
+        "malformed-bootstrap",
+        "malformed-replacement",
+        "base-malformed",
+    ]);
+    const blockingKeyChange = FAILING_KEY_STATES.has(keyChange);
     const integrityBroken = audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0;
     const count = (state) => intents.filter((i) => i.signatureState === state).length;
     const parts = [
@@ -129,7 +121,13 @@ export function deriveProvenanceConclusion(input) {
         if (blockingKeyChange) {
             reasons.push(keyChange === "replaced"
                 ? "the pull request replaces .drift/public/key.pem (trust-root change)"
-                : "the pull request removes .drift/public/key.pem (trust-root change)");
+                : keyChange === "removed"
+                    ? "the pull request removes .drift/public/key.pem (trust-root change)"
+                    : keyChange === "base-malformed"
+                        ? "the base branch trust root (.drift/public/key.pem) is not a valid Drift public key — no trust root can be established"
+                        : keyChange === "malformed-bootstrap"
+                            ? "the pull request introduces a MALFORMED .drift/public/key.pem — a malformed initial key is not a bootstrap"
+                            : "the pull request replaces .drift/public/key.pem with MALFORMED content that is not a valid Drift public key");
         }
         for (const i of failing) {
             reasons.push(`${i.signatureState === "malformed" ? "malformed manifest" : `${i.signatureState} signature`} for ${i.id ?? "an intent"}`);

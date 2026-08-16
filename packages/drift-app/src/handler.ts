@@ -63,6 +63,8 @@ export interface WebhookResult {
   error?: string;
   /** False for client-side errors (GitHub must not retry). */
   retryable?: boolean;
+  /** Structured Check Run + comment write outcomes for this delivery. */
+  writeResult?: GitHubWriteResult;
 }
 
 export interface WebhookEvent {
@@ -148,72 +150,98 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     // --- Trust-root evaluation FIRST ---------------------------------------
     // A key-only PR (replaces .drift/public/key.pem with zero intents) must
     // still produce a visible warning + blocking check run. Never exit
-    // through the no-intents path before evaluating the key.
-    const baseKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", baseSha ?? headSha);
-    const headKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", headSha);
+    // through the no-intents path before evaluating the key. Key state uses
+    // the SHARED strict parser: malformed bootstrap/replacement/base roots
+    // are explicit failure states, never a fallback identity.
+    const prInfo = await github.getPullRequest(owner, repoName, prNumber);
+    const effectiveBaseSha = baseSha || prInfo.baseSha || headSha;
+    const effectiveHeadSha = headSha || prInfo.headSha;
+    const baseKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", effectiveBaseSha);
+    const headKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", effectiveHeadSha);
     const keyChange: KeyChange = evaluateKeyChange(baseKey, headKey);
 
-    const commits = await github.getPullCommits(owner, repoName, prNumber);
+    // Commit enumeration WITH completeness proof: the App must never conclude
+    // trust from a truncated commit list (the REST endpoint caps at 250).
+    const commitCollection = await github.getPullCommits(owner, repoName, prNumber);
+    const commits = commitCollection.commits;
     const ids = extractIntentIds(commits);
+    // Commits reachable from head but NOT from base — a trailer reference is
+    // NEW when its commit is ahead of base; otherwise it is legacy history.
+    const aheadShas = new Set(
+      await github.getCompareCommits(owner, repoName, effectiveBaseSha, effectiveHeadSha),
+    );
 
     // Integrity audit runs BEFORE any early return: a PR can tamper with
-    // existing public manifests (modified/deleted/renamed/orphan/replay)
-    // while carrying zero ordinary trailers, and that must still fail the
-    // check — never silently green.
+    // existing public manifests (modified/deleted/renamed/orphan/replay) or
+    // introduce a trailer without its manifest, while carrying zero ordinary
+    // trailers — that must still fail the check, never silently green.
     const audit = await auditProvenanceIntegrity(
       github,
       owner,
       repoName,
       prNumber,
       commits,
-      baseSha ?? headSha,
-      headSha,
+      effectiveBaseSha,
+      effectiveHeadSha,
+      {
+        aheadShas,
+        commitAuditIncomplete: !commitCollection.complete,
+        expectedFiles: prInfo.changedFiles,
+      },
     );
     const integrityBroken =
       audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0;
 
     // A key-only PR: blocking warning comment + failing check run, no intents
-    // needed. Integrity violations with zero intents also surface here.
+    // needed. Integrity violations with zero intents also surface here. Any
+    // non-trivial key state (bootstrap, replaced, removed, malformed-*,
+    // base-malformed) is surfaced — only none/unchanged stays silent.
     if (ids.length === 0) {
       const conclusion = deriveProvenanceConclusion({ intents: [], keyChange, audit });
-      if (keyChange === "replaced" || keyChange === "removed" || keyChange === "bootstrap" || integrityBroken) {
+      const keyVisible = keyChange !== "none" && keyChange !== "unchanged";
+      if (keyVisible || integrityBroken) {
         const commentBody = summarizeIntents({
           owner,
           repo: repoName,
           prNumber,
           prTitle: pr?.title ?? "",
           intents: [],
-          keyChange: keyChange === "replaced" || keyChange === "removed" ? keyChange : undefined,
+          keyChange:
+            keyChange === "replaced" ||
+            keyChange === "removed" ||
+            keyChange === "malformed-bootstrap" ||
+            keyChange === "malformed-replacement" ||
+            keyChange === "base-malformed"
+              ? keyChange
+              : undefined,
           audit,
         });
-        if (!deps.readOnly) {
-          // Check Run first, comment second — a comment failure must never
-          // suppress the machine-readable trust result (issue 9).
-          const checkError = await createCheckRunSafe(github, owner, repoName, headSha, conclusion, commentBody, deps.checkRun !== false);
-          let writeError: string | null = null;
-          try {
-            await writeOwnedComment(github, owner, repoName, prNumber, commentBody, expectedAppId);
-          } catch (err) {
-            writeError = err instanceof Error ? err.message : String(err);
-          }
-          if (checkError && writeError) {
-            throw new Error(`check run failed (${checkError}); comment failed (${writeError})`);
-          }
+        if (deps.readOnly) {
+          return { handled: true, action: "dry-run", commentBody, intentsFound: 0, conclusion: conclusion.conclusion };
         }
+        // Check Run first, comment second — a comment failure must never
+        // suppress the machine-readable trust result (issue 9); a check-run
+        // failure must never be hidden by a successful comment.
+        const writeResult: GitHubWriteResult = {
+          checkRun: await createCheckRunSafe(github, owner, repoName, effectiveHeadSha, conclusion, commentBody, deps.checkRun !== false),
+          comment: await writeOwnedCommentSafe(github, owner, repoName, prNumber, commentBody, expectedAppId),
+        };
+        const writeError = applyWriteResultPolicy(writeResult);
         return {
           handled: true,
-          action: "key-change",
+          action: writeError ? "error" : "key-change",
           commentBody,
           intentsFound: 0,
           conclusion: conclusion.conclusion,
-          error: undefined,
+          ...(writeError ? { error: writeError.message, retryable: writeError.retryable } : {}),
+          writeResult,
         };
       }
       return { handled: true, action: "no-intents", intentsFound: 0 };
     }
 
     // Hydrate strictly validated public manifests + per-intent trust states.
-    const intents = await fetchIntents(github, owner, repoName, headSha, commits, ids, baseSha);
+    const intents = await fetchIntents(github, owner, repoName, effectiveHeadSha, commits, ids, effectiveBaseSha);
 
     const commentBody = summarizeIntents({
       owner,
@@ -232,28 +260,25 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
       return { handled: true, action: "dry-run", commentBody, intentsFound: intents.length, conclusion: conclusion.conclusion };
     }
 
-    // Check Run creation is INDEPENDENT of the comment: a failure to list,
-    // post or update the comment must not prevent the check result (and a
-    // check-run failure must not suppress the comment).
-    const checkError = await createCheckRunSafe(github, owner, repoName, headSha, conclusion, commentBody, deps.checkRun !== false);
-    let writeAction: "updated" | "commented" | null = null;
-    let writeError: string | null = null;
-    try {
-      writeAction = await writeOwnedComment(github, owner, repoName, prNumber, commentBody, expectedAppId);
-    } catch (err) {
-      writeError = err instanceof Error ? err.message : String(err);
-    }
-    if (checkError && writeError) {
-      throw new Error(`check run failed (${checkError}); comment failed (${writeError})`);
-    }
+    // The Check Run is the PRIMARY machine-readable trust result: a comment
+    // failure never suppresses it, and a check-run failure is never hidden by
+    // a successful comment (a transient check failure makes the webhook
+    // retryable so GitHub redelivers).
+    const writeResult: GitHubWriteResult = {
+      checkRun: await createCheckRunSafe(github, owner, repoName, effectiveHeadSha, conclusion, commentBody, deps.checkRun !== false),
+      comment: await writeOwnedCommentSafe(github, owner, repoName, prNumber, commentBody, expectedAppId),
+    };
+    const writeError = applyWriteResultPolicy(writeResult);
+    const commentAction =
+      writeResult.comment.state === "success" ? writeResult.comment.action : "error";
     return {
       handled: true,
-      action: writeAction ?? "error",
+      action: writeError ? "error" : commentAction,
       commentBody,
       intentsFound: intents.length,
       conclusion: conclusion.conclusion,
-      ...(writeError ? { error: `comment failed: ${writeError}` } : {}),
-      ...(checkError ? { error: `check run failed: ${checkError}` } : {}),
+      ...(writeError ? { error: writeError.message, retryable: writeError.retryable } : {}),
+      writeResult,
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
@@ -269,9 +294,68 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
 }
 
 /**
+ * Structured write outcomes for one webhook delivery. The Check Run is the
+ * PRIMARY machine-readable trust result: a failed check run must never be
+ * hidden by a successful comment, and vice versa. Transient API failures
+ * (network/5xx/429) are `retryable` — the webhook then returns 500 so GitHub
+ * redelivers — while permanent 4xx failures are acknowledged to stop retries.
+ */
+export type GitHubWriteResult = {
+  checkRun:
+    | { state: "success"; id: number }
+    | { state: "skipped"; reason: string }
+    | { state: "failed"; retryable: boolean; status?: number };
+  comment:
+    | { state: "success"; id: number; action: "updated" | "commented" }
+    | { state: "skipped"; reason: string }
+    | { state: "failed"; retryable: boolean; status?: number };
+};
+
+/** Extract { retryable, status } from a GitHub API error message. */
+function failureClass(message: string): { retryable: boolean; status?: number } {
+  const status = /failed: (\d{3})/.exec(message)?.[1];
+  const code = status ? Number(status) : 0;
+  // 429 (rate limit) is transient even though it is < 500.
+  return { retryable: !status || code === 429 || code >= 500, status: code || undefined };
+}
+
+/**
+ * Apply the write policy and produce the handler-level outcome:
+ *  - check failed + comment failed   → error (retryable if either is)
+ *  - check failed + comment ok       → error (retryable when transient — a
+ *    successful comment must never hide a failed Check Run)
+ *  - check ok + comment failed       → error (retryable when transient)
+ *  - both ok / skipped               → null (no error)
+ */
+function applyWriteResultPolicy(
+  writeResult: GitHubWriteResult,
+): { message: string; retryable: boolean } | null {
+  const { checkRun, comment } = writeResult;
+  if (checkRun.state === "failed" && comment.state === "failed") {
+    return {
+      message: `check run failed${checkRun.status ? ` (HTTP ${checkRun.status})` : ""}; comment failed${comment.status ? ` (HTTP ${comment.status})` : ""}`,
+      retryable: checkRun.retryable || comment.retryable,
+    };
+  }
+  if (checkRun.state === "failed") {
+    return {
+      message: `check run failed${checkRun.status ? ` (HTTP ${checkRun.status})` : ""} — the comment alone cannot substitute for the machine-readable trust result`,
+      retryable: checkRun.retryable,
+    };
+  }
+  if (comment.state === "failed") {
+    return {
+      message: `comment failed${comment.status ? ` (HTTP ${comment.status})` : ""}`,
+      retryable: comment.retryable,
+    };
+  }
+  return null;
+}
+
+/**
  * Create the Check Run with independent error handling (never throws): the
  * trust result is the primary machine-readable outcome and must survive a
- * comment/API hiccup. Returns the error message, or null on success.
+ * comment/API hiccup. Returns the structured outcome.
  */
 async function createCheckRunSafe(
   github: GitHubClientLike,
@@ -281,51 +365,57 @@ async function createCheckRunSafe(
   conclusion: { conclusion: "success" | "neutral" | "failure"; title: string; summary: string },
   commentBody: string,
   enabled: boolean,
-): Promise<string | null> {
-  if (!enabled) return null;
+): Promise<GitHubWriteResult["checkRun"]> {
+  if (!enabled) return { state: "skipped", reason: "check-run disabled" };
   try {
-    await github.createCheckRun(owner, repo, {
+    const id = await github.createCheckRun(owner, repo, {
       name: "Drift intent check",
       headSha,
       conclusion: conclusion.conclusion,
       title: conclusion.title,
       summary: `${conclusion.summary}\n\n${commentBody}`,
     });
-    return null;
+    return { state: "success", id };
   } catch (err) {
-    return err instanceof Error ? err.message : String(err);
+    const message = err instanceof Error ? err.message : String(err);
+    return { state: "failed", ...failureClass(message) };
   }
 }
 
 /**
  * Post the summary, or update the canonical OWNED Drift comment in place.
  * Spoofed user-authored markers are left untouched (ownership is verified by
- * GitHub-attested authorship — github-actions[bot] login or a real
- * performed_via_github_app.id — never by marker presence alone).
- * Returns "updated" when an owned comment was PATCHed, else "commented".
+ * GitHub-attested authorship — a real performed_via_github_app.id matching
+ * the configured App id — never by marker presence alone). Never throws;
+ * returns the structured outcome.
  */
-async function writeOwnedComment(
+async function writeOwnedCommentSafe(
   github: GitHubClientLike,
   owner: string,
   repo: string,
   prNumber: number,
   body: string,
   expectedAppId: string | null | undefined,
-): Promise<"updated" | "commented"> {
-  const comments = (await github.listIssueComments(owner, repo, prNumber)) as (IssueComment & {
-    user?: { login?: string; type?: string } | null;
-    performed_via_github_app?: { id?: number } | null;
-  })[];
-  const existing = findOwnedDriftComment(comments, expectedAppId);
-  if (existing) {
-    if (existing.duplicates > 0) {
-      console.error(
-        `[drift-app] ⚠ found ${existing.duplicates + 1} genuine Drift comments on PR #${prNumber} — updating the oldest (id ${existing.id}), leaving the others untouched.`,
-      );
+): Promise<GitHubWriteResult["comment"]> {
+  try {
+    const comments = (await github.listIssueComments(owner, repo, prNumber)) as (IssueComment & {
+      user?: { login?: string; type?: string } | null;
+      performed_via_github_app?: { id?: number } | null;
+    })[];
+    const existing = findOwnedDriftComment(comments, expectedAppId);
+    if (existing) {
+      if (existing.duplicates > 0) {
+        console.error(
+          `[drift-app] ⚠ found ${existing.duplicates + 1} genuine Drift comments on PR #${prNumber} — updating the oldest (id ${existing.id}), leaving the others untouched.`,
+        );
+      }
+      await github.updateComment(owner, repo, existing.id, body);
+      return { state: "success", id: existing.id, action: "updated" };
     }
-    await github.updateComment(owner, repo, existing.id, body);
-    return "updated";
+    const id = await github.postComment(owner, repo, prNumber, body);
+    return { state: "success", id, action: "commented" };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { state: "failed", ...failureClass(message) };
   }
-  await github.postComment(owner, repo, prNumber, body);
-  return "commented";
 }

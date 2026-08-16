@@ -13,6 +13,32 @@ export interface PullCommit {
   message: string;
 }
 
+/**
+ * Pull-request commit enumeration WITH completeness proof. The REST
+ * `pulls/{n}/commits` endpoint caps at 250 commits; the App must never issue
+ * a trust conclusion from a silently truncated list, so the handler compares
+ * the returned count against the PR metadata `commits` count and fails the
+ * audit when they disagree or when pagination was interrupted.
+ */
+export interface PullCommitCollection {
+  commits: PullCommit[];
+  /** PR metadata `commits` count (the expected total). */
+  expectedCount: number;
+  /** False when the listing is provably incomplete (endpoint cap, page
+   *  interruption, duplicate entries, invalid SHAs, count mismatch). */
+  complete: boolean;
+  reason?: "over-endpoint-limit" | "count-mismatch" | "pagination-interrupted" | "duplicate-sha" | "invalid-sha";
+}
+
+/** PR metadata the handler needs for completeness + trust decisions. */
+export interface PullRequestInfo {
+  headSha: string;
+  baseSha: string;
+  commits: number;
+  changedFiles: number;
+  title: string;
+}
+
 export interface CheckRunInput {
   name: string;
   headSha: string;
@@ -46,16 +72,23 @@ export interface GitHubClientLike {
   setInstallation(id: number): void;
   /** The configured GitHub App id (for exact comment-ownership matching). */
   getAppId(): string | null;
-  getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
+  getPullRequest(owner: string, repo: string, number: number): Promise<PullRequestInfo>;
+  getPullCommits(owner: string, repo: string, number: number): Promise<PullCommitCollection>;
+  /** Commits reachable from head but NOT from base (compare base...head) —
+   *  used to distinguish a NEW trailer reference from one carried in from
+   *  base history (legacy provenance). */
+  getCompareCommits(owner: string, repo: string, baseSha: string, headSha: string): Promise<string[]>;
   /** All changed files of the PR (paginated, so PRs with >100 files work). */
   getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult>;
   getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
   /** File NAMES in a directory at a ref ([] when the dir does not exist). */
   listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
   listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
-  postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
+  /** Returns the created comment id. */
+  postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<number>;
   updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
-  createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<void>;
+  /** Returns the created check-run id. */
+  createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<number>;
 }
 
 export interface GitHubAppClientOptions {
@@ -121,28 +154,98 @@ export class GitHubAppClient implements GitHubClientLike {
   }
 
   // ------------------------------------------------------------ reads
-  async getPullRequest(owner: string, repo: string, number: number) {
+  async getPullRequest(owner: string, repo: string, number: number): Promise<PullRequestInfo> {
     const token = await this.getInstallationToken(await this.requireInstallation());
     const res = await this.request(`/repos/${owner}/${repo}/pulls/${number}`, token);
     if (!res.ok) throw new Error(`getPullRequest failed: ${res.status}`);
-    const data = (await res.json()) as { head: { sha: string }; title: string };
-    return { headSha: data.head.sha, title: data.title };
+    const data = (await res.json()) as {
+      head: { sha: string };
+      base: { sha: string };
+      commits?: number;
+      changed_files?: number;
+      title?: string;
+    };
+    return {
+      headSha: data.head.sha,
+      baseSha: data.base.sha,
+      commits: typeof data.commits === "number" ? data.commits : -1,
+      changedFiles: typeof data.changed_files === "number" ? data.changed_files : -1,
+      title: data.title ?? "",
+    };
   }
 
-  async getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]> {
+  async getPullCommits(owner: string, repo: string, number: number): Promise<PullCommitCollection> {
+    const info = await this.getPullRequest(owner, repo, number);
     const token = await this.getInstallationToken(await this.requireInstallation());
     const commits: PullCommit[] = [];
-    // Paginate so PRs with more than 100 commits still get fully scanned
-    // (cap at 5 000 commits to stay bounded on pathological PRs).
+    let interrupted = false;
+    // The REST endpoint itself caps at 250 commits; paginate through Link
+    // headers (bounded at 50 pages) and let completeness detection decide.
     let path: string | null = `/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`;
     for (let page = 0; path && page < 50; page++) {
       const res = await this.request(path, token);
       if (!res.ok) throw new Error(`getPullCommits failed: ${res.status}`);
       const data = (await res.json()) as { sha: string; commit: { message: string } }[];
+      if (!Array.isArray(data) || data.length === 0) {
+        // A legitimately EMPTY pull request has zero commits: an empty first
+        // page with an expected count of 0 is a complete listing. Any other
+        // empty page means the API stopped producing data — interrupted. In
+        // BOTH cases clear `path` so the post-loop cap check cannot turn the
+        // legitimate empty listing into a spurious interruption.
+        path = null;
+        if (commits.length === 0 && info.commits === 0) break;
+        interrupted = true;
+        break;
+      }
       commits.push(...data.map((c) => ({ sha: c.sha, message: c.commit.message })));
       path = nextPagePath(res.headers.get("link"));
     }
-    return commits;
+    if (path && path.length > 0) interrupted = true;
+
+    // Completeness proof: the returned list must match the PR metadata count
+    // exactly, contain no duplicate or blank SHAs, and never hit the page cap.
+    const dup = commits.length !== new Set(commits.map((c) => c.sha)).size;
+    const invalidSha = commits.some((c) => typeof c.sha !== "string" || !/^[0-9a-f]{40}$/.test(c.sha));
+    // The Pull Request Commits REST endpoint has a HARD maximum of 250
+    // commits: an expected count above that can never be fully enumerated.
+    const overLimit = info.commits > 250;
+    const countMismatch = !overLimit && commits.length !== info.commits;
+    const complete = !interrupted && !dup && !invalidSha && !overLimit && !countMismatch;
+    let reason: PullCommitCollection["reason"];
+    if (complete) {
+      reason = undefined;
+    } else if (overLimit) {
+      reason = "over-endpoint-limit";
+    } else if (interrupted) {
+      reason = "pagination-interrupted";
+    } else if (dup) {
+      reason = "duplicate-sha";
+    } else if (invalidSha) {
+      reason = "invalid-sha";
+    } else {
+      reason = "count-mismatch";
+    }
+    return {
+      commits,
+      expectedCount: info.commits,
+      complete,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  async getCompareCommits(owner: string, repo: string, baseSha: string, headSha: string): Promise<string[]> {
+    const token = await this.getInstallationToken(await this.requireInstallation());
+    const shas: string[] = [];
+    let path: string | null = `/repos/${owner}/${repo}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}?per_page=100`;
+    for (let page = 0; path && page < 20; page++) {
+      const res = await this.request(path, token);
+      if (!res.ok) throw new Error(`getCompareCommits failed: ${res.status}`);
+      const data = (await res.json()) as { commits?: { sha?: string }[]; total_commits?: number };
+      if (!Array.isArray(data.commits)) break;
+      shas.push(...data.commits.map((c) => c.sha).filter((s): s is string => typeof s === "string" && s.length > 0));
+      path = nextPagePath(res.headers.get("link"));
+    }
+    return [...new Set(shas)];
   }
 
   async getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult> {
@@ -235,13 +338,15 @@ export class GitHubAppClient implements GitHubClientLike {
   }
 
   // ----------------------------------------------------------- writes
-  async postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void> {
+  async postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<number> {
     const token = await this.getInstallationToken(await this.requireInstallation());
     const res = await this.request(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, token, {
       method: "POST",
       body: JSON.stringify({ body }),
     });
     if (!res.ok) throw new Error(`postComment failed: ${res.status} ${await res.text()}`);
+    const data = (await res.json()) as { id?: number };
+    return typeof data.id === "number" ? data.id : 0;
   }
 
   /** PATCH an existing comment in place (keeps the thread tidy across synchronize events). */
@@ -254,7 +359,7 @@ export class GitHubAppClient implements GitHubClientLike {
     if (!res.ok) throw new Error(`updateComment failed: ${res.status} ${await res.text()}`);
   }
 
-  async createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<void> {
+  async createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<number> {
     const token = await this.getInstallationToken(await this.requireInstallation());
     const res = await this.request(`/repos/${owner}/${repo}/check-runs`, token, {
       method: "POST",
@@ -267,6 +372,8 @@ export class GitHubAppClient implements GitHubClientLike {
       }),
     });
     if (!res.ok) throw new Error(`createCheckRun failed: ${res.status} ${await res.text()}`);
+    const data = (await res.json()) as { id?: number };
+    return typeof data.id === "number" ? data.id : 0;
   }
 
   setInstallation(id: number): void {

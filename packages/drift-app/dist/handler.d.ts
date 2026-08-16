@@ -44,6 +44,8 @@ export interface WebhookResult {
     error?: string;
     /** False for client-side errors (GitHub must not retry). */
     retryable?: boolean;
+    /** Structured Check Run + comment write outcomes for this delivery. */
+    writeResult?: GitHubWriteResult;
 }
 export interface WebhookEvent {
     event: string;
@@ -53,4 +55,36 @@ export interface WebhookEvent {
 }
 export declare function verifyWebhookSignature(rawBody: string, signature: string | undefined, secret: string): boolean;
 export declare function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Promise<WebhookResult>;
+/**
+ * Structured write outcomes for one webhook delivery. The Check Run is the
+ * PRIMARY machine-readable trust result: a failed check run must never be
+ * hidden by a successful comment, and vice versa. Transient API failures
+ * (network/5xx/429) are `retryable` — the webhook then returns 500 so GitHub
+ * redelivers — while permanent 4xx failures are acknowledged to stop retries.
+ */
+export type GitHubWriteResult = {
+    checkRun: {
+        state: "success";
+        id: number;
+    } | {
+        state: "skipped";
+        reason: string;
+    } | {
+        state: "failed";
+        retryable: boolean;
+        status?: number;
+    };
+    comment: {
+        state: "success";
+        id: number;
+        action: "updated" | "commented";
+    } | {
+        state: "skipped";
+        reason: string;
+    } | {
+        state: "failed";
+        retryable: boolean;
+        status?: number;
+    };
+};
 //# sourceMappingURL=handler.d.ts.map

@@ -13,8 +13,10 @@ export interface SummaryInput {
     prTitle: string;
     intents: IntentView[];
     repoUrl?: string;
-    /** Trust-root warning is prepended when the PR modifies key.pem. */
-    keyChange?: "replaced" | "removed";
+    /** Trust-root warning is prepended when the PR modifies key.pem. A malformed
+     *  key state (malformed bootstrap / malformed replacement / malformed base
+     *  root) renders its own blocking warning — never a neutral bootstrap. */
+    keyChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
     /** Public-provenance integrity violations (append-only rules). */
     audit?: ProvenanceAudit;
 }

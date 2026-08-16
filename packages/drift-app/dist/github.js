@@ -65,23 +65,94 @@ export class GitHubAppClient {
         if (!res.ok)
             throw new Error(`getPullRequest failed: ${res.status}`);
         const data = (await res.json());
-        return { headSha: data.head.sha, title: data.title };
+        return {
+            headSha: data.head.sha,
+            baseSha: data.base.sha,
+            commits: typeof data.commits === "number" ? data.commits : -1,
+            changedFiles: typeof data.changed_files === "number" ? data.changed_files : -1,
+            title: data.title ?? "",
+        };
     }
     async getPullCommits(owner, repo, number) {
+        const info = await this.getPullRequest(owner, repo, number);
         const token = await this.getInstallationToken(await this.requireInstallation());
         const commits = [];
-        // Paginate so PRs with more than 100 commits still get fully scanned
-        // (cap at 5 000 commits to stay bounded on pathological PRs).
+        let interrupted = false;
+        // The REST endpoint itself caps at 250 commits; paginate through Link
+        // headers (bounded at 50 pages) and let completeness detection decide.
         let path = `/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`;
         for (let page = 0; path && page < 50; page++) {
             const res = await this.request(path, token);
             if (!res.ok)
                 throw new Error(`getPullCommits failed: ${res.status}`);
             const data = (await res.json());
+            if (!Array.isArray(data) || data.length === 0) {
+                // A legitimately EMPTY pull request has zero commits: an empty first
+                // page with an expected count of 0 is a complete listing. Any other
+                // empty page means the API stopped producing data — interrupted. In
+                // BOTH cases clear `path` so the post-loop cap check cannot turn the
+                // legitimate empty listing into a spurious interruption.
+                path = null;
+                if (commits.length === 0 && info.commits === 0)
+                    break;
+                interrupted = true;
+                break;
+            }
             commits.push(...data.map((c) => ({ sha: c.sha, message: c.commit.message })));
             path = nextPagePath(res.headers.get("link"));
         }
-        return commits;
+        if (path && path.length > 0)
+            interrupted = true;
+        // Completeness proof: the returned list must match the PR metadata count
+        // exactly, contain no duplicate or blank SHAs, and never hit the page cap.
+        const dup = commits.length !== new Set(commits.map((c) => c.sha)).size;
+        const invalidSha = commits.some((c) => typeof c.sha !== "string" || !/^[0-9a-f]{40}$/.test(c.sha));
+        // The Pull Request Commits REST endpoint has a HARD maximum of 250
+        // commits: an expected count above that can never be fully enumerated.
+        const overLimit = info.commits > 250;
+        const countMismatch = !overLimit && commits.length !== info.commits;
+        const complete = !interrupted && !dup && !invalidSha && !overLimit && !countMismatch;
+        let reason;
+        if (complete) {
+            reason = undefined;
+        }
+        else if (overLimit) {
+            reason = "over-endpoint-limit";
+        }
+        else if (interrupted) {
+            reason = "pagination-interrupted";
+        }
+        else if (dup) {
+            reason = "duplicate-sha";
+        }
+        else if (invalidSha) {
+            reason = "invalid-sha";
+        }
+        else {
+            reason = "count-mismatch";
+        }
+        return {
+            commits,
+            expectedCount: info.commits,
+            complete,
+            ...(reason ? { reason } : {}),
+        };
+    }
+    async getCompareCommits(owner, repo, baseSha, headSha) {
+        const token = await this.getInstallationToken(await this.requireInstallation());
+        const shas = [];
+        let path = `/repos/${owner}/${repo}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}?per_page=100`;
+        for (let page = 0; path && page < 20; page++) {
+            const res = await this.request(path, token);
+            if (!res.ok)
+                throw new Error(`getCompareCommits failed: ${res.status}`);
+            const data = (await res.json());
+            if (!Array.isArray(data.commits))
+                break;
+            shas.push(...data.commits.map((c) => c.sha).filter((s) => typeof s === "string" && s.length > 0));
+            path = nextPagePath(res.headers.get("link"));
+        }
+        return [...new Set(shas)];
     }
     async getPullFiles(owner, repo, number) {
         const token = await this.getInstallationToken(await this.requireInstallation());
@@ -167,6 +238,8 @@ export class GitHubAppClient {
         });
         if (!res.ok)
             throw new Error(`postComment failed: ${res.status} ${await res.text()}`);
+        const data = (await res.json());
+        return typeof data.id === "number" ? data.id : 0;
     }
     /** PATCH an existing comment in place (keeps the thread tidy across synchronize events). */
     async updateComment(owner, repo, commentId, body) {
@@ -192,6 +265,8 @@ export class GitHubAppClient {
         });
         if (!res.ok)
             throw new Error(`createCheckRun failed: ${res.status} ${await res.text()}`);
+        const data = (await res.json());
+        return typeof data.id === "number" ? data.id : 0;
     }
     setInstallation(id) {
         this.installationId = id;

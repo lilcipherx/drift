@@ -201,10 +201,27 @@ class FakeGitHub {
     this.pullFiles = opts.pullFiles ?? [];
     this.pullFilesTruncated = opts.pullFilesTruncated ?? false;
     this.appId = opts.appId ?? "12345";
+    this.prInfo = opts.prInfo ?? null;
+    this.commitCollection = opts.commitCollection ?? null;
+    this.compareShas = opts.compareShas ?? null;
+    this.postCommentResult = opts.postCommentResult ?? null; // { throw: Error } | { id: n }
+    this.checkRunResult = opts.checkRunResult ?? null; // { throw: Error } | { id: n }
   }
   setInstallation(id) { this.installation = id; }
   getAppId() { return this.appId; }
-  async getPullCommits() { return this.commits; }
+  async getPullRequest() {
+    if (this.prInfo) return this.prInfo;
+    return { headSha: "abc123def", baseSha: "base123", commits: this.commits.length, changedFiles: 0, title: "" };
+  }
+  async getPullCommits() {
+    if (this.commitCollection) return this.commitCollection;
+    return { commits: this.commits, expectedCount: this.commits.length, complete: true };
+  }
+  async getCompareCommits() {
+    if (this.compareShas) return this.compareShas;
+    // default: every PR commit is new (ahead of base)
+    return this.commits.map((c) => c.sha);
+  }
   async getPullFiles() { return { files: this.pullFiles, truncated: this.pullFilesTruncated }; }
   isBaseRef(ref) { return ref === "base123" || ref === "base-sha"; }
   async getFileContent(owner, repo, path, ref) {
@@ -230,15 +247,23 @@ class FakeGitHub {
       .map((p) => p.split("/").pop());
   }
   async postComment(owner, repo, issueNumber, body) {
+    if (this.postCommentResult?.throw) throw this.postCommentResult.throw;
     this.calls.comments.push({ issueNumber, body });
-    this.existing.push(APP_COMMENT(this.nextId++, body));
+    const id = this.nextId++;
+    this.existing.push(APP_COMMENT(id, body));
+    return this.postCommentResult?.id ?? id;
   }
   async updateComment(owner, repo, commentId, body) {
+    if (this.postCommentResult?.throwUpdate) throw this.postCommentResult.throwUpdate;
     this.calls.updates.push({ commentId, body });
     const c = this.existing.find((x) => x.id === commentId);
     if (c) c.body = body;
   }
-  async createCheckRun(owner, repo, input) { this.calls.checks.push(input); }
+  async createCheckRun(owner, repo, input) {
+    if (this.checkRunResult?.throw) throw this.checkRunResult.throw;
+    this.calls.checks.push(input);
+    return this.checkRunResult?.id ?? 1;
+  }
   async listIssueComments() {
     this.calls.list = (this.calls.list ?? 0) + 1;
     return [...this.existing];
@@ -524,14 +549,23 @@ test("deriveProvenanceConclusion: mixed valid+invalid is a failure, not a green 
   assert.equal(r.conclusion, "failure");
 });
 
-test("evaluateKeyChange: detects bootstrap, removal and replacement", () => {
-  const A = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
-  const B = "-----BEGIN PUBLIC KEY-----\nBBBB\n-----END PUBLIC KEY-----\n";
+test("evaluateKeyChange: strict states — bootstrap, removal, replacement AND malformed keys never get a fallback identity", () => {
+  const pairA = generateKeyPairSync("ed25519");
+  const pairB = generateKeyPairSync("ed25519");
+  const A = pairA.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const B = pairB.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const garbage = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
   assert.equal(evaluateKeyChange(null, null), "none");
   assert.equal(evaluateKeyChange(null, A), "bootstrap");
   assert.equal(evaluateKeyChange(A, null), "removed");
   assert.equal(evaluateKeyChange(A, A), "unchanged");
   assert.equal(evaluateKeyChange(A, B), "replaced");
+  // Strict parsing: a malformed initial key is NOT a bootstrap, a malformed
+  // replacement is NOT a replacement, and a malformed base root always fails.
+  assert.equal(evaluateKeyChange(null, garbage), "malformed-bootstrap");
+  assert.equal(evaluateKeyChange(A, garbage), "malformed-replacement");
+  assert.equal(evaluateKeyChange(garbage, A), "base-malformed");
+  assert.equal(evaluateKeyChange(garbage, garbage), "base-malformed");
 });
 
 // ----------------------------------------------- B: key-only PR visibility
@@ -1070,4 +1104,165 @@ test("webhook auth: missing/invalid signatures are rejected when a secret is con
   // explicit dev mode bypasses the requirement
   const dev = await handleWebhook(eventFor(PAYLOAD), { github, insecureDevMode: true });
   assert.equal(dev.action, "commented");
+});
+
+// ------------------------------------------- F: final completeness regressions
+const manyCommits = (n) =>
+  Array.from({ length: n }, (_, i) => ({
+    sha: `${String(i).padStart(39, "0")}`,
+    message: "chore: fill",
+  }));
+
+const ID_NEW = "did_99999999999999999999999999999999";
+
+test("App audit: complete 250-commit enumeration audits normally (no false incomplete)", async () => {
+  const commits = manyCommits(250);
+  const github = new FakeGitHub(commits, {}, [], {
+    commitCollection: { commits, expectedCount: 250, complete: true },
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
+  assert.equal(audit.violations.length, 0);
+});
+
+test("App commit completeness: 251 commits (endpoint cap) → incomplete-commit-audit, never success", async () => {
+  const commits = manyCommits(251);
+  const truncated = commits.slice(0, 250);
+  const github = new FakeGitHub(truncated, {}, [], {
+    commitCollection: { commits: truncated, expectedCount: 251, complete: false, reason: "returned 250 commits but metadata reports 251" },
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, truncated, "base123", "head123", {
+    commitAuditIncomplete: true,
+  });
+  assert.ok(audit.violations.some((v) => v.code === "incomplete-commit-audit"), JSON.stringify(audit.violations));
+});
+
+test("App commit completeness: count mismatch, duplicates and blank SHAs are incomplete", async () => {
+  const commits = manyCommits(10);
+  for (const bad of [
+    { commits: commits.slice(0, 5), expectedCount: 10, complete: false, reason: "returned 5 commits but metadata reports 10" },
+    { commits: [...commits, commits[0]], expectedCount: 11, complete: false, reason: "duplicate commit entries" },
+    { commits: [{ sha: "", message: "no sha" }, ...commits], expectedCount: 11, complete: false, reason: "entries without a SHA" },
+  ]) {
+    const github = new FakeGitHub(bad.commits, {}, [], { commitCollection: bad });
+    const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, bad.commits, "base123", "head123", {
+      commitAuditIncomplete: true,
+    });
+    assert.ok(audit.violations.some((v) => v.code === "incomplete-commit-audit"), JSON.stringify(bad));
+  }
+});
+
+test("App commit completeness: the handler fails the check on an incomplete listing (never green)", async () => {
+  const commits = manyCommits(10);
+  const github = new FakeGitHub(commits, {}, [], {
+    commitCollection: { commits: commits.slice(0, 4), expectedCount: 10, complete: false, reason: "interrupted pagination" },
+  });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "failure", JSON.stringify(result));
+  assert.ok((result.commentBody ?? "").includes("incomplete-commit-audit"), result.commentBody);
+});
+
+test("App audit: NEW trailer without manifest is a violation; a legacy base-history reference stays neutral", async () => {
+  const commits = [{ sha: "new1", message: `feat\n\nDrift-Intent: ${ID_NEW}` }];
+  // NEW: the referencing commit is ahead of base → hard violation
+  const github = new FakeGitHub(commits, {}, [], {});
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123", {
+    aheadShas: new Set(["new1"]),
+  });
+  assert.ok(audit.violations.some((v) => v.code === "trailer-without-manifest" && v.id === ID_NEW), JSON.stringify(audit.violations));
+  // LEGACY: the referencing commit is carried in from base history (not ahead)
+  const github2 = new FakeGitHub(commits, {}, [], {});
+  const audit2 = await auditProvenanceIntegrity(github2, "lilcipherx", "drift", 7, commits, "base123", "head123", {
+    aheadShas: new Set(),
+  });
+  assert.equal(audit2.violations.length, 0, JSON.stringify(audit2.violations));
+  assert.ok(!audit2.replayIds.includes(ID_NEW), "no manifest anywhere → not a replay");
+});
+
+test("handler: key-only PR with a MALFORMED initial key fails the check (never a bootstrap)", async () => {
+  const github = new FakeGitHub([{ sha: "s", message: "introduce key" }], {}, [], {
+    publicKeyPem: "-----BEGIN PUBLIC KEY-----\nGARBAGE\n-----END PUBLIC KEY-----\n", // malformed head key
+    basePublicKeyPem: null, // no base key
+  });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "failure", JSON.stringify(result));
+  assert.ok((result.commentBody ?? "").includes("malformed"), result.commentBody);
+  assert.equal(github.calls.checks[0].conclusion, "failure");
+  assert.ok(!(result.commentBody ?? "").includes("unverified bootstrap"), "malformed must never be labeled bootstrap");
+});
+
+test("handler: malformed BASE trust root fails even when the head key is valid (base-malformed)", async () => {
+  const github = new FakeGitHub([{ sha: "s", message: "fix key" }], {}, [], {
+    publicKeyPem: PUBLIC_KEY_PEM, // valid head key
+    basePublicKeyPem: "-----BEGIN PUBLIC KEY-----\nGARBAGE\n-----END PUBLIC KEY-----\n", // malformed base
+  });
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "failure", JSON.stringify(result));
+  assert.equal(github.calls.checks[0].conclusion, "failure");
+});
+
+test("handler: a failed Check Run is never hidden by a successful comment (transient → retryable)", async () => {
+  const github = makeGitHub();
+  github.createCheckRun = async () => {
+    throw new Error("createCheckRun failed: 500"); // transient
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "success", JSON.stringify(result));
+  assert.equal(github.calls.comments.length, 1, "comment must still be written");
+  assert.equal(result.action, "error", "a failed check run must never be acked as fully successful");
+  assert.equal(result.retryable, true, "transient check failure must be retryable (webhook 500 → redelivery)");
+  assert.ok(result.writeResult.checkRun.state === "failed");
+  assert.ok(result.writeResult.comment.state === "success");
+});
+
+test("handler: permanent check-run failure (403) is acknowledged, not silently green", async () => {
+  const github = makeGitHub();
+  github.createCheckRun = async () => {
+    throw new Error("createCheckRun failed: 403"); // permanent
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.action, "error");
+  assert.equal(result.retryable, false, "permanent 4xx is acknowledged so GitHub stops redelivering");
+});
+
+test("handler: comment failure with a successful check is reported (retryable when transient)", async () => {
+  // transient comment failure (500) → retryable so the comment gets another chance
+  const github = makeGitHub();
+  github.postComment = async () => {
+    throw new Error("postComment failed: 500");
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "success");
+  assert.equal(github.calls.checks.length, 1, "the check result is preserved");
+  assert.equal(result.action, "error");
+  assert.equal(result.retryable, true);
+  // permanent comment failure (403) → acknowledged
+  const github2 = makeGitHub();
+  github2.postComment = async () => {
+    throw new Error("postComment failed: 403");
+  };
+  const result2 = await handleWebhook(eventFor(PAYLOAD), devDeps(github2));
+  assert.equal(result2.action, "error");
+  assert.equal(result2.retryable, false);
+});
+
+test("handler: key-only PR follows the same check-run reliability policy (check 500 → retryable error)", async () => {
+  const github = new FakeGitHub([{ sha: "s", message: "rotate key only" }], {}, [], {
+    publicKeyPem: OTHER_PUBLIC_KEY_PEM,
+    basePublicKeyPem: PUBLIC_KEY_PEM, // replaced
+  });
+  github.createCheckRun = async () => {
+    throw new Error("createCheckRun failed: 500");
+  };
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.action, "error", JSON.stringify(result));
+  assert.equal(result.retryable, true, "a transient check failure on a key-only PR must be retryable");
+});
+
+test("handler: read-only mode returns the computed result and writes nothing (check + comment untouched)", async () => {
+  const github = makeGitHub();
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github, { readOnly: true }));
+  assert.equal(result.action, "dry-run");
+  assert.equal(result.conclusion, "success");
+  assert.equal(github.calls.checks.length, 0);
+  assert.equal(github.calls.comments.length, 0);
 });

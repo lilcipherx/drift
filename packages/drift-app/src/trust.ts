@@ -11,7 +11,7 @@
  *    invalid/untrusted/malformed/key-change provenance fails the check.
  */
 
-import { signingKeyIdFor } from "@drift/core";
+import { evaluateTrustRootChange, type TrustRootChange } from "@drift/core";
 import type { IntentView } from "./intents.js";
 
 /** Comment marker version 2 — the App owns the app-specific marker and must
@@ -25,29 +25,22 @@ export const LEGACY_SUMMARY_MARKERS = ["<!-- drift:pr-summary:v2 -->", "<!-- dri
 export const TRUST_ROOT_WARNING =
   "## ⚠ Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
 
-/** Trust-root relationship between the base branch and the PR head. */
-export type KeyChange = "none" | "unchanged" | "bootstrap" | "removed" | "replaced";
-
 /**
- * Trust-root relationship between the base branch and the PR head, computed
- * from CANONICAL SPKI-DER key fingerprints (`signingKeyIdFor`) — never from
- * textual PEM bytes. The same key with LF/CRLF line endings or harmless
- * surrounding whitespace is therefore "unchanged" (issue 6), while a
- * genuinely different public key is a replacement. A malformed key hashes to
- * a deterministic fallback id that never equals a real key, so a malformed
- * head key is a replacement/unverifiable change, never a trusted state.
+ * Trust-root relationship between the base branch and the PR head. This is
+ * the SHARED @drift/core evaluator (the Action mirrors it): strict PEM
+ * parsing into absent/valid/malformed + canonical SPKI-DER fingerprints. A
+ * malformed key NEVER receives a fallback identity and is NEVER a trusted
+ * state — malformed-bootstrap, malformed-replacement and base-malformed are
+ * explicit failures. The same key with LF/CRLF/whitespace formatting is
+ * "unchanged".
  */
+export type KeyChange = TrustRootChange;
+
 export function evaluateKeyChange(
-  baseKey: string | null,
-  headKey: string | null,
+  baseKey: string | null | undefined,
+  headKey: string | null | undefined,
 ): KeyChange {
-  if (!baseKey && !headKey) return "none";
-  if (!baseKey && headKey) return "bootstrap";
-  if (baseKey && !headKey) return "removed";
-  if (baseKey && headKey) {
-    return signingKeyIdFor(baseKey) === signingKeyIdFor(headKey) ? "unchanged" : "replaced";
-  }
-  return "none";
+  return evaluateTrustRootChange(baseKey, headKey);
 }
 
 /** A PR comment as returned by the GitHub API (ownership-relevant fields). */
@@ -115,7 +108,15 @@ const FAILING_STATES = new Set(["invalid", "untrusted-key", "malformed"]);
 
 /** A public-provenance integrity violation (append-only rules). */
 export interface IntegrityViolation {
-  code: "modified" | "deleted" | "renamed" | "orphan" | "intro-mismatch" | "mutated";
+  code:
+    | "modified"
+    | "deleted"
+    | "renamed"
+    | "orphan"
+    | "intro-mismatch"
+    | "mutated"
+    | "trailer-without-manifest"
+    | "incomplete-commit-audit";
   id: string;
   detail: string;
 }
@@ -159,7 +160,17 @@ export function deriveProvenanceConclusion(input: ConclusionInput): ConclusionRe
   const audit = input.audit ?? NO_AUDIT;
   const failing = intents.filter((i) => FAILING_STATES.has(i.signatureState));
   const validCount = intents.filter((i) => i.signatureState === "valid").length;
-  const blockingKeyChange = keyChange === "replaced" || keyChange === "removed";
+  // Failure key states: replacement, removal and ANY malformed key state
+  // (malformed initial key, malformed replacement, malformed base root). Only
+  // a cryptographically parseable initial key is a neutral bootstrap.
+  const FAILING_KEY_STATES = new Set([
+    "replaced",
+    "removed",
+    "malformed-bootstrap",
+    "malformed-replacement",
+    "base-malformed",
+  ]);
+  const blockingKeyChange = FAILING_KEY_STATES.has(keyChange);
   const integrityBroken =
     audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0;
 
@@ -184,7 +195,13 @@ export function deriveProvenanceConclusion(input: ConclusionInput): ConclusionRe
       reasons.push(
         keyChange === "replaced"
           ? "the pull request replaces .drift/public/key.pem (trust-root change)"
-          : "the pull request removes .drift/public/key.pem (trust-root change)",
+          : keyChange === "removed"
+            ? "the pull request removes .drift/public/key.pem (trust-root change)"
+            : keyChange === "base-malformed"
+              ? "the base branch trust root (.drift/public/key.pem) is not a valid Drift public key — no trust root can be established"
+              : keyChange === "malformed-bootstrap"
+                ? "the pull request introduces a MALFORMED .drift/public/key.pem — a malformed initial key is not a bootstrap"
+                : "the pull request replaces .drift/public/key.pem with MALFORMED content that is not a valid Drift public key",
       );
     }
     for (const i of failing) {

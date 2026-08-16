@@ -132,11 +132,31 @@ before(async () => {
           expires_at: new Date(Date.now() + 3_600_000).toISOString(),
         });
       }
-      // pull request head by number
+      // pull request head by number (with metadata for completeness proof)
       if (req.method === "GET" && /\/pulls\/\d+$/.test(path)) {
         const n = Number(path.split("/").pop());
         const sha = { 7: HEAD1, 8: HEAD3, 9: HEAD4 }[n] ?? HEAD1;
-        return json(res, 200, { head: { sha }, title: "feat: add login" });
+        const count = n === 7 ? 150 : n === 8 ? commitsPr8.length : n === 9 ? commitsPr9.length : 150;
+        return json(res, 200, {
+          head: { sha },
+          base: { sha: BASE_SHA },
+          commits: count,
+          changed_files: 0,
+          title: "feat: add login",
+        });
+      }
+      // compare base...head — commits reachable from head but NOT from base
+      // (used by the audit to tell a NEW trailer reference from legacy history)
+      if (req.method === "GET" && path.includes("/compare/")) {
+        const headSha = decodeURIComponent((path.split("...")[1] ?? "").split("?")[0]);
+        let list = [];
+        if (headSha === HEAD1 || headSha === HEAD2) list = [...commitsPage1, ...commitsPage2];
+        else if (headSha === HEAD3) list = commitsPr8;
+        else if (headSha === HEAD4) list = commitsPr9;
+        return json(res, 200, {
+          total_commits: list.length,
+          commits: list.map((c) => ({ sha: c.sha })),
+        });
       }
       // commits by PR: 7 → paginated (100 + 50), 8 → fallback, 9 → no trailers
       const commitsMatch = req.method === "GET" && path.match(/\/pulls\/(\d+)\/commits$/);
@@ -304,13 +324,18 @@ test("payload without installation.id: clean error, not retryable", async () => 
 });
 
 // -------------------------------------------- 3d) manifest missing → generic fallback (never the subject)
-test("intent manifest missing: generic non-prompt fallback, never the commit subject", async () => {
+test("new trailer WITHOUT its manifest is a hard failure (never a neutral fallback)", async () => {
+  // PR 8 introduces a Drift-Intent trailer for ID3 but ships NO manifest:
+  // the commit is NEW (ahead of base), so this is `trailer-without-manifest`
+  // — a failing check run + explicit violation in the comment, while the
+  // generic non-prompt fallback still keeps the raw subject out of the body.
   const r = await sendWebhook("pull_request", basePayload("opened", HEAD3, 8));
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.action, "commented");
+  assert.equal(r.data.conclusion, "failure", "missing manifest for a NEW trailer must fail");
   assert.equal(r.data.intentsFound, 1);
   assert.equal(prComments[8].length, 1);
   assert.ok(prComments[8][0].body.includes("public provenance manifest missing"), prComments[8][0].body);
+  assert.ok(prComments[8][0].body.includes("trailer-without-manifest"), "the violation must be visible in the comment");
   assert.ok(!prComments[8][0].body.includes("fallback subject here"), "commit subject must never be rendered as a summary");
   assert.equal(state.posted, 2);
 });

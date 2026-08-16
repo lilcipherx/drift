@@ -9,6 +9,30 @@ export interface PullCommit {
     sha: string;
     message: string;
 }
+/**
+ * Pull-request commit enumeration WITH completeness proof. The REST
+ * `pulls/{n}/commits` endpoint caps at 250 commits; the App must never issue
+ * a trust conclusion from a silently truncated list, so the handler compares
+ * the returned count against the PR metadata `commits` count and fails the
+ * audit when they disagree or when pagination was interrupted.
+ */
+export interface PullCommitCollection {
+    commits: PullCommit[];
+    /** PR metadata `commits` count (the expected total). */
+    expectedCount: number;
+    /** False when the listing is provably incomplete (endpoint cap, page
+     *  interruption, duplicate entries, invalid SHAs, count mismatch). */
+    complete: boolean;
+    reason?: "over-endpoint-limit" | "count-mismatch" | "pagination-interrupted" | "duplicate-sha" | "invalid-sha";
+}
+/** PR metadata the handler needs for completeness + trust decisions. */
+export interface PullRequestInfo {
+    headSha: string;
+    baseSha: string;
+    commits: number;
+    changedFiles: number;
+    title: string;
+}
 export interface CheckRunInput {
     name: string;
     headSha: string;
@@ -43,16 +67,23 @@ export interface GitHubClientLike {
     setInstallation(id: number): void;
     /** The configured GitHub App id (for exact comment-ownership matching). */
     getAppId(): string | null;
-    getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
+    getPullRequest(owner: string, repo: string, number: number): Promise<PullRequestInfo>;
+    getPullCommits(owner: string, repo: string, number: number): Promise<PullCommitCollection>;
+    /** Commits reachable from head but NOT from base (compare base...head) —
+     *  used to distinguish a NEW trailer reference from one carried in from
+     *  base history (legacy provenance). */
+    getCompareCommits(owner: string, repo: string, baseSha: string, headSha: string): Promise<string[]>;
     /** All changed files of the PR (paginated, so PRs with >100 files work). */
     getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult>;
     getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null>;
     /** File NAMES in a directory at a ref ([] when the dir does not exist). */
     listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
     listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
-    postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
+    /** Returns the created comment id. */
+    postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<number>;
     updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
-    createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<void>;
+    /** Returns the created check-run id. */
+    createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<number>;
 }
 export interface GitHubAppClientOptions {
     appId: string;
@@ -72,11 +103,9 @@ export declare class GitHubAppClient implements GitHubClientLike {
     /** Exchange the app JWT for a short-lived installation access token (cached per installation). */
     getInstallationToken(installationId: number): Promise<string>;
     private request;
-    getPullRequest(owner: string, repo: string, number: number): Promise<{
-        headSha: string;
-        title: string;
-    }>;
-    getPullCommits(owner: string, repo: string, number: number): Promise<PullCommit[]>;
+    getPullRequest(owner: string, repo: string, number: number): Promise<PullRequestInfo>;
+    getPullCommits(owner: string, repo: string, number: number): Promise<PullCommitCollection>;
+    getCompareCommits(owner: string, repo: string, baseSha: string, headSha: string): Promise<string[]>;
     getPullFiles(owner: string, repo: string, number: number): Promise<PullFilesResult>;
     /** File NAMES in a directory at a ref ([] when the dir does not exist). */
     listDirectory(owner: string, repo: string, path: string, ref: string): Promise<string[]>;
@@ -88,10 +117,10 @@ export declare class GitHubAppClient implements GitHubClientLike {
      * marker comment is found even on heavily-commented PRs.
      */
     listIssueComments(owner: string, repo: string, issueNumber: number): Promise<IssueComment[]>;
-    postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
+    postComment(owner: string, repo: string, issueNumber: number, body: string): Promise<number>;
     /** PATCH an existing comment in place (keeps the thread tidy across synchronize events). */
     updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
-    createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<void>;
+    createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<number>;
     setInstallation(id: number): void;
     getAppId(): string | null;
     private installationId;

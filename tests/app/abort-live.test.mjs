@@ -86,7 +86,10 @@ before(async () => {
         return json(res, 201, { token: "mock-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() });
       }
       if (req.method === "GET" && /\/pulls\/\d+$/.test(path)) {
-        return json(res, 200, { head: { sha: HEAD_SLOW }, title: "feat: add login" });
+        return json(res, 200, { head: { sha: HEAD_SLOW }, base: { sha: "0".repeat(40) }, commits: 1, changed_files: 0, title: "feat: add login" });
+      }
+      if (req.method === "GET" && path.includes("/compare/")) {
+        return json(res, 200, { total_commits: 1, commits: [{ sha: "c".repeat(40) }] });
       }
       if (req.method === "GET" && path.match(/\/pulls\/\d+\/files$/)) {
         return json(res, 200, []);
@@ -173,12 +176,17 @@ describe("client abort during webhook processing", () => {
 
     // Body lands on loopback in ms; the handler then blocks on the slow mock
     // commits call. Tear the connection down while it is in-flight.
-    await sleep(100);
+    await sleep(200);
     req.destroy();
 
-    // The handler must still run to completion: slow mock answers at ~600 ms,
+    // The handler must still run to completion: the slow mock answers later,
     // comment + check run land, and the guarded sendJson drops the response.
-    await sleep(900);
+    // Poll instead of fixed-sleeping — under full-suite CPU load the remaining
+    // upstream calls can take longer than any naive window.
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && (state.posted < 1 || state.checkRuns < 1)) {
+      await sleep(100);
+    }
     assert.equal(prComments[77].length, 1, "fully-read delivery must be processed despite the disconnect");
     assert.equal(state.posted, 1);
     assert.equal(state.checkRuns, 1);
