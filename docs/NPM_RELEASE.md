@@ -7,10 +7,11 @@ locally on Windows (Node v24.18.0, npm 11.16.0) except the `npm publish` /
 
 ## Prerequisites
 
-1. An npm account with **Read and publish** access to the `@drift` scope —
-   create the org first: npmjs.com → **Organizations** → *Create organization*
-   → name it `drift`. (If the scope is already taken, see
-   [Scope collision](#scope-collision).)
+1. **Scope ownership must be proven first.** The `@drift/*` packages are
+   unpublished today (registry 404 — that is not ownership proof). See
+   [docs/NPM_SCOPE_DECISION.md](NPM_SCOPE_DECISION.md) for the registry
+   findings and the recommended `@lilcipherx` scope. Do not publish until the
+   scope is verified with an authenticated `npm whoami` / `npm access`.
 2. Log in on the machine that will publish:
 
    ```bash
@@ -20,6 +21,11 @@ locally on Windows (Node v24.18.0, npm 11.16.0) except the `npm publish` /
 
    (Or put a **Read and publish** token in `C:\Users\you\.npmrc`:
    `//registry.npmjs.org/:_authToken=<token>` — then `npm whoami`.)
+
+`scripts/publish-npm.sh` now has a safety preflight: it prints the target
+packages, verifies `npm whoami` and the registry, supports `--dry-run`, and
+**refuses to publish unless** `DRIFT_NPM_SCOPE_APPROVED=1` is set (an explicit
+manual approval).
 
 ## Release checklist
 
@@ -41,7 +47,9 @@ for p in drift-ast drift-core drift-cli drift-mcp; do
 done
 
 # 4. Publish the chain in dependency order (the one-command script)
-bash scripts/publish-npm.sh
+#    First a dry run, then — after explicit approval — the real publish:
+bash scripts/publish-npm.sh --dry-run      # plan + npm publish --dry-run, no registry writes
+DRIFT_NPM_SCOPE_APPROVED=1 bash scripts/publish-npm.sh
 #    publishes @drift/ast → @drift/core → @drift/cli → @drift/mcp,
 #    confirms each version on the registry, then launches
 #    `npx -y @drift/mcp` from an EMPTY directory and checks the
@@ -81,9 +89,10 @@ cd "$(mktemp -d)" && npx -y @drift/cli --help && npx -y @drift/mcp   # handshake
 
 ## Scope collision
 
-If the `@drift` scope already belongs to someone else (it may — it is a
-common word), pick a different scope, e.g. `@drift-dev` or `@lilcipherx/drift`,
-update every package `name` **and** every `@drift/*` dependency reference in
-`packages/*/package.json` and `package-lock.json`, then re-run this checklist.
-The repo's internal imports (`@drift/core` etc.) are workspace-linked, so only
-the published names change.
+The `@drift` scope is a common word and ownership is **unverified** (an npm
+404 means not published, not available). Registry research and the exact
+rename checklist live in [docs/NPM_SCOPE_DECISION.md](NPM_SCOPE_DECISION.md):
+pick a unique scope (recommended: `@lilcipherx`), update every package `name`
+**and** every `@drift/*` dependency reference in `packages/*/package.json` and
+`package-lock.json`, then re-run this checklist. The repo's internal imports
+(`@drift/core` etc.) are workspace-linked, so only the published names change.

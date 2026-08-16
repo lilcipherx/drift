@@ -12,8 +12,7 @@ later.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
-[![Tests](https://img.shields.io/badge/tests-123%20passing-brightgreen)](tests/)
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)](.github/workflows/ci.yml)
+[![CI](https://github.com/lilcipherx/drift/actions/workflows/ci.yml/badge.svg)](https://github.com/lilcipherx/drift/actions/workflows/ci.yml)
 
 ---
 
@@ -101,23 +100,26 @@ When Drift is used in a repository, every pull request gets a compact
 provenance summary (posted by the GitHub App or the Action, updated in place —
 never spammed):
 
-> ## 🤖 Drift intent summary
+> ## Drift — Why this changed
 >
-> 1 intent on this PR · 1 author
+> 1 intent on this PR
 >
 > ### Intent `did_910a…`
 >
-> **Author:** `claude-code` (AGENT) · **Model:** `claude-3-5-sonnet` · **Signature:** ✍ Ed25519
+> Add retry handling to the payment webhook.
 >
-> > Add retry handling to the payment webhook with exponential backoff and a dead-letter queue for permanent failures.
+> ### Generated with
+> `claude-code` (AGENT) · model `claude-3-5-sonnet` · ✓ signed
 >
-> | File | Change |
-> | --- | --- |
-> | `src/webhooks/payment.ts` | **MODIFIED** — add retryWebhook() with backoff |
-> | `src/webhooks/signature.ts` | **MODIFIED** — verify signature before enqueue |
-> | `src/webhooks/process.ts` | **ADDED** — add processPaymentEvent() handler |
+> ### Affected code
+> - `src/webhooks/payment.ts` (**MODIFIED**) — add retryWebhook() with backoff
+> - `src/webhooks/signature.ts` (**MODIFIED**) — verify signature before enqueue
+> - `src/webhooks/process.ts` (**ADDED**) — add processPaymentEvent() handler
 
-Review the intent, not 2,000 lines of diff.
+Only the safe public **summary** is posted — the full prompt is private and
+never appears in a PR comment. The comment is scoped to **this PR's commits**
+(immutable base/head SHAs) and updated in place, never duplicated. Review the
+intent, not 2,000 lines of diff.
 
 ---
 
@@ -144,7 +146,8 @@ Drift records exactly that, at commit time:
 1. **`drift init`** creates `.drift/` — a SQLite intent store, a config, and a
    per-repo Ed25519 key. Git history is never rewritten.
 2. **`drift realize`** stages, syntax-checks, redacts, AST-diffs, signs, stores
-   the intent in `.drift/objects/`, and commits with a `Drift-Intent:` trailer.
+   the intent in the local `.drift/` store, writes a signed public manifest to
+   `.drift/public/intents/`, and commits with a `Drift-Intent:` trailer.
 3. **`drift blame` / `drift context`** map any line or function back to the
    intent that created it.
 4. **`drift verify`** re-runs the recorded verification command.
@@ -158,17 +161,28 @@ MCP tool).
 
 ## Security & privacy
 
-- **Prompts never leak into git history by default.** `[prompts] mode` in
-  `.drift/config.toml`: `commit-summary` (default — full prompt only in the
-  local, gitignored `.drift/` store; the commit carries a safe `Intent:` /
-  `Model:` / `Verification:` summary), `full` (opt-in, legacy), `none`
+- **The raw prompt is private by default (ADR-009).** `drift init` writes a
+  `.drift/.gitignore` that ignores the SQLite store, content-addressed
+  objects, keys and everything except the public allow-list, so `git add .`
+  can never stage private data. The only committed Drift data is
+  `.drift/public/` — the public key and signed intent manifests carrying a
+  safe summary.
+- **Default CLI/JSON output is safe for automation.** `drift log` / `blame` /
+  `context` / `status` return the public `summary`; the full local prompt
+  needs the explicit `--include-private-prompt` flag (never used in CI).
+- **A fresh clone still works.** `drift log` / `blame` / `verify-intent`
+  serve from the committed public manifests without any private database.
+- **`[prompts] mode`** in `.drift/config.toml`: `commit-summary` (default —
+  only the first line of the redacted prompt is ever public), `full`
+  (opt-in, legacy, writes the prompt into the commit message), `none`
   (prompt stored nowhere).
 - **Secrets are redacted** (AWS, OpenAI, GitHub, Slack, JWT, PEM, …) before
   any storage.
 - **Encryption at rest** (optional): `[encryption] enabled = true` +
   `DRIFT_MASTER_KEY` → AES-256-GCM for prompts and agent state.
 - **No telemetry, no network** — the CLI works fully offline.
-- Full threat model: [SECURITY.md](SECURITY.md).
+- Full threat model: [SECURITY.md](SECURITY.md) and the
+  [ADR-009 decision record](docs/adrs/009-public-private-provenance.md).
 
 ---
 

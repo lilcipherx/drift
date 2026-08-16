@@ -30,9 +30,11 @@ drift realize -p "<prompt: what and why>" --agent --model <model>
 - Exit 3 means there was nothing to commit (`E_NO_CHANGES`).
 - `--verify-cmd "<cmd>"` records a verification command re-run by `drift verify`.
 - **Prompt storage** is controlled by `[prompts] mode` in `.drift/config.toml`:
-  `commit-summary` (default — full prompt only in local `.drift/`, git commit
-  carries a safe `Intent:`/`Model:`/`Verification:` summary), `full` (prompt
-  also in the commit message), `none` (prompt stored nowhere).
+  `commit-summary` (default — the raw prompt stays in the private, gitignored
+  `.drift/` store; only the first line of the redacted prompt is public),
+  `full` (prompt also in the commit message — legacy, unsafe), `none` (prompt
+  stored nowhere). `drift log`/`blame` return the safe public `summary` by
+  default; the private prompt needs `--include-private-prompt`.
 
 ## blame / context — trace intent
 
@@ -78,7 +80,7 @@ Add `--json` for machine-readable output. Successful commands print
 `{ "status": "ok", ... }` to stdout; errors print
 `{ "status": "error", "type", "message", "exitCode" }` (thrown errors go to
 stderr, usage errors to stdout; MCP merges both). `log --json` returns
-intents with `authorType` (`"AGENT"`/`"HUMAN"`, uppercase), `model`, `prompt`,
+intents with `authorType` (`"AGENT"`/`"HUMAN"`, uppercase), `model`, `summary`,
 `gitSha`; `verify --json` returns
 `verifyStatus: "pass"|"fail"|"no-command"`.
 

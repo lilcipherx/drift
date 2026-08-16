@@ -40,7 +40,9 @@ node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "Add login flow wi
 `realize` stages the change, checks the syntax (broken code → exit 2, **no
 commit**), redacts secrets from your prompt, computes the AST delta, signs the
 intent, stores it in `.drift/objects/`, and commits with a `Drift-Intent: <id>`
-trailer. **By default the full prompt stays in the local `.drift/` store** —
+trailer. **By default the raw prompt stays in the private, gitignored
+`.drift/` store** — only the first line of the redacted prompt is public
+(ADR-009) —
 the git commit message carries only a safe `Intent:` / `Model:` /
 `Verification:` summary (see `[prompts] mode` in
 [api.md](api.md#configuration-driftconfigtoml)).
@@ -54,7 +56,7 @@ node /path/to/drift/packages/drift-cli/dist/cli.js context src/auth.ts --limit 5
 ```
 
 `blame` maps the line or function through `git blame` back to the intent that
-created it — the original prompt, author, model, and signature.
+created it — the safe public summary, author, model, and signature.
 
 ## 5. Verify your intent
 
@@ -81,11 +83,11 @@ ran verbatim from the README; the npx one-liners were skipped because the
 | 3 | `node packages/drift-cli/dist/cli.js --help` | ~90 ms | ✅ |
 | 4a | `bash scripts/seed-demo.sh` | 2.4 s | ✅ demo repo |
 | 4b | `drift log` (demo) | 68 ms | ✅ |
-| 4c | `drift blame src/auth.ts --function refreshToken` (aha) | 116 ms | ✅ prompt + model + `signature: valid` |
+| 4c | `drift blame src/auth.ts --function refreshToken` (aha) | 116 ms | ✅ summary + model + `signature: valid` |
 | 5a | `drift init` | 85 ms | ✅ |
 | 5b | `drift realize -p "Add login flow…"` | 598 ms | ✅ intent + AST delta |
 | 5c | `drift log` | 67 ms | ✅ |
-| 5d | `drift blame src/auth.ts --function login` (first blame) | 116 ms | ✅ prompt + model + `signature: valid` |
+| 5d | `drift blame src/auth.ts --function login` (first blame) | 116 ms | ✅ summary + model + `signature: valid` |
 | 5e | `drift context src/auth.ts --limit 5` | 87 ms | ✅ |
 | 5f | `drift doctor` | 248 ms | ✅ all checks pass |
 

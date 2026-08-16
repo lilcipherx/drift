@@ -86,7 +86,9 @@ drift realize -p "Add login flow" --agent --model claude-3-5-sonnet --json
 ```
 
 `drift log --json` → `{ "status": "ok", "intents": [{ "id", "gitSha",
-"authorType", "authorId", "model", "prompt", "timestamp", "files" }] }`.
+"authorType", "authorId", "model", "summary", "timestamp", "files" }] }`.
+The private `prompt` is **omitted by default** (ADR-009); add
+`--include-private-prompt` to include it (local repos only, warns on stderr).
 `drift verify --json` → `{ "status": "ok", "intentId", "verifyStatus":
 "pass"|"fail"|"no-command", "verifyCmd", "exitCode", "stdout", "stderr" }`.
 `drift replay --json` → `{ "status": "ok", "intentId", "gitSha",
@@ -128,16 +130,20 @@ mode = "commit-summary"   # commit-summary | full | none
 
 Controls how (and whether) the **full prompt** is persisted:
 
-| Mode | Full prompt in `.drift` (gitignored, local) | Full prompt in the git commit message |
-| :--- | :---: | :---: |
-| `commit-summary` (default) | ✅ | ❌ — commit carries `Intent:` (first line, ≤72 chars), `Model:`, `Verification:`, `Drift-Intent:` |
-| `full` | ✅ | ✅ — legacy behaviour (`git commit -m "<full redacted prompt>…"`) |
-| `none` | ❌ (empty) | ❌ — generic `Intent recorded` subject, only trailers |
+| Mode | Full prompt in `.drift` (gitignored, local) | Public data in git history |
+| :--- | :---: | :--- |
+| `commit-summary` (default) | ✅ | `Intent:` first line (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers; sanitized first-line summary in the signed `.drift/public/intents/<id>.json` manifest |
+| `full` | ✅ | full (redacted) prompt in the commit message — legacy, visibly unsafe |
+| `none` | ❌ (empty) | generic `Intent recorded` subject, empty manifest summary — nothing derived from the prompt |
 
 > The summary is derived from the **already-redacted** prompt, so a secret in
 > the first line is `[REDACTED]` before it can reach the commit message. For
 > a one-line prompt, `commit-summary`'s `Intent:` line *is* that line — use
 > `none` if even that must never appear.
+>
+> `drift init` writes a `.drift/.gitignore` that makes `.drift/public/` the
+> only trackable Drift data (ADR-009) — `git add .` can never stage the
+> private store, and a fresh clone serves `log`/`blame` from the manifests.
 >
 > `[encryption] enabled = true` applies **on top of** any mode: whatever is
 > stored in `.drift` (prompt, agent state) is AES-256-GCM encrypted.
@@ -191,7 +197,7 @@ resume a crashed or interrupted task.
 
 ### `drift_blame`
 
-Ask *“why does this function exist?”* — returns the originating prompt, model
+Ask *“why does this function exist?”* — returns the safe public summary, model
 and intent for a line or function.
 
 | Input | Type | Meaning |
