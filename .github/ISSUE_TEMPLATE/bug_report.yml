@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a broken command, wrong output, crash, or unexpected behaviour
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report. Security
+        issues must **not** be reported here — use
+        [private vulnerability reporting](https://github.com/lilcipherx/drift/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: Drift version
+      description: Output of `drift version` (or the commit you're on)
+      placeholder: e.g. 0.4.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + Node version (`node -v`)
+      placeholder: e.g. Windows 11, Node v24.18.0
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: The exact command(s), including flags. Paste, don't paraphrase.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead? Paste the real output (including exit code).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps or script to reproduce. Fresh temp repo preferred.
+      placeholder: |
+        1. `git init` in a temp dir
+        2. `node /path/to/drift/packages/drift-cli/dist/cli.js init`
+        3. ...
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Sanity checks
+      options:
+        - label: I searched the issues and docs before filing
+        - label: The bug reproduces on a fresh clone / temp repo

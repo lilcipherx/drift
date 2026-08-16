@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a new command, MCP tool, integration, or UX improvement
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement to Drift. Small, well-scoped
+        ideas are easiest to review — if the feature is large, consider
+        splitting it into an RFC discussion first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today? Who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What should the behaviour/command/tool look like? Include a sketch of the CLI flags or MCP input schema if applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you try or consider?
+  - type: input
+    id: area
+    attributes:
+      label: Area
+      description: cli / mcp / app / action / sdk / ast / docs
+      placeholder: e.g. cli
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Willingness
+      options:
+        - label: I'm willing to implement this (or pair on it)

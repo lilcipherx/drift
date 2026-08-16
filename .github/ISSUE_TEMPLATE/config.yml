@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerabilities
+    url: https://github.com/lilcipherx/drift/security/advisories/new
+    about: Report security issues privately — please do not open a public issue.
+  - name: Documentation
+    url: https://github.com/lilcipherx/drift/blob/main/docs/quickstart.md
+    about: Quickstart, API reference and architecture docs.
+  - name: Good first issues
+    url: https://github.com/lilcipherx/drift/blob/main/docs/GOOD_FIRST_ISSUES.md
+    about: A curated list of small tasks for new contributors.
