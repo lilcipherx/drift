@@ -38,8 +38,12 @@ function git(repo, args) {
   return res.stdout.trim();
 }
 
-function run(repo, args) {
-  const res = spawnSync(process.execPath, [CLI, ...args], { cwd: repo, encoding: "utf8" });
+function run(repo, args, env = {}) {
+  const res = spawnSync(process.execPath, [CLI, ...args], {
+    cwd: repo,
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
   return { status: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
 
@@ -655,4 +659,69 @@ test("an oversized tracked manifest is reported as malformed without crashing or
   assert.ok(log.stderr.includes("malformed"), log.stderr);
   const v = run(repo, ["verify", id, "--json"]);
   assert.equal(JSON.parse(v.stdout).signature, "malformed");
+});
+
+// ------------------------------------------- index snapshot lifecycle (issue 10-12)
+// The CLI is spawned with its OWN isolated TMPDIR so concurrent test files
+// (npm test runs suites in parallel) can never create drift-idx-* entries
+// inside the directory we are asserting on.
+function isolatedRun(repo, args) {
+  const tmp = mkdtempSync(join(tmpdir(), "drift-idxcheck-"));
+  const res = run(repo, args, { TMPDIR: tmp, TMP: tmp, TEMP: tmp });
+  return { status: res.status, stderr: res.stderr, backups: () => readdirSync(tmp).filter((n) => n.startsWith("drift-idx-")) };
+}
+
+test("index snapshots are always discarded: no drift-idx-* backup survives success, failure, or repeated realizations", () => {
+  // successful realize discards its snapshot
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 80;\n");
+  let r = isolatedRun(repo, ["realize", "-p", "ok", "--summary", "OK"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.backups(), [], "a successful realize must not leave a drift-idx-* backup behind");
+
+  // repeated successful realizations do not accumulate backups
+  for (let i = 0; i < 3; i++) {
+    writeFileSync(join(repo, "src", "a.ts"), `export const a = ${81 + i};\n`);
+    r = isolatedRun(repo, ["realize", "-p", "ok", "--summary", "OK"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.backups(), [], `realize #${i + 1} must not leak a backup (persistent self-hosted runner hygiene)`);
+  }
+
+  // pre-commit failure (syntax error) restores AND cleans up its snapshot
+  writeFileSync(join(repo, "src", "bad.ts"), "this is not valid typescript ;;;\n");
+  r = isolatedRun(repo, ["realize", "-p", "boom", "--summary", "Boom"]);
+  assert.equal(r.status, 2, r.stderr);
+  assert.deepEqual(r.backups(), [], "a failed realize must not leave a drift-idx-* backup behind");
+
+  // "no staged changes" failure also cleans up
+  const fresh = makeRepo();
+  assert.equal(run(fresh, ["init"]).status, 0);
+  r = isolatedRun(fresh, ["realize", "-p", "nothing changed"]);
+  assert.notEqual(r.status, 0);
+  assert.deepEqual(r.backups(), [], "a no-op realize must not leave a drift-idx-* backup behind");
+});
+
+test("strict schema: unknown manifest fields are rejected (top-level, agent, files)", async () => {
+  const { parsePublicIntentManifest } = await import("../../packages/drift-core/dist/index.js");
+  const base = {
+    schemaVersion: 2,
+    id: "did_11111111111111111111111111111111",
+    summary: "s",
+    timestamp: 1,
+    signature: "",
+    signingKeyId: "0123456789abcdef",
+  };
+  assert.equal(parsePublicIntentManifest(base).ok, true);
+  assert.equal(parsePublicIntentManifest({ ...base, stray: 1 }).ok, false);
+  assert.equal(
+    parsePublicIntentManifest({ ...base, agent: { type: "AGENT", identifier: "x", extra: true } }).ok,
+    false,
+  );
+  assert.equal(
+    parsePublicIntentManifest({ ...base, files: [{ path: "a", mutationType: "ADDED", extra: 1 }] }).ok,
+    false,
+  );
+  assert.equal(parsePublicIntentManifest({ ...base, commit: "abc" }).ok, false, "commit is V1-only");
+  assert.equal(parsePublicIntentManifest({ ...base, symbols: [] }).ok, false, "symbols is not part of the schema");
 });

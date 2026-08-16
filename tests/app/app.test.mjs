@@ -25,7 +25,8 @@ const { verifyWebhookSignature, handleWebhook } = await mod("handler.js");
 const { createAppJwt, decodeJwt } = await mod("jwt.js");
 const { createWebhookServer, assertWebhookAuthConfigured } = await mod("server.js");
 const { deriveProvenanceConclusion, evaluateKeyChange, isDriftOwnedComment } = await mod("trust.js");
-const { signatureStateFor, auditProvenanceIntegrity } = await mod("intents.js");
+const { signatureStateFor, auditProvenanceIntegrity, parseLoadedManifest } = await mod("intents.js");
+const { generateKeyPair, newIntentId, PublicStore, signingKeyIdFor } = await import("@drift/core");
 
 // ------------------------------------------------------------- unit: trailers
 test("extractIntentIds: parses Drift-Intent trailers across commits, dedupes, ignores invalid ids", () => {
@@ -181,6 +182,9 @@ class FakeGitHub {
     // Base-branch manifests (default: empty — a fresh base, so every head
     // manifest is a legitimate atomic addition).
     this.baseManifests = opts.baseManifests ?? {};
+    // Per-commit file content for introduction-commit resolution:
+    // ref -> path -> content. Absent refs fall back to head content.
+    this.perCommit = opts.perCommit ?? {};
     // The key at the HEAD ref (default). `basePublicKeyPem` (when given)
     // simulates a base-branch key that differs from the head — required for
     // key-only PR / trust-root-change scenarios.
@@ -195,17 +199,27 @@ class FakeGitHub {
     this.calls = { comments: [], checks: [], updates: [] };
     this.installation = null;
     this.pullFiles = opts.pullFiles ?? [];
+    this.appId = opts.appId ?? "12345";
   }
   setInstallation(id) { this.installation = id; }
+  getAppId() { return this.appId; }
   async getPullCommits() { return this.commits; }
   async getPullFiles() { return this.pullFiles; }
   isBaseRef(ref) { return ref === "base123" || ref === "base-sha"; }
   async getFileContent(owner, repo, path, ref) {
     const base = this.isBaseRef(ref);
-    if (path === ".drift/public/key.pem") {
-      return base ? this.basePublicKeyPem : this.publicKeyPem;
+    if (base) {
+      if (path === ".drift/public/key.pem") return this.basePublicKeyPem;
+      return this.baseManifests[path] ?? null;
     }
-    return (base ? this.baseManifests : this.manifests)[path] ?? null;
+    const per = this.perCommit[ref];
+    if (per !== undefined) {
+      // A pinned per-commit tree sees ONLY that tree's content.
+      if (path in per) return per[path];
+      return null;
+    }
+    if (path === ".drift/public/key.pem") return this.publicKeyPem;
+    return this.manifests[path] ?? null;
   }
   async listDirectory(owner, repo, path, ref) {
     if (path !== ".drift/public/intents") return [];
@@ -585,15 +599,21 @@ test("handler: invalid bootstrap signature fails the check run (never labeled bo
 });
 
 // -------------------------------------------------- D: comment ownership
-test("isDriftOwnedComment: only GitHub-attested App authorship — never bot, never a user marker", () => {
+test("isDriftOwnedComment: requires EXACT configured App id — never an arbitrary positive id, never bot, never a user marker", () => {
   const marker = SUMMARY_MARKER;
   // a github-actions[bot] comment is the ACTION's, which the App must never edit
-  assert.equal(isDriftOwnedComment({ body: `${marker} action`, user: { login: "github-actions[bot]", type: "Bot" }, performed_via_github_app: null }), false);
+  assert.equal(isDriftOwnedComment({ body: `${marker} action`, user: { login: "github-actions[bot]", type: "Bot" }, performed_via_github_app: null }, "12345"), false);
   // a real App-authored comment carries performed_via_github_app.id (GitHub-set)
-  assert.equal(isDriftOwnedComment({ body: `${marker} app`, user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }), true);
+  assert.equal(isDriftOwnedComment({ body: `${marker} app`, user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }, "12345"), true);
+  // ANY other positive app id is NOT ownership — a different GitHub App that
+  // happens to use the marker must never be edited (issue 7)
+  assert.equal(isDriftOwnedComment({ body: `${marker} other app`, user: { login: "other[bot]", type: "Bot" }, performed_via_github_app: { id: 999 } }, "12345"), false);
   // a user-authored body that merely contains the marker is a spoof
-  assert.equal(isDriftOwnedComment({ body: `${marker} spoofed`, user: { login: "alice", type: "User" }, performed_via_github_app: null }), false);
-  assert.equal(isDriftOwnedComment({ body: "no marker", user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }), false);
+  assert.equal(isDriftOwnedComment({ body: `${marker} spoofed`, user: { login: "alice", type: "User" }, performed_via_github_app: null }, "12345"), false);
+  assert.equal(isDriftOwnedComment({ body: "no marker", user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }, "12345"), false);
+  // fail-safe: when the configured App id is unavailable, NO comment is owned
+  assert.equal(isDriftOwnedComment({ body: `${marker} app`, user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }, null), false);
+  assert.equal(isDriftOwnedComment({ body: `${marker} app`, user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }, ""), false);
 });
 
 test("handler: a user-authored spoofed marker is never updated — the App posts its own", async () => {
@@ -627,9 +647,25 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
   );
   assert.deepEqual(audit, { violations: [], replayIds: [], ambiguousIds: [] }, JSON.stringify(audit));
 
-  // modified: present on base AND head
+  // unchanged: byte-identical content on base AND head is NOT a modification
+  // (issue 4 — filename presence alone is never evidence of tampering)
   audit = await auditProvenanceIntegrity(
     new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson() }, [], { baseManifests: base, publicKeyPem: PUBLIC_KEY_PEM }),
+    "lilcipherx",
+    "drift",
+    7,
+    COMMITS,
+    "base123",
+    "abc123def",
+  );
+  assert.deepEqual(audit, { violations: [], replayIds: [INTENT_ID], ambiguousIds: [] }, JSON.stringify(audit));
+
+  // modified: present on base AND head with DIFFERENT content
+  audit = await auditProvenanceIntegrity(
+    new FakeGitHub(COMMITS, { [MANIFEST_PATH]: manifestJson({ summary: "tampered content" }) }, [], {
+      baseManifests: base,
+      publicKeyPem: PUBLIC_KEY_PEM,
+    }),
     "lilcipherx",
     "drift",
     7,
@@ -714,6 +750,72 @@ test("auditProvenanceIntegrity: modified / deleted / orphan / replay / ambiguous
   assert.ok(audit.replayIds.includes(INTENT_ID), JSON.stringify(audit));
 });
 
+test("auditProvenanceIntegrity: added-then-modified in the same PR is a violation (issue 5)", async () => {
+  // commit c1 introduces the manifest with content X (and carries the single
+  // matching trailer); commit c2 later modifies it to content Y. The final
+  // diff may still look like "added", so head-vs-introduction blob comparison
+  // must catch the post-introduction mutation.
+  const commits = [
+    { sha: "c1", message: `add intent\n\nDrift-Intent: ${INTENT_ID}` },
+    { sha: "c2", message: "tweak manifest" },
+  ];
+  const introContent = manifestJson();
+  const headContent = manifestJson({ summary: "mutated after introduction" });
+  const github = new FakeGitHub(commits, { [MANIFEST_PATH]: headContent }, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    perCommit: { c1: { [MANIFEST_PATH]: introContent }, c2: { [MANIFEST_PATH]: headContent } },
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
+  assert.ok(audit.violations.some((v) => v.code === "mutated" && v.id === INTENT_ID), JSON.stringify(audit));
+});
+
+test("auditProvenanceIntegrity: trailer on a different commit than the introduction is a violation (issue 5)", async () => {
+  // c1 introduces the file with NO trailer; c2 carries the trailer. Atomic
+  // association requires the introducing commit to carry exactly one matching
+  // Drift-Intent trailer.
+  const commits = [
+    { sha: "c1", message: "add manifest without trailer" },
+    { sha: "c2", message: `claim intent\n\nDrift-Intent: ${INTENT_ID}` },
+  ];
+  const content = manifestJson();
+  const github = new FakeGitHub(commits, { [MANIFEST_PATH]: content }, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    perCommit: { c1: { [MANIFEST_PATH]: content }, c2: { [MANIFEST_PATH]: content } },
+  });
+  const audit = await auditProvenanceIntegrity(github, "lilcipherx", "drift", 7, commits, "base123", "head123");
+  assert.ok(audit.violations.some((v) => v.code === "intro-mismatch" && v.id === INTENT_ID), JSON.stringify(audit));
+});
+
+// ------------------------------------------- contract: real Core → App
+test("contract: a real Core V2 manifest is valid through the App (production writer → app loader)", async () => {
+  const { privateKeyPem, publicKeyPem } = generateKeyPair();
+  const id = newIntentId();
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const root = mkdtempSync(join(tmpdir(), "drift-app-contract-"));
+  const store = new PublicStore(join(root, ".drift"));
+  const view = {
+    schemaVersion: 2,
+    id,
+    summary: "app contract test",
+    agent: { type: "AGENT", identifier: "contract" },
+    files: [{ path: "src/a.ts", mutationType: "ADDED", summary: "added" }],
+    timestamp: Date.now(),
+    signingKeyId: signingKeyIdFor(publicKeyPem),
+  };
+  store.write(view, privateKeyPem); // the production manifest writer
+  const raw = await import("node:fs").then((m) => m.readFileSync(join(root, ".drift", "public", "intents", `${id}.json`), "utf8"));
+  const loaded = parseLoadedManifest(raw, id); // the App's loader
+  assert.equal(loaded.errors, null, JSON.stringify(loaded.errors));
+  assert.ok(loaded.manifest, "App must load the Core-written manifest");
+  const state = signatureStateFor(loaded, publicKeyPem, publicKeyPem);
+  assert.equal(state, "valid", "a real Core manifest must be VALID in the App");
+  // formatting invariance: CRLF + whitespace PEM produce the same fingerprint
+  assert.equal(signingKeyIdFor(publicKeyPem.replace(/\n/g, "\r\n")), signingKeyIdFor(publicKeyPem));
+  assert.equal(signingKeyIdFor(`  ${publicKeyPem}\n`), signingKeyIdFor(publicKeyPem));
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("deriveProvenanceConclusion: any integrity violation fails the check, even with zero intents", () => {
   const r = deriveProvenanceConclusion({
     intents: [],
@@ -743,9 +845,10 @@ test("deriveProvenanceConclusion: any integrity violation fails the check, even 
 });
 
 test("handler: an integrity-only PR (tampered manifest, zero new trailers) still gets a failing check run + warning", async () => {
-  // base has the manifest; head carries it too but commits carry no trailers
+  // base has the manifest; head carries it with DIFFERENT content and commits
+  // carry no trailers — content comparison must flag the modification
   const noTrailer = [{ sha: "x", message: "tamper without trailer" }];
-  const github = new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson() }, [], {
+  const github = new FakeGitHub(noTrailer, { [MANIFEST_PATH]: manifestJson({ summary: "tampered content" }) }, [], {
     publicKeyPem: PUBLIC_KEY_PEM,
     basePublicKeyPem: PUBLIC_KEY_PEM,
     baseManifests: { [MANIFEST_PATH]: manifestJson() },
@@ -755,6 +858,43 @@ test("handler: an integrity-only PR (tampered manifest, zero new trailers) still
   assert.equal(github.calls.checks.length, 1);
   assert.equal(github.calls.checks[0].conclusion, "failure");
   assert.ok(result.commentBody.includes("integrity"), "the violation must be visible in the comment");
+});
+
+test("handler: ordinary PR with an unchanged historical manifest is NOT flagged as modified (issue 4)", async () => {
+  // base already has intent A's manifest; the PR changes only an ordinary
+  // source file and atomically adds a NEW intent B. A is byte-identical on
+  // base and head ⇒ unchanged, no violation; the check is success.
+  const ID_B = "did_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const MANIFEST_B = `.drift/public/intents/${ID_B}.json`;
+  const commits = [
+    { sha: "c1", message: "fix(src): ordinary source change" },
+    { sha: "c2", message: `feat(src): add feature\n\nDrift-Intent: ${ID_B}` },
+  ];
+  const baseContent = manifestJson();
+  const bContent = JSON.stringify(
+    signedManifest({
+      schemaVersion: 1,
+      id: ID_B,
+      summary: "new feature",
+      commit: "c2",
+      timestamp: 1786000000000,
+    }),
+  );
+  const github = new FakeGitHub(commits, { [MANIFEST_PATH]: baseContent, [MANIFEST_B]: bContent }, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    basePublicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: { [MANIFEST_PATH]: baseContent },
+    perCommit: { c1: {}, c2: { [MANIFEST_B]: bContent } },
+  });
+  const payload = {
+    ...PAYLOAD,
+    pull_request: { ...PAYLOAD.pull_request, base: { sha: "base123" }, head: { sha: "head123" } },
+  };
+  const result = await handleWebhook(eventFor(payload), devDeps(github));
+  assert.equal(result.conclusion, "success", JSON.stringify(result));
+  assert.equal(github.calls.checks.length, 1);
+  assert.equal(github.calls.checks[0].conclusion, "success");
+  assert.ok(!result.commentBody.includes("integrity violation"), "no false modified violation");
 });
 
 test("handler: check-run creation is independent from the comment — a comment failure never loses the check result", async () => {

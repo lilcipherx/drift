@@ -17,7 +17,11 @@ import {
   sanitizeCommentText,
   parseGitTrailers,
   auditPublicProvenance,
+  validateManifest,
+  signingKeyIdFor,
+  hasProvenanceError,
 } from "../../scripts/pr-comment.mjs";
+import { generateKeyPair, newIntentId, PublicStore } from "@drift/core";
 
 // ------------------------------------------------------------------- helpers
 function git(repo, args) {
@@ -718,4 +722,125 @@ test("auditPublicProvenance: one id referenced by two commits is ambiguous (neve
   const audit = auditOf(repo, { baseSha, headSha: c2, commits: [c1, c2] });
   assert.ok(audit.ambiguousIds.includes(ID_A), JSON.stringify(audit));
   assert.ok(!audit.violations.some((v) => v.code === "orphan"), "n>1 is ambiguous, not orphan");
+});
+
+test("auditPublicProvenance: added-then-modified in the same PR is a violation (mutated)", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // c1: atomic introduction (content X + matching trailer)
+  writePublicProvenance(repo, { manifests: { [ID_A]: { summary: "original" } } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `add\n\nDrift-Intent: ${ID_A}`]);
+  const c1 = git(repo, ["rev-parse", "HEAD"]);
+  // c2: modifies the SAME manifest (content Y) — final diff still shows "A"
+  writePublicProvenance(repo, { manifests: { [ID_A]: { summary: "mutated after introduction" } } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "tweak manifest"]);
+  const c2 = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha: c2, commits: [c1, c2] });
+  assert.ok(audit.violations.some((v) => v.code === "mutated" && v.id === ID_A), JSON.stringify(audit.violations));
+});
+
+test("auditPublicProvenance: unchanged introduction is NOT flagged as mutated (byte-identical head blob)", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `add\n\nDrift-Intent: ${ID_A}`]);
+  const c1 = git(repo, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 4;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "unrelated source change"]);
+  const c2 = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha: c2, commits: [c1, c2] });
+  assert.deepEqual(audit.violations, [], JSON.stringify(audit));
+});
+
+// ------------------------------------------ contract: real Core → Action
+// The Action and Core must agree on key identity and signature validity. A
+// real Core-generated V2 manifest (the production writer `PublicStore.write`)
+// must be classified VALID by the Action's verification path.
+test("contract: a real Core V2 manifest is valid through the Action (fingerprint + signature)", () => {
+  const { privateKeyPem, publicKeyPem } = generateKeyPair();
+  const id = newIntentId();
+  // PublicStore is constructed on the `.drift` dir (as the engine does);
+  // readManifest (the Action loader) is called on the repo root.
+  const root = mkdtempSync(join(tmpdir(), "drift-contract-"));
+  const store = new PublicStore(join(root, ".drift"));
+  const view = {
+    schemaVersion: 2,
+    id,
+    summary: "contract test intent",
+    model: "test-model",
+    agent: { type: "AGENT", identifier: "contract-test" },
+    verification: "npm test",
+    files: [{ path: "src/a.ts", mutationType: "ADDED", summary: "added a" }],
+    timestamp: Date.now(),
+    signingKeyId: signingKeyIdFor(publicKeyPem),
+  };
+  store.write(view, privateKeyPem); // the production manifest writer
+  const loaded = readManifest(root, id); // the Action's loader
+  assert.ok(loaded.manifest, "Action must load the Core-written manifest");
+  assert.equal(loaded.errors, null, JSON.stringify(loaded.errors));
+  // the manifest's signingKeyId (Core canonical SPKI-DER) must equal the
+  // Action's canonical fingerprint — LF/CRLF/whitespace must not change it
+  assert.equal(loaded.manifest.signingKeyId, signingKeyIdFor(publicKeyPem));
+  assert.equal(
+    signingKeyIdFor(publicKeyPem.replace(/\n/g, "\r\n")),
+    signingKeyIdFor(publicKeyPem),
+    "CRLF PEM must produce the same fingerprint",
+  );
+  assert.equal(
+    signingKeyIdFor(`  ${publicKeyPem}\n\n`),
+    signingKeyIdFor(publicKeyPem),
+    "surrounding whitespace must produce the same fingerprint",
+  );
+  const state = signatureStateFor(loaded.manifest, { baseKey: publicKeyPem, headKey: publicKeyPem });
+  assert.equal(state, "valid", "a real Core manifest must be VALID in the Action");
+  // a different key must NOT validate the same manifest
+  const other = generateKeyPair();
+  assert.equal(
+    signatureStateFor(loaded.manifest, { baseKey: other.publicKeyPem, headKey: other.publicKeyPem }),
+    "invalid",
+  );
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("validateManifest: strict unknown-field rejection (top-level, agent, files)", () => {
+  const base = {
+    schemaVersion: 2,
+    id: ID_A,
+    summary: "s",
+    timestamp: 1,
+    signature: "",
+    signingKeyId: "0123456789abcdef",
+  };
+  assert.equal(validateManifest(base).ok, true);
+  assert.equal(validateManifest({ ...base, extraTopLevel: 1 }).ok, false);
+  assert.equal(validateManifest({ ...base, agent: { type: "AGENT", identifier: "x", extraAgent: true } }).ok, false);
+  assert.equal(validateManifest({ ...base, files: [{ path: "a", mutationType: "ADDED", extraFile: 1 }] }).ok, false);
+  assert.equal(validateManifest({ ...base, commit: "abc" }).ok, false, "commit is V1-only, rejected on V2");
+});
+
+test("hasProvenanceError: trust/integrity state → workflow-failure mapping (issue 13)", () => {
+  const intent = (signatureState) => ({ id: ID_A, signatureState });
+  // failures
+  assert.equal(hasProvenanceError({ intents: [intent("invalid")], keyChange: "unchanged", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [intent("untrusted-key")], keyChange: "unchanged", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [intent("malformed")], keyChange: "unchanged", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "replaced", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "removed", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", audit: { violations: [{ code: "modified", id: ID_A, detail: "x" }], replayIds: [], ambiguousIds: [] } }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", audit: { violations: [], replayIds: [ID_A], ambiguousIds: [] } }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", audit: { violations: [], replayIds: [], ambiguousIds: [ID_A] } }), true);
+  // neutral states never fail by default
+  assert.equal(hasProvenanceError({ intents: [intent("bootstrap")], keyChange: "bootstrap", audit: emptyAudit() }), false);
+  assert.equal(hasProvenanceError({ intents: [intent("unsigned")], keyChange: "unchanged", audit: emptyAudit() }), false);
+  assert.equal(hasProvenanceError({ intents: [intent("unverifiable")], keyChange: "unchanged", audit: emptyAudit() }), false);
+  assert.equal(hasProvenanceError({ intents: [intent("missing")], keyChange: "unchanged", audit: emptyAudit() }), false);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "none", audit: emptyAudit() }), false);
+  assert.equal(hasProvenanceError({ intents: [intent("valid")], keyChange: "unchanged", audit: emptyAudit() }), false);
+  function emptyAudit() {
+    return { violations: [], replayIds: [], ambiguousIds: [] };
+  }
 });
