@@ -9,8 +9,19 @@
  * Raw prompts, the SQLite database, the content-addressed objects and the
  * signing key live in private (gitignored) locations. This module never sees
  * them: everything here is safe to commit and safe to render publicly.
+ *
+ * Manifest schemas:
+ *   V1 (schemaVersion 1) — legacy. Contains an embedded `commit` SHA that was
+ *     part of its signed payload. Read and verified as-is; the `commit` field
+ *     is treated as untrusted legacy metadata by consumers.
+ *   V2 (schemaVersion 2) — current. Deliberately does NOT embed the containing
+ *     Git commit SHA (that would be a self-referential cycle: adding the SHA
+ *     changes the tree, which changes the SHA). The intent → commit
+ *     association is derived from `Drift-Intent:` git trailers. Adds
+ *     `signingKeyId` (fingerprint of the signing public key).
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { canonicalJson, signPayload, verifyPayload } from "./crypto.js";
@@ -31,25 +42,51 @@ export interface PublicAgent {
   identifier: string;
 }
 
-/**
- * The canonical public record for one intent. Everything except `signature`
- * is covered by the Ed25519 signature, verifiable with `.drift/public/key.pem`.
- */
-export interface PublicIntentView {
-  schemaVersion: 1;
+/** Fields common to every manifest schema version. */
+export interface PublicIntentManifestBase {
   id: string;
   summary: string;
   model?: string;
   agent?: PublicAgent;
   verification?: string;
   files?: PublicIntentFile[];
-  commit: string;
+  /** Epoch-ms creation time (kept across V1/V2 for consumers). */
   timestamp: number;
+}
+
+/**
+ * Legacy manifest (ADR-009 initial release). The `commit` field is legacy
+ * metadata: it was part of the signed payload of V1 manifests only. Consumers
+ * prefer the Git-trailer-derived association over this field.
+ */
+export interface PublicIntentManifestV1 extends PublicIntentManifestBase {
+  schemaVersion: 1;
+  commit: string;
   signature: string;
 }
 
-/** A PublicIntentView with `signature` stripped (the signed payload). */
-export type UnsignedPublicIntentView = Omit<PublicIntentView, "signature">;
+/**
+ * The canonical public record for one intent (current). Everything except
+ * `signature` is covered by the Ed25519 signature, verifiable with
+ * `.drift/public/key.pem`.
+ *
+ * Deliberately does NOT contain the SHA of the Git commit that contains it:
+ * that would be a self-referential cycle (adding the SHA changes the tree,
+ * which changes the SHA). The intent → commit association is derived from the
+ * `Drift-Intent:` trailer in the commit message instead (engine
+ * `intentCommitIndex`). `signingKeyId` is a fingerprint of the signing public
+ * key so consumers can tell which trust root signed a manifest.
+ */
+export interface PublicIntentManifestV2 extends PublicIntentManifestBase {
+  schemaVersion: 2;
+  signingKeyId: string;
+  signature: string;
+}
+
+export type PublicIntentView = PublicIntentManifestV1 | PublicIntentManifestV2;
+
+/** A V2 view with `signature` stripped (the signed payload). */
+export type UnsignedPublicIntentView = Omit<PublicIntentManifestV2, "signature">;
 
 /**
  * Strip content that must never reach a public surface (PR comments, step
@@ -86,7 +123,8 @@ export function buildPublicSummary(text: string): string {
 /**
  * Generic fallback summary derived ONLY from non-prompt metadata (intent id,
  * affected file count) — never from prompt text, so it is always safe to
- * commit, clone, and render. Used when the user supplies no explicit summary.
+ * commit, clone, and render. Used when the user supplies no explicit summary
+ * or when a public manifest is missing.
  */
 export function genericPublicSummary(id: string, opts: { fileCount?: number } = {}): string {
   const base = `Drift intent ${id}`;
@@ -100,13 +138,16 @@ export const PUBLIC_INTENTS_DIR = join("public", "intents");
 function isPublicIntentView(value: unknown): value is PublicIntentView {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return (
-    v.schemaVersion === 1 &&
-    typeof v.id === "string" &&
-    typeof v.summary === "string" &&
-    typeof v.commit === "string" &&
-    typeof v.signature === "string"
-  );
+  // A missing/empty `signature` is NOT disqualifying: an unsigned manifest is
+  // still provenance (reported as state "unsigned"), it must never silently
+  // fall back to the private legacy record.
+  if (v.schemaVersion === 1) {
+    return typeof v.id === "string" && typeof v.summary === "string" && typeof v.commit === "string";
+  }
+  if (v.schemaVersion === 2) {
+    return typeof v.id === "string" && typeof v.summary === "string" && typeof v.signingKeyId === "string";
+  }
+  return false;
 }
 
 /**
@@ -132,11 +173,16 @@ export class PublicStore {
     return existsSync(this.keyPath) || this.list().length > 0;
   }
 
-  /** The committed Ed25519 public key, or null when absent. */
+  /**
+   * The committed Ed25519 public key, or null when absent. Line endings are
+   * normalized to LF: on Windows `core.autocrlf` gives tracked PEM files CRLF
+   * in the working tree, which would otherwise break string comparisons
+   * between the derived public key and the committed trust root.
+   */
   publicKey(): string | null {
     if (!existsSync(this.keyPath)) return null;
     try {
-      const pem = readFileSync(this.keyPath, "utf8").trim();
+      const pem = readFileSync(this.keyPath, "utf8").replace(/\r\n/g, "\n").trim();
       return pem || null;
     } catch {
       return null;
@@ -146,10 +192,10 @@ export class PublicStore {
   /** Write the public key file (idempotent). */
   writePublicKey(pem: string): void {
     mkdirSync(dirname(this.keyPath), { recursive: true });
-    writeFileSync(this.keyPath, `${pem.trim()}\n`, { mode: 0o644 });
+    writeFileSync(this.keyPath, `${pem.replace(/\r\n/g, "\n").trim()}\n`, { mode: 0o644 });
   }
 
-  /** Sign a public view with the repo key and persist it. */
+  /** Sign a public view with the repo key and persist it (V2 schema). */
   write(view: UnsignedPublicIntentView, privateKeyPem: string): PublicIntentView {
     const signature = signPayload(canonicalJson(view), privateKeyPem);
     const signed: PublicIntentView = { ...view, signature };
@@ -169,7 +215,7 @@ export class PublicStore {
     }
   }
 
-  /** Every manifest, newest first (commit timestamp desc). */
+  /** Every manifest, newest first (timestamp desc). */
   list(): PublicIntentView[] {
     const dir = join(this.driftDir, PUBLIC_INTENTS_DIR);
     if (!existsSync(dir)) return [];
@@ -182,9 +228,16 @@ export class PublicStore {
     return views.sort((a, b) => b.timestamp - a.timestamp);
   }
 
+  /**
+   * Legacy V1-only association: find a V1 manifest whose embedded `commit`
+   * field matches. V2 manifests never embed a commit SHA — their association
+   * is resolved from `Drift-Intent:` git trailers (engine `intentCommitIndex`),
+   * never from this field, so an attacker cannot fabricate an association by
+   * editing a manifest.
+   */
   findByCommit(commitSha: string): PublicIntentView | null {
     if (!/^[0-9a-f]{40}$/.test(commitSha)) return null;
-    return this.list().find((v) => v.commit === commitSha) ?? null;
+    return this.list().find((v) => v.schemaVersion === 1 && v.commit === commitSha) ?? null;
   }
 
   /** Verify the manifest signature against the committed public key. */
@@ -194,4 +247,13 @@ export class PublicStore {
     const { signature, ...unsigned } = view;
     return verifyPayload(canonicalJson(unsigned), pub, signature);
   }
+}
+
+/**
+ * Short fingerprint of an Ed25519 public key (first 16 hex chars of its
+ * SHA-256). Used as `signingKeyId` in V2 manifests and by `drift status` /
+ * key-state output — never the private key material.
+ */
+export function signingKeyIdFor(publicKeyPem: string): string {
+  return createHash("sha256").update(publicKeyPem.trim(), "utf8").digest("hex").slice(0, 16);
 }

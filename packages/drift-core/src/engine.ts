@@ -9,6 +9,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { createPublicKey } from "node:crypto";
@@ -63,10 +64,15 @@ import {
   genericPublicSummary,
   PUBLIC_FILES_MAX,
   PublicStore,
+  signingKeyIdFor,
+  type PublicIntentManifestV2,
   type PublicIntentView,
   type UnsignedPublicIntentView,
 } from "./public.js";
 import { extractDriftIntentIds } from "./trailers.js";
+
+/** Default timeout for a `drift verify --run` verification command (ms). */
+const VERIFY_TIMEOUT_MS = 120_000;
 
 export interface RealizeOptions {
   prompt: string;
@@ -106,10 +112,20 @@ export interface BlameResult {
 export interface VerifyResult {
   intentId: string;
   verifyCmd: string | null;
-  status: "pass" | "fail" | "no-command";
+  /**
+   * pass/fail/timeout — the command executed (only with explicit `--run`).
+   * no-command        — no verification command recorded.
+   * not-executed      — a command is recorded but was NOT run (default).
+   * refused           — `--run` given but trust requirements unmet.
+   */
+  status: "pass" | "fail" | "timeout" | "no-command" | "not-executed" | "refused";
+  /** Signature/trust state of the intent (valid | invalid | unsigned | unverifiable | untrusted-key). */
+  signature: SignatureState;
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  /** Human-readable explanation (also safe to render). */
+  message: string;
 }
 
 export interface ReplayResult {
@@ -135,7 +151,36 @@ export interface InitResult {
   repoRoot: string;
   driftDir: string;
   publicKeyPem: string;
+  /** Signer state after init: ready | read-only | missing | mismatch. */
+  signerState: SignerState;
+  /** sha256 fingerprint (16 hex chars) of the public key, or null. */
+  publicKeyFingerprint: string | null;
 }
+
+/**
+ * Signing-key availability of this checkout (ADR-009 key model):
+ *   ready    — private key present and matches the committed trust root.
+ *   read-only— committed public key present, private key absent (fresh clone).
+ *   missing  — neither key present.
+ *   mismatch — private key present but does NOT match the trust root.
+ */
+export type SignerState = "ready" | "read-only" | "missing" | "mismatch";
+
+/**
+ * Cryptographic trust state of an intent's signature:
+ *   valid        — verifies against the trusted repository public key.
+ *   invalid      — a signature exists but does not verify against the key.
+ *   unsigned     — no signature recorded.
+ *   unverifiable — no verification material available (e.g. no committed key).
+ *   untrusted-key— verifies only against a key that is NOT the trust root
+ *                  (PR contexts: a replacement key from the same PR).
+ */
+export type SignatureState =
+  | "valid"
+  | "invalid"
+  | "unsigned"
+  | "unverifiable"
+  | "untrusted-key";
 
 export interface DriftStatus {
   initialized: boolean;
@@ -155,6 +200,18 @@ export interface DriftStatus {
   gitHead?: string | null;
   gitDirty?: boolean;
   lastIntent?: { id: string; timestamp: number; summary: string } | null;
+  /** Signer state: ready | read-only | missing | mismatch. */
+  signerState?: SignerState;
+  /** sha256 fingerprint (16 hex) of the trust-root public key, or null. */
+  publicKeyFingerprint?: string | null;
+  /** Whether a private signing key is present in this checkout. */
+  privateKeyAvailable?: boolean;
+  /** Whether new signed intents can be created here. */
+  signingAllowed?: boolean;
+  /** Whether committed public provenance exists (.drift/public/). */
+  publicProvenance?: boolean;
+  /** Whether verification material (committed public key) is available. */
+  verificationMaterial?: boolean;
 }
 
 export class Drift {
@@ -167,8 +224,9 @@ export class Drift {
    */
   private store: IntentStore | null;
   private publicStore: PublicStore;
-  private privateKeyPem: string;
-  private publicKeyPem: string;
+  private privateKeyPem = "";
+  private publicKeyPem = "";
+  private signerState: SignerState = "missing";
   private redactionPatterns: RegExp[];
   private readonly publicOnly: boolean;
 
@@ -188,6 +246,7 @@ export class Drift {
       this.store = null;
       this.privateKeyPem = "";
       this.publicKeyPem = this.publicStore.publicKey() ?? "";
+      this.signerState = this.publicKeyPem ? "read-only" : "missing";
     } else {
       try {
         this.store = IntentStore.open(dbPath);
@@ -199,10 +258,51 @@ export class Drift {
           EXIT.CORRUPT,
         );
       }
-      const keys = this.loadKeys();
-      this.privateKeyPem = keys.privateKeyPem;
-      this.publicKeyPem = keys.publicKeyPem;
+      this.deriveKeyState();
     }
+  }
+
+  /**
+   * Resolve the signer state from the private key (if present) and the
+   * committed public trust root. Never throws for a missing or mismatched
+   * private key — read commands must keep working; only signing is refused.
+   *
+   * State A: neither key            → missing (init generates a pair).
+   * State B: both, matching         → ready.
+   * State C: public only            → read-only (fresh clone).
+   * State D: private only           → derive public, ready.
+   * State E: both, not matching     → mismatch (signing refused).
+   */
+  private deriveKeyState(): void {
+    const committedPub = this.publicStore.publicKey();
+    const keyPath = join(this.driftDir, "keys", "ed25519.pem");
+    if (!existsSync(keyPath)) {
+      this.privateKeyPem = "";
+      this.publicKeyPem = committedPub ?? "";
+      this.signerState = committedPub ? "read-only" : "missing";
+      return;
+    }
+    const privateKeyPem = readFileSync(keyPath, "utf8");
+    let derived: string;
+    try {
+      derived = publicKeyFromPrivate(privateKeyPem).trim();
+    } catch {
+      throw new DriftError(
+        `The Drift signing key (${keyPath}) is unreadable or corrupt. Restore it or import the repository key with \`drift key import --file <path>\`.`,
+        EXIT.KEY,
+      );
+    }
+    if (committedPub && derived !== committedPub) {
+      // State E: do not sign with a key that is not the trust root, and never
+      // overwrite either key automatically.
+      this.privateKeyPem = "";
+      this.publicKeyPem = committedPub;
+      this.signerState = "mismatch";
+      return;
+    }
+    this.privateKeyPem = privateKeyPem;
+    this.publicKeyPem = derived;
+    this.signerState = "ready";
   }
 
   // ---------------------------------------------------------- encryption
@@ -270,45 +370,129 @@ export class Drift {
     // Idempotent merge: never deletes user lines, only ensures the ADR-009
     // ignore rules are present so `git add .` can never stage private data.
     ensureDriftGitignore(driftDir);
-    const keysDir = join(driftDir, "keys");
-    const keyPath = join(keysDir, "ed25519.pem");
-    let keyPair: { privateKeyPem: string; publicKeyPem: string };
-    if (existsSync(keyPath)) {
+
+    // --- key-state resolution (never replaces an existing trust root) ------
+    // The committed `.drift/public/key.pem` is the repository trust root. It
+    // must be preserved byte-for-byte in a fresh clone (State C) and never
+    // silently replaced. Only genuinely new repositories (State A) generate a
+    // keypair; a private-only checkout (State D) derives the public key; a
+    // mismatch (State E) fails safely.
+    const keyPath = join(driftDir, "keys", "ed25519.pem");
+    const committedPub = new PublicStore(driftDir).publicKey();
+    const privateExists = existsSync(keyPath);
+    let publicKeyPem: string;
+    let signerState: SignerState;
+
+    if (committedPub && privateExists) {
       const privateKeyPem = readFileSync(keyPath, "utf8");
-      keyPair = { privateKeyPem, publicKeyPem: publicKeyFromPrivate(privateKeyPem) };
+      const derived = publicKeyFromPrivate(privateKeyPem).trim();
+      if (derived !== committedPub) {
+        throw new DriftError(
+          "Signing-key mismatch detected: .drift/keys/ed25519.pem does not match the committed trust root (.drift/public/key.pem).\nNothing was overwritten. Import the correct repository key with:\n  drift key import --file /secure/path/repository-private-key.pem",
+          EXIT.KEY,
+        );
+      }
+      publicKeyPem = committedPub;
+      signerState = "ready"; // State B
+    } else if (committedPub && !privateExists) {
+      // State C — fresh clone: preserve the trust root, enter read-only
+      // signer mode. No keypair is generated, the public key is untouched.
+      publicKeyPem = committedPub;
+      signerState = "read-only";
+    } else if (!committedPub && privateExists) {
+      // State D — private key exists but the public key was lost: derive it.
+      const privateKeyPem = readFileSync(keyPath, "utf8");
+      publicKeyPem = publicKeyFromPrivate(privateKeyPem).trim();
+      new PublicStore(driftDir).writePublicKey(publicKeyPem);
+      signerState = "ready";
     } else {
-      keyPair = generateKeyPair();
+      // State A — genuinely new repository: generate one keypair.
+      const keyPair = generateKeyPair();
+      publicKeyPem = keyPair.publicKeyPem.trim();
       writeFileSync(keyPath, keyPair.privateKeyPem, { mode: 0o600 });
+      new PublicStore(driftDir).writePublicKey(publicKeyPem);
+      signerState = "ready";
     }
 
     const drift = new Drift(root, { forceStore: true });
     const store = drift.requireStore("drift init");
     store.setMeta("schema_version", "1");
-    store.setMeta("public_key", keyPair.publicKeyPem.trim());
+    store.setMeta("public_key", publicKeyPem);
+    store.setMeta("signer_state", signerState);
     store.setMeta("created_at", String(Date.now()));
     if (opts.author) store.setMeta("default_author", opts.author);
-    // Commit the public key so fresh clones can verify manifest signatures.
-    drift.publicStore.writePublicKey(keyPair.publicKeyPem.trim());
     drift.close();
     return {
       repoRoot: root,
       driftDir,
-      publicKeyPem: keyPair.publicKeyPem.trim(),
+      publicKeyPem,
+      signerState,
+      publicKeyFingerprint: signingKeyIdFor(publicKeyPem),
     };
   }
 
-  private loadKeys(): { privateKeyPem: string; publicKeyPem: string } {
-    const keyPath = join(this.driftDir, "keys", "ed25519.pem");
-    if (!existsSync(keyPath)) {
+  /**
+   * Import the repository private signing key (ADR-009 key model, State C →
+   * ready). Validates the key, derives its public key, requires it to match
+   * the committed trust root, copies it atomically with restrictive
+   * permissions, and never prints key material or stages it in git.
+   */
+  keyImport(privateKeyFilePath: string): { signerState: SignerState; publicKeyFingerprint: string | null } {
+    const committedPub = this.publicStore.publicKey();
+    if (!committedPub) {
       throw new DriftError(
-        "Drift signing key missing. Run `drift init` to regenerate.",
+        "No committed public trust root (.drift/public/key.pem) in this repository. Run `drift init` in a new repository first — there is nothing for this key to match.",
         EXIT.KEY,
       );
     }
-    const privateKeyPem = readFileSync(keyPath, "utf8");
-    return { privateKeyPem, publicKeyPem: publicKeyFromPrivate(privateKeyPem) };
+    const pem = readFileSync(resolve(privateKeyFilePath), "utf8");
+    let derived: string;
+    try {
+      derived = publicKeyFromPrivate(pem).trim();
+    } catch {
+      throw new DriftError(
+        `The file at ${privateKeyFilePath} is not a readable Ed25519 private key.`, EXIT.KEY,
+      );
+    }
+    if (derived !== committedPub) {
+      throw new DriftError(
+        "The private key does not match the committed trust root (.drift/public/key.pem). Refusing to import — nothing was written.",
+        EXIT.KEY,
+      );
+    }
+    const keysDir = join(this.driftDir, "keys");
+    mkdirSync(keysDir, { recursive: true });
+    const target = join(keysDir, "ed25519.pem");
+    const tmp = `${target}.tmp-${process.pid}`;
+    writeFileSync(tmp, pem, { mode: 0o600 });
+    renameSync(tmp, target);
+    return { signerState: "ready", publicKeyFingerprint: signingKeyIdFor(committedPub) };
   }
 
+  /**
+   * Refuse to create NEW signed provenance unless the local private key
+   * matches the committed trust root (States A/B/D). Read-only clones (C) and
+   * mismatches (E) get an actionable message and exit E_KEY.
+   */
+  private assertSignerReady(command: string): void {
+    if (this.signerState === "ready") return;
+    if (this.signerState === "read-only") {
+      throw new DriftError(
+        `Public provenance exists, but the matching private signing key is unavailable (\`${command}\` needs it).\n\nRead operations remain available.\nImport the repository signing key before creating new signed intents:\n  drift key import --file /secure/path/repository-private-key.pem`,
+        EXIT.KEY,
+      );
+    }
+    if (this.signerState === "mismatch") {
+      throw new DriftError(
+        "Signing-key mismatch detected: .drift/keys/ed25519.pem does not match the committed trust root (.drift/public/key.pem).\nImport the correct key with `drift key import --file <path>` — nothing was overwritten.",
+        EXIT.KEY,
+      );
+    }
+    throw new DriftError(
+      `No Drift signing key in this checkout — run \`drift init\` first.`,
+      EXIT.KEY,
+    );
+  }
   close(): void {
     this.store?.close();
   }
@@ -355,6 +539,7 @@ export class Drift {
       // local-only parts reported separately.
       const publicIntents = drift.publicStore.list().length;
       const localIntents = drift.store ? drift.store.allRows().length : 0;
+      const publicProvenance = drift.publicStore.exists();
       return {
         initialized: true,
         repoRoot: root,
@@ -370,6 +555,12 @@ export class Drift {
         lastIntent: last
           ? { id: last.id, timestamp: last.timestamp, summary: last.summary ?? "" }
           : null,
+        signerState: drift.signerState,
+        publicKeyFingerprint: drift.publicKeyPem ? signingKeyIdFor(drift.publicKeyPem) : null,
+        privateKeyAvailable: drift.privateKeyPem !== "",
+        signingAllowed: drift.signerState === "ready",
+        publicProvenance,
+        verificationMaterial: drift.publicStore.publicKey() !== null,
       };
     } finally {
       drift.close();
@@ -379,6 +570,9 @@ export class Drift {
   // ---------------------------------------------------------------- realize
   realize(opts: RealizeOptions): RealizeResult {
     const store = this.requireStore("drift realize");
+    // A fresh clone or a mismatched local key must not create NEW signed
+    // provenance with the wrong/absent key (ADR-009 key model, States C/E).
+    this.assertSignerReady("drift realize");
     const prompt = (opts.prompt ?? "").trim();
     if (!prompt) {
       throw new DriftError("realize requires a prompt: drift realize -p \"what did you change and why\"");
@@ -535,7 +729,58 @@ export class Drift {
     writeFileSync(tmpPath, objectData);
     renameSync(tmpPath, absObjectPath);
 
-    const gitSha = commit(this.repoRoot, commitMessage);
+    // --- ADR-009 atomic transaction ---------------------------------------
+    // Order is critical (docs/architecture.md "Realize transaction"):
+    //   1. build the V2 public manifest (NEVER contains the containing commit
+    //      SHA — that would be a self-referential cycle);
+    //   2. write + sign it on disk;
+    //   3. explicitly stage ONLY the approved public paths;
+    //   4. create ONE git commit containing source + public provenance;
+    //   5. record the resulting SHA only in the local private database.
+    // The commit's `Drift-Intent:` trailer is the canonical intent→commit
+    // association for every consumer (log/blame/status/export/Action/App).
+    const publicView: UnsignedPublicIntentView = {
+      schemaVersion: 2,
+      id,
+      summary: publicSummary,
+      model: opts.model,
+      agent: { type: author.type, identifier: author.identifier },
+      verification: opts.verifyCmd,
+      files: deltas
+        .slice(0, PUBLIC_FILES_MAX)
+        .map((d) => ({ path: d.filePath, mutationType: d.type, summary: d.summary || undefined })),
+      timestamp,
+      signingKeyId: signingKeyIdFor(this.publicKeyPem),
+    };
+    // Write + sign the manifest BEFORE the git commit so the same commit that
+    // carries the source change also carries its provenance (no second manual
+    // `git add . && git commit` needed). The signature covers the V2 payload
+    // which has no commit SHA, so the manifest is stable once committed.
+    const manifestPath = this.publicStore.manifestPath(id);
+    this.publicStore.write(publicView, this.privateKeyPem);
+
+    // Stage ONLY the approved public paths — never .drift/private, objects,
+    // keys or drift.db. Staging uses explicit argument arrays, never shell
+    // interpolation.
+    const stagedPublic = this.stagePublicFiles(id);
+
+    let gitSha: string;
+    try {
+      gitSha = commit(this.repoRoot, commitMessage);
+    } catch (err) {
+      // Commit failed: unstage + remove ONLY the manifest this operation just
+      // generated (and only if we staged it). The user's source changes stay
+      // staged; the private object record is preserved for a safe retry.
+      execGit(this.repoRoot, ["reset", "-q", "--", relPath(this.repoRoot, manifestPath).replace(/\\/g, "/")], true);
+      try {
+        rmSync(manifestPath, { force: true });
+      } catch {
+        /* best-effort */
+      }
+      throw new DriftError(
+        `git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your source changes are still staged; run \`drift realize\` again after fixing the problem.`,
+      );
+    }
 
     const intent: IntentRecord = {
       ...intentBase,
@@ -549,31 +794,34 @@ export class Drift {
       // Commit landed but intent recording failed — surface it so the user can
       // run `drift doctor` (trailer-backref check) instead of a bare error.
       throw new DriftError(
-        `git commit landed (${gitSha}) but intent recording failed: ${err instanceof Error ? err.message : String(err)}. Run \`drift doctor\` to reconcile.`,
+        `git commit landed (${gitSha}) but intent recording failed: ${err instanceof Error ? err.message : String(err)}. Public provenance was committed; run \`drift doctor\` to reindex the local store.`,
       );
     }
     store.setHead(id);
 
-    // ADR-009: persist the public (safe, signed) provenance view so fresh
-    // clones and the GitHub Action/App can show intent metadata without any
-    // private data. In `none` mode the summary stays empty — nothing derived
-    // from the prompt may persist anywhere.
-    const publicView: UnsignedPublicIntentView = {
-      schemaVersion: 1,
-      id,
-      summary: publicSummary,
-      model: opts.model,
-      agent: { type: author.type, identifier: author.identifier },
-      verification: opts.verifyCmd,
-      files: deltas
-        .slice(0, PUBLIC_FILES_MAX)
-        .map((d) => ({ path: d.filePath, mutationType: d.type, summary: d.summary || undefined })),
-      commit: gitSha,
-      timestamp,
-    };
-    this.publicStore.write(publicView, this.privateKeyPem);
-
+    void stagedPublic; // staged paths are intentionally not returned
     return { gitSha, intentId: id, astDelta: deltas, redactions: redactionResult.count };
+  }
+
+  /**
+   * Stage ONLY approved public Drift paths for the realize commit: the
+   * ADR-009 gitignore (so `git add .` can never stage private data), the
+   * public key (first introduction), and the new manifest. Config is staged
+   * only when already tracked (respects a user who deliberately untracked it).
+   * Returns the repo-relative paths that were staged.
+   */
+  private stagePublicFiles(intentId: string): string[] {
+    const candidates = [
+      join(this.driftDir, ".gitignore"),
+      this.publicStore.keyPath,
+      this.publicStore.manifestPath(intentId),
+      join(this.driftDir, "config.toml"),
+    ];
+    const toStage = candidates
+      .filter((p) => existsSync(p))
+      .map((p) => relPath(this.repoRoot, p).replace(/\\/g, "/"));
+    if (toStage.length > 0) execGit(this.repoRoot, ["add", "--", ...toStage]);
+    return toStage;
   }
 
   // -------------------------------------------------------------------- log
@@ -597,10 +845,62 @@ export class Drift {
    * store only enriches those entries with the local prompt; store-only
    * (legacy pre-ADR-009) intents are kept so old repos keep working.
    */
+  /**
+   * Canonical intent → commit association, derived ONLY from `Drift-Intent:`
+   * git trailers (never from an unverified manifest field). `byId` maps each
+   * intent id to the FIRST commit that references it (newest-first log order,
+   * i.e. the introducing commit). `byCommit` maps each commit to all ids its
+   * message references. Used by log, context, blame, status, export and the
+   * fresh-clone paths so every consumer shares one resolver.
+   */
+  private intentCommitIndex(): { byId: Map<string, string>; byCommit: Map<string, string[]> } {
+    const byId = new Map<string, string>();
+    const byCommit = new Map<string, string[]>();
+    for (const { sha, body } of gitLogMessages(this.repoRoot)) {
+      const ids = extractDriftIntentIds(body);
+      if (ids.length === 0) continue;
+      byCommit.set(sha, ids);
+      for (const id of ids) {
+        if (!byId.has(id)) byId.set(id, sha);
+      }
+    }
+    return { byId, byCommit };
+  }
+
+  /**
+   * Public manifests referenced by a commit's `Drift-Intent:` trailers. Falls
+   * back to the V1 embedded `commit` field only when no trailer-derived match
+   * exists (legacy manifests written before trailers became canonical).
+   */
+  private findManifestsForCommit(sha: string): PublicIntentView[] {
+    const res = execGit(this.repoRoot, ["log", "-1", "--format=%B", sha], true);
+    if (res.status === 0) {
+      const ids = extractDriftIntentIds(res.stdout);
+      if (ids.length > 0) {
+        return ids
+          .map((id) => this.publicStore.getById(id))
+          .filter((v): v is PublicIntentView => v !== null);
+      }
+    }
+    return this.publicStore.list().filter((v) => v.schemaVersion === 1 && v.commit === sha);
+  }
+
+  /**
+   * Canonical provenance is the committed public manifest (ADR-009) — that is
+   * what survives a fresh clone and what the Action/App consume. The private
+   * store only enriches those entries with the local prompt; store-only
+   * (legacy pre-ADR-009) intents are kept so old repos keep working.
+   */
   private mergeIntents(): LogEntry[] {
     const byId = new Map<string, LogEntry>();
+    const { byId: commitById } = this.intentCommitIndex();
     for (const view of this.publicStore.list()) {
-      if (!byId.has(view.id)) byId.set(view.id, publicViewToLogEntry(view));
+      if (byId.has(view.id)) continue;
+      const gitSha =
+        commitById.get(view.id) ??
+        (view.schemaVersion === 1 ? view.commit : null) ??
+        "";
+      byId.set(view.id, publicViewToLogEntry(view, gitSha));
     }
     if (this.store) {
       for (const e of this.store.listIntents({})) {
@@ -661,6 +961,12 @@ export class Drift {
       throw new DriftError(`Line ${line} is out of range (1..${totalLines})`);
     }
 
+    // One shared trailer-derived resolver (ADR-009 V2): intent commits are
+    // found by their `Drift-Intent:` trailer, not by any embedded manifest
+    // field. Built once per blame call.
+    const { byCommit: commitIndex } = this.intentCommitIndex();
+    const isIntentCommit = (s: string): boolean =>
+      this.store?.findByGitSha(s) !== null || commitIndex.has(s) || this.publicStore.findByCommit(s) !== null;
     let sha: string;
     if (functionName) {
       // Attribute the intent whose commit touched ANY line of the function
@@ -680,7 +986,7 @@ export class Drift {
           fallback = s;
           fallbackLine = ln;
         }
-        if (this.store?.findByGitSha(s) || this.publicStore.findByCommit(s)) {
+        if (isIntentCommit(s)) {
           chosen = s;
           line = ln;
           break;
@@ -708,11 +1014,12 @@ export class Drift {
       // verifies against the COMMITTED public key, so a fresh clone or a
       // regenerated local key can never make a real signature look valid
       // (or invalid) by accident. The private store is only a legacy fallback
-      // for pre-ADR-009 intents that have no manifest yet.
-      const view = this.publicStore.findByCommit(sha);
+      // for pre-ADR-009 intents that have no manifest yet. The commit→intent
+      // association comes from git trailers via the shared resolver.
+      const view = this.findManifestsForCommit(sha)[0] ?? null;
       const localRecord = this.store?.findByGitSha(sha) ?? null;
       if (view) {
-        record = publicViewToIntentRecord(view);
+        record = publicViewToIntentRecord(view, sha);
         signatureValid = this.publicStore.verifySignature(view);
         // Enrich with the LOCAL private prompt/state when present (surfaced
         // only through the CLI's explicit --include-private-prompt flag).
@@ -779,32 +1086,78 @@ export class Drift {
   }
 
   // ---------------------------------------------------------------- verify
-  verify(intentId: string): VerifyResult {
-    // Committed public manifest is canonical (ADR-009); the private store is
-    // only a legacy fallback, so a fresh clone can still run `drift verify`.
+  /**
+   * Verification is INFORMATION by default: `drift verify <id>` validates the
+   * manifest schema, reports the signature/trust state and shows the recorded
+   * command WITHOUT executing it. A repository-provided verification string is
+   * code — it may only run with an explicit `--run`, and only when the
+   * manifest is validly signed by the trusted repository key (or when the
+   * user explicitly forces execution with --allow-untrusted-command).
+   */
+  verify(
+    intentId: string,
+    opts: { run?: boolean; allowUntrustedCommand?: boolean; timeoutMs?: number } = {},
+  ): VerifyResult {
     const view = this.publicStore.getById(intentId);
     const record = view ? null : (this.store ? this.store.getById(intentId) : null);
     if (!record && !view) throw new DriftError(`Intent not found: ${intentId}`);
     const verifyCmd = record?.verifyCmd ?? view?.verification ?? null;
+    const sig = this.signatureState(intentId, view, record);
+    const base = {
+      intentId,
+      verifyCmd,
+      signature: sig.state,
+      exitCode: null as number | null,
+      stdout: "",
+      stderr: "",
+    };
     if (!verifyCmd) {
-      return { intentId, verifyCmd: null, status: "no-command", exitCode: null, stdout: "", stderr: "" };
+      return {
+        ...base,
+        status: "no-command" as const,
+        message: "no verification command recorded",
+      };
     }
-    // NOTE: verifyCmd executes with the user's shell. Only run `drift verify`
-    // on intents you trust (local or from a trusted upstream).
+    if (!opts.run) {
+      return {
+        ...base,
+        status: "not-executed" as const,
+        message: `verification command recorded but NOT executed (signature: ${sig.state}). Re-run with \`drift verify ${intentId} --run\` to execute it.`,
+      };
+    }
+    const trusted = sig.state === "valid";
+    if (!trusted && !opts.allowUntrustedCommand) {
+      return {
+        ...base,
+        status: "refused" as const,
+        message: `refusing to execute the verification command: signature is ${sig.state} (${sig.detail}). Re-run with \`drift verify ${intentId} --run --allow-untrusted-command\` to force execution of repository-provided code.`,
+      };
+    }
+    // Executes with the user's shell ONLY after explicit authorization. The
+    // timeout bounds runaway commands; output is captured, never logged as
+    // secrets; no env is inherited from the invoking shell beyond the process
+    // environment (no implicit GitHub/npm tokens are injected).
     const res = spawnSync(verifyCmd, {
       cwd: this.repoRoot,
       shell: true,
       encoding: "utf8",
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,
+      timeout: opts.timeoutMs ?? VERIFY_TIMEOUT_MS,
     });
+    const errno = res.error as NodeJS.ErrnoException | undefined;
+    const timedOut = errno?.code === "ETIMEDOUT" || res.signal === "SIGTERM";
     return {
-      intentId,
-      verifyCmd,
-      status: res.status === 0 ? "pass" : "fail",
+      ...base,
+      status: timedOut ? "timeout" : res.status === 0 ? "pass" : "fail",
       exitCode: res.status,
       stdout: (res.stdout ?? "").toString(),
       stderr: (res.stderr ?? "").toString(),
+      message: timedOut
+        ? `verification command timed out after ${(opts.timeoutMs ?? VERIFY_TIMEOUT_MS) / 1000}s`
+        : res.status === 0
+          ? "verification passed"
+          : `verification failed (exit ${res.status})`,
     };
   }
 
@@ -1022,8 +1375,22 @@ export class Drift {
   }
 
   // ---------------------------------------------------------------- export
-  exportJson(): string {
-    if (this.store) {
+  /**
+   * Default export is PUBLIC-ONLY (ADR-009): committed manifests + trailer-
+   * derived commit association, never a prompt. Private prompts are exported
+   * only with `{ includePrivatePrompt: true }` (CLI: --include-private-prompt),
+   * which marks the output `containsPrivatePrompts: true` and requires the
+   * local store.
+   */
+  exportJson(opts: { includePrivatePrompt?: boolean } = {}): string {
+    const exportedAt = new Date().toISOString();
+    if (opts.includePrivatePrompt) {
+      if (!this.store) {
+        throw new DriftError(
+          "Private prompt export requires the local Drift store (run `drift init` first).",
+          EXIT.KEY,
+        );
+      }
       const entries = this.store
         .listIntents({})
         .map((e) => ({
@@ -1036,12 +1403,16 @@ export class Drift {
           timestamp: new Date(e.timestamp).toISOString(),
           files: e.files,
         }));
-      return JSON.stringify({ schemaVersion: 1, exportedAt: new Date().toISOString(), intents: entries }, null, 2);
+      return JSON.stringify(
+        { schemaVersion: 2, containsPrivatePrompts: true, exportedAt, intents: entries },
+        null,
+        2,
+      );
     }
-    // Public-only clone: export the public views (no prompts).
+    const { byId: commitById } = this.intentCommitIndex();
     const entries = this.publicStore.list().map((v) => ({
       id: v.id,
-      gitSha: v.commit,
+      gitSha: commitById.get(v.id) ?? (v.schemaVersion === 1 ? v.commit : null) ?? null,
       authorType: v.agent?.type ?? "HUMAN",
       authorId: v.agent?.identifier ?? "unknown",
       model: v.model ?? null,
@@ -1049,27 +1420,46 @@ export class Drift {
       timestamp: new Date(v.timestamp).toISOString(),
       files: (v.files ?? []).map((f) => ({ path: f.path, mutationType: f.mutationType, summary: f.summary ?? null })),
     }));
-    return JSON.stringify({ schemaVersion: 1, exportedAt: new Date().toISOString(), intents: entries }, null, 2);
+    return JSON.stringify(
+      { schemaVersion: 2, containsPrivatePrompts: false, exportedAt, intents: entries },
+      null,
+      2,
+    );
   }
 
-  verifyIntentSignature(intentId: string): { ok: boolean; detail: string } {
-    // Canonical provenance is the committed public manifest, verified against
-    // the COMMITTED public key — a newly generated local key (e.g. after
-    // `drift init` in a clone) must never be used to judge an old record.
+  verifyIntentSignature(intentId: string): { ok: boolean; detail: string; state: SignatureState } {
     const view = this.publicStore.getById(intentId);
+    const record = view ? null : (this.store ? this.store.getById(intentId) : null);
+    const sig = this.signatureState(intentId, view, record);
+    return { ok: sig.state === "valid", detail: sig.detail, state: sig.state };
+  }
+
+  /**
+   * Shared signature/trust-state resolver used by verify, verify-intent and
+   * blame. The committed public manifest is verified against the COMMITTED
+   * public key — a newly generated local key (e.g. after `drift init` in a
+   * clone) is never used to judge an old record, so the states distinguish
+   * valid / invalid / unsigned / unverifiable / untrusted-key honestly.
+   */
+  private signatureState(
+    intentId: string,
+    view: PublicIntentView | null,
+    record: IntentRecord | null,
+  ): { state: SignatureState; detail: string } {
     if (view) {
       const pub = this.publicStore.publicKey();
-      if (!pub) return { ok: false, detail: "unverifiable: no committed public key" };
+      if (!pub) return { state: "unverifiable", detail: "no committed public key in this checkout" };
+      if (!view.signature) return { state: "unsigned", detail: "manifest has no signature" };
       const valid = this.publicStore.verifySignature(view);
-      return { ok: valid, detail: valid ? "valid" : "invalid" };
+      return valid
+        ? { state: "valid", detail: "signature verifies against the committed public key" }
+        : { state: "invalid", detail: "signature does not verify against the committed public key" };
     }
-    // Legacy pre-ADR-009 intent: verify the private object against the public
-    // key recorded in the local store (the key that originally signed it).
-    if (this.store) {
-      const intent = this.store.getById(intentId);
-      if (!intent) return { ok: false, detail: "not found" };
-      const obj = this.store.readObjectRecord(intent.objectPath);
-      if (!obj?.signature) return { ok: false, detail: "object or signature missing" };
+    if (record && this.store) {
+      const obj = this.store.readObjectRecord(record.objectPath);
+      if (!obj?.signature) {
+        return { state: "unsigned", detail: "legacy record has no signature" };
+      }
       const canonical = canonicalJson({
         id: obj.id,
         parentId: obj.parentId,
@@ -1082,9 +1472,12 @@ export class Drift {
       });
       const recordedPub = this.store.getMeta("public_key") ?? this.publicKeyPem;
       const valid = verifyPayload(canonical, recordedPub, obj.signature as string);
-      return { ok: valid, detail: valid ? "valid" : "invalid" };
+      return valid
+        ? { state: "valid", detail: "legacy signature verifies against the recorded repository key" }
+        : { state: "invalid", detail: "legacy signature does not verify" };
     }
-    return { ok: false, detail: "not found" };
+    void intentId;
+    return { state: "unverifiable", detail: "no public manifest or local record" };
   }
 }
 
@@ -1157,10 +1550,10 @@ export function ensureDriftGitignore(driftDir: string): void {
 }
 
 /** Map a public manifest to the shared LogEntry shape (no prompt). */
-function publicViewToLogEntry(v: PublicIntentView): LogEntry {
+function publicViewToLogEntry(v: PublicIntentView, gitSha: string): LogEntry {
   return {
     id: v.id,
-    gitSha: v.commit,
+    gitSha,
     authorType: v.agent?.type ?? "HUMAN",
     authorId: v.agent?.identifier ?? "unknown",
     model: v.model ?? null,
@@ -1176,11 +1569,11 @@ function publicViewToLogEntry(v: PublicIntentView): LogEntry {
 }
 
 /** Map a public manifest to an IntentRecord-shaped object (private fields empty). */
-function publicViewToIntentRecord(v: PublicIntentView): IntentRecord {
+function publicViewToIntentRecord(v: PublicIntentView, gitSha: string): IntentRecord {
   return {
     id: v.id,
     parentId: null,
-    gitCommitSha: v.commit,
+    gitCommitSha: gitSha,
     author: {
       type: v.agent?.type ?? "HUMAN",
       identifier: v.agent?.identifier ?? "unknown",

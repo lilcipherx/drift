@@ -7,6 +7,8 @@ export type {
   RealizeOptions,
   RealizeResult,
   ReplayResult,
+  SignatureState,
+  SignerState,
   VerifyResult,
 } from "./engine.js";
 export {
@@ -14,12 +16,16 @@ export {
   buildPublicSummary,
   genericPublicSummary,
   sanitizePublicText,
+  signingKeyIdFor,
   PUBLIC_FILES_MAX,
   PUBLIC_SUMMARY_MAX,
 } from "./public.js";
 export type {
   PublicAgent,
   PublicIntentFile,
+  PublicIntentManifestBase,
+  PublicIntentManifestV1,
+  PublicIntentManifestV2,
   PublicIntentView,
   UnsignedPublicIntentView,
 } from "./public.js";

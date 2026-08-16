@@ -9,7 +9,18 @@
  * Raw prompts, the SQLite database, the content-addressed objects and the
  * signing key live in private (gitignored) locations. This module never sees
  * them: everything here is safe to commit and safe to render publicly.
+ *
+ * Manifest schemas:
+ *   V1 (schemaVersion 1) — legacy. Contains an embedded `commit` SHA that was
+ *     part of its signed payload. Read and verified as-is; the `commit` field
+ *     is treated as untrusted legacy metadata by consumers.
+ *   V2 (schemaVersion 2) — current. Deliberately does NOT embed the containing
+ *     Git commit SHA (that would be a self-referential cycle: adding the SHA
+ *     changes the tree, which changes the SHA). The intent → commit
+ *     association is derived from `Drift-Intent:` git trailers. Adds
+ *     `signingKeyId` (fingerprint of the signing public key).
  */
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { canonicalJson, signPayload, verifyPayload } from "./crypto.js";
@@ -50,7 +61,8 @@ export function buildPublicSummary(text) {
 /**
  * Generic fallback summary derived ONLY from non-prompt metadata (intent id,
  * affected file count) — never from prompt text, so it is always safe to
- * commit, clone, and render. Used when the user supplies no explicit summary.
+ * commit, clone, and render. Used when the user supplies no explicit summary
+ * or when a public manifest is missing.
  */
 export function genericPublicSummary(id, opts = {}) {
     const base = `Drift intent ${id}`;
@@ -63,11 +75,16 @@ function isPublicIntentView(value) {
     if (typeof value !== "object" || value === null)
         return false;
     const v = value;
-    return (v.schemaVersion === 1 &&
-        typeof v.id === "string" &&
-        typeof v.summary === "string" &&
-        typeof v.commit === "string" &&
-        typeof v.signature === "string");
+    // A missing/empty `signature` is NOT disqualifying: an unsigned manifest is
+    // still provenance (reported as state "unsigned"), it must never silently
+    // fall back to the private legacy record.
+    if (v.schemaVersion === 1) {
+        return typeof v.id === "string" && typeof v.summary === "string" && typeof v.commit === "string";
+    }
+    if (v.schemaVersion === 2) {
+        return typeof v.id === "string" && typeof v.summary === "string" && typeof v.signingKeyId === "string";
+    }
+    return false;
 }
 /**
  * Read/write access to `.drift/public/`. Reading never requires the private
@@ -91,12 +108,17 @@ export class PublicStore {
     exists() {
         return existsSync(this.keyPath) || this.list().length > 0;
     }
-    /** The committed Ed25519 public key, or null when absent. */
+    /**
+     * The committed Ed25519 public key, or null when absent. Line endings are
+     * normalized to LF: on Windows `core.autocrlf` gives tracked PEM files CRLF
+     * in the working tree, which would otherwise break string comparisons
+     * between the derived public key and the committed trust root.
+     */
     publicKey() {
         if (!existsSync(this.keyPath))
             return null;
         try {
-            const pem = readFileSync(this.keyPath, "utf8").trim();
+            const pem = readFileSync(this.keyPath, "utf8").replace(/\r\n/g, "\n").trim();
             return pem || null;
         }
         catch {
@@ -106,9 +128,9 @@ export class PublicStore {
     /** Write the public key file (idempotent). */
     writePublicKey(pem) {
         mkdirSync(dirname(this.keyPath), { recursive: true });
-        writeFileSync(this.keyPath, `${pem.trim()}\n`, { mode: 0o644 });
+        writeFileSync(this.keyPath, `${pem.replace(/\r\n/g, "\n").trim()}\n`, { mode: 0o644 });
     }
-    /** Sign a public view with the repo key and persist it. */
+    /** Sign a public view with the repo key and persist it (V2 schema). */
     write(view, privateKeyPem) {
         const signature = signPayload(canonicalJson(view), privateKeyPem);
         const signed = { ...view, signature };
@@ -128,7 +150,7 @@ export class PublicStore {
             return null;
         }
     }
-    /** Every manifest, newest first (commit timestamp desc). */
+    /** Every manifest, newest first (timestamp desc). */
     list() {
         const dir = join(this.driftDir, PUBLIC_INTENTS_DIR);
         if (!existsSync(dir))
@@ -143,10 +165,17 @@ export class PublicStore {
         }
         return views.sort((a, b) => b.timestamp - a.timestamp);
     }
+    /**
+     * Legacy V1-only association: find a V1 manifest whose embedded `commit`
+     * field matches. V2 manifests never embed a commit SHA — their association
+     * is resolved from `Drift-Intent:` git trailers (engine `intentCommitIndex`),
+     * never from this field, so an attacker cannot fabricate an association by
+     * editing a manifest.
+     */
     findByCommit(commitSha) {
         if (!/^[0-9a-f]{40}$/.test(commitSha))
             return null;
-        return this.list().find((v) => v.commit === commitSha) ?? null;
+        return this.list().find((v) => v.schemaVersion === 1 && v.commit === commitSha) ?? null;
     }
     /** Verify the manifest signature against the committed public key. */
     verifySignature(view) {
@@ -156,5 +185,13 @@ export class PublicStore {
         const { signature, ...unsigned } = view;
         return verifyPayload(canonicalJson(unsigned), pub, signature);
     }
+}
+/**
+ * Short fingerprint of an Ed25519 public key (first 16 hex chars of its
+ * SHA-256). Used as `signingKeyId` in V2 manifests and by `drift status` /
+ * key-state output — never the private key material.
+ */
+export function signingKeyIdFor(publicKeyPem) {
+    return createHash("sha256").update(publicKeyPem.trim(), "utf8").digest("hex").slice(0, 16);
 }
 //# sourceMappingURL=public.js.map
