@@ -3,8 +3,9 @@
  * history, never touches `.git` internals. Trailers are the only footprint.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, rmSync, mkdtempSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { DriftError } from "./errors.js";
 export function execGit(repoRoot, args, allowFailure = false) {
     const res = spawnSync("git", args, {
@@ -59,8 +60,77 @@ export function stageAll(repoRoot, files) {
     }
     execGit(repoRoot, ["add", "-A", "--", ".", ":(exclude).drift"]);
 }
-export function unstage(repoRoot) {
-    execGit(repoRoot, ["reset"], true);
+// ---------------------------------------------------------------------------
+// Index snapshot / restore — Drift must never destroy the user's staged state
+// ---------------------------------------------------------------------------
+/**
+ * Absolute path of the git index file for a repository (`git rev-parse
+ * --git-path index`). Falls back to plain `--git-path` on older git that
+ * lacks `--path-format=absolute`.
+ */
+export function gitIndexPath(repoRoot) {
+    const abs = execGit(repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"], true);
+    if (abs.status === 0 && abs.stdout.trim())
+        return abs.stdout.trim();
+    const plain = execGit(repoRoot, ["rev-parse", "--git-path", "index"], true);
+    if (plain.status !== 0 || !plain.stdout.trim())
+        return null;
+    const p = plain.stdout.trim();
+    return resolve(repoRoot, p);
+}
+function indexLockExists(repoRoot) {
+    const indexPath = gitIndexPath(repoRoot);
+    if (!indexPath)
+        return null;
+    const lockPath = `${indexPath}.lock`;
+    return existsSync(lockPath) ? lockPath : null;
+}
+export function captureIndexSnapshot(repoRoot) {
+    const indexPath = gitIndexPath(repoRoot);
+    if (!indexPath) {
+        throw new DriftError("cannot determine the git index path — is this a git repository?");
+    }
+    const lock = indexLockExists(repoRoot);
+    if (lock) {
+        throw new DriftError(`git index.lock exists (${lock}) — another git process may be running. Wait for it to finish, then run drift realize again.`);
+    }
+    if (!existsSync(indexPath))
+        return { backupPath: null };
+    const dir = mkdtempSync(join(tmpdir(), "drift-idx-"));
+    const backupPath = join(dir, "index");
+    copyFileSync(indexPath, backupPath);
+    return { backupPath };
+}
+/**
+ * Restore the index captured by `captureIndexSnapshot`. Safe to call once.
+ * Never overwrites another git process's lock; never touches the worktree.
+ */
+export function restoreIndexSnapshot(repoRoot, snap) {
+    const indexPath = gitIndexPath(repoRoot);
+    if (!indexPath)
+        return; // repo vanished mid-operation — nothing we can do
+    const lock = indexLockExists(repoRoot);
+    if (lock) {
+        throw new DriftError(`git index.lock exists (${lock}) — cannot restore the index while another git process is running. Drift's staging was NOT rolled back.`);
+    }
+    if (!snap.backupPath) {
+        // No index existed before Drift — remove the one Drift's git commands
+        // created so the repository is byte-identical to the pre-Drift state.
+        if (existsSync(indexPath))
+            rmSync(indexPath, { force: true });
+        return;
+    }
+    // Atomic replace in the same directory (fs.rename replaces atomically on
+    // POSIX and Windows). Never a plain overwrite of a live index.
+    const tmp = `${indexPath}.drift-restore-${process.pid}`;
+    copyFileSync(snap.backupPath, tmp);
+    renameSync(tmp, indexPath);
+    try {
+        rmSync(dirname(snap.backupPath), { recursive: true, force: true });
+    }
+    catch {
+        /* best-effort cleanup */
+    }
 }
 /** `git diff --cached --name-status -z` — robust against spaces/newlines in paths. */
 export function stagedNameStatus(repoRoot) {

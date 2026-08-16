@@ -202,11 +202,14 @@ server.registerTool("drift_verify", {
     inputSchema: {
         intentId: z.string(),
         run: z.boolean().optional().describe("Execute the recorded verification command (requires a validly signed manifest). Default false: informational only."),
+        inheritEnv: z.boolean().optional().describe("DANGEROUS: pass the full process environment (including credentials) to the executed command. Requires run:true. Default false: a sanitized non-secret environment."),
     },
 }, async (args) => {
     const cliArgs = ["verify", String(args.intentId)];
     if (args.run)
         cliArgs.push("--run");
+    if (args.inheritEnv)
+        cliArgs.push("--inherit-env");
     const out = runCli(cliArgs);
     if (!out.ok)
         return text({ status: "error", details: out.error?.message });

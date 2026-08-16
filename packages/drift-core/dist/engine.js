@@ -10,13 +10,88 @@ import { computeDelta, detectLanguage, isBinary, parseSymbols, ParseError, textD
 import { canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";
 import { CONFIG_TEMPLATE, loadConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
-import { blameLine, blameLines, checkout, commit, commitExists, currentHead, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, stageAll, stagedNameStatus, unstage, } from "./git.js";
+import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitExists, currentHead, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, restoreIndexSnapshot, stageAll, stagedNameStatus, } from "./git.js";
 import { IntentStore } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
 import { buildPublicSummary, genericPublicSummary, PUBLIC_FILES_MAX, PublicStore, signingKeyIdFor, } from "./public.js";
 import { extractDriftIntentIds } from "./trailers.js";
 /** Default timeout for a `drift verify --run` verification command (ms). */
 const VERIFY_TIMEOUT_MS = 120_000;
+/**
+ * Environment allowlist for `drift verify --run`. Repository-provided
+ * verification commands are UNTRUSTED code: by default the child process gets
+ * only the non-secret variables needed for ordinary PATH-based tooling on
+ * Linux/macOS/Windows (git, npm, node, shell). Secret-bearing variables
+ * (GITHUB_TOKEN, GH_TOKEN, NPM_TOKEN, NODE_AUTH_TOKEN, DRIFT_MASTER_KEY,
+ * AWS_*, AZURE_*, GOOGLE_*, GCP_*, SSH_AUTH_SOCK, DATABASE_URL, anything
+ * named *_TOKEN / *_SECRET / *PRIVATE_KEY*) are deliberately absent. Full
+ * inheritance requires an explicit `--inherit-env` opt-in.
+ */
+export const VERIFY_ENV_ALLOWLIST = [
+    // PATH resolution + home for config lookups
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    // temp dirs (build tools, npm, git)
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Windows runtime essentials
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    // locale — affects encoding of command output
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    // non-secret CI signals
+    "CI",
+    "GITHUB_ACTIONS",
+    // interactive shell basics
+    "SHELL",
+    "TERM",
+    "TERM_PROGRAM",
+    "USER",
+    "LOGNAME",
+    "HOSTNAME",
+    "PWD",
+];
+/** Build the sanitized child environment from a parent env (default: process). */
+export function sanitizedVerifyEnv(parent = process.env) {
+    const out = {};
+    for (const key of VERIFY_ENV_ALLOWLIST) {
+        const value = parent[key];
+        if (value === undefined)
+            continue;
+        // Belt-and-suspenders: even a future allowlist addition can never leak a
+        // variable that looks like a credential.
+        if (SECRET_ENV_PATTERNS.some((re) => re.test(key)))
+            continue;
+        out[key] = value;
+    }
+    return out;
+}
+/** Variables that must NEVER reach an untrusted verification child by default. */
+const SECRET_ENV_PATTERNS = [
+    /^GITHUB_TOKEN$/i,
+    /^GH_TOKEN$/i,
+    /^NPM_TOKEN$/i,
+    /^NODE_AUTH_TOKEN$/i,
+    /^DRIFT_MASTER_KEY$/i,
+    /^AWS_/,
+    /^AZURE_/,
+    /^GOOGLE_/,
+    /^GCP_/,
+    /^SSH_AUTH_SOCK$/i,
+    /^DATABASE_URL$/i,
+    /TOKEN/i,
+    /SECRET/i,
+    /PRIVATE_KEY/i,
+];
 export class Drift {
     repoRoot;
     driftDir;
@@ -308,6 +383,7 @@ export class Drift {
             // store (e.g. right after `drift init` in a fresh clone) must never
             // shadow them, so `intents` is the MERGED count, with the public and
             // local-only parts reported separately.
+            const { errors: manifestErrors } = drift.publicStore.listWithErrors();
             const publicIntents = drift.publicStore.list().length;
             const localIntents = drift.store ? drift.store.allRows().length : 0;
             const publicProvenance = drift.publicStore.exists();
@@ -317,6 +393,7 @@ export class Drift {
                 intents: drift.log({}).length,
                 publicIntents,
                 localIntents,
+                malformedManifests: manifestErrors.length > 0 ? manifestErrors : undefined,
                 head: drift.store?.getHead() ?? null,
                 encryption: drift.config.encryption.enabled,
                 promptMode: drift.config.prompts.mode,
@@ -348,6 +425,17 @@ export class Drift {
         if (!prompt) {
             throw new DriftError("realize requires a prompt: drift realize -p \"what did you change and why\"");
         }
+        // Capture the user's staged state BEFORE Drift stages anything, so a
+        // syntax/analysis failure can restore the index exactly (staged files,
+        // partially staged hunks, intent-to-add entries, renames, deletions,
+        // assume-unchanged/skip-worktree flags). Never a broad `git reset` that
+        // discards the user's selections. Refuse to run against an unmerged index
+        // (a conflict in progress) before any write happens.
+        const unmerged = execGit(this.repoRoot, ["ls-files", "-u"], true);
+        if (unmerged.status === 0 && unmerged.stdout.trim().length > 0) {
+            throw new DriftError("the git index has unmerged (conflict) entries — resolve the merge conflict and run drift realize again");
+        }
+        const indexSnapshot = captureIndexSnapshot(this.repoRoot);
         stageAll(this.repoRoot, opts.files);
         const staged = stagedNameStatus(this.repoRoot);
         if (staged.length === 0) {
@@ -403,168 +491,249 @@ export class Drift {
             }
         }
         if (syntaxErrors.length > 0) {
-            unstage(this.repoRoot);
-            throw new DriftError(`Syntax error — commit aborted, no history was polluted:\n  - ${syntaxErrors
+            // Restore the user's exact pre-Drift index state — never `git reset`
+            // wholesale, which would discard their staged selections.
+            restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+            throw new DriftError(`Syntax error — commit aborted, no history was polluted (your staged changes were preserved):\n  - ${syntaxErrors
                 .map((e) => `${e.file}: ${e.message}`)
                 .join("\n  - ")}\nFix the code and run realize again.`, EXIT.SYNTAX);
         }
-        const redactionResult = redact(prompt, this.redactionPatterns);
-        const safePrompt = redactionResult.text;
-        const safeState = opts.agentState
-            ? redact(opts.agentState, this.redactionPatterns).text
-            : undefined;
-        const headId = store.getHead();
-        const timestamp = Date.now();
-        const id = newIntentId();
-        const authorId = opts.author ?? (gitIdentity(this.repoRoot, "user.name") || "unknown");
-        const author = {
-            type: (opts.authorType ?? (opts.model ? "AGENT" : "HUMAN")),
-            identifier: authorId,
-            model: opts.model,
-        };
-        // v0.2.0 encryption at rest: when enabled, the intent's prompt and agent
-        // state are AES-256-GCM encrypted (AAD-bound to the intent id) before they
-        // are stored. The git commit message keeps the plaintext prompt so history
-        // stays readable; the signature covers the stored (encrypted) canonical
-        // form, so verification never requires the master key.
-        const encKey = this.config.encryption.enabled ? this.masterKeyOrThrow() : null;
-        // Prompt storage modes (PRD §17.x, docs/architecture.md):
-        //   commit-summary (default) — full prompt only in local .drift (gitignored);
-        //                              the git commit message carries a safe summary.
-        //   full                     — full prompt in the commit message too (legacy).
-        //   none                     — prompt text is not persisted anywhere.
-        // The PUBLIC summary is deliberately NOT derived from the prompt (ADR-009):
-        // the first line of a one-line prompt would otherwise be copied verbatim
-        // into git history, manifests and PR comments. It comes from an explicit
-        // `--summary` (redacted first, so secrets can't ride along) or a generic
-        // non-prompt fallback built from the intent id.
-        const mode = this.config.prompts.mode;
-        const explicitSummary = opts.summary
-            ? buildPublicSummary(redact(opts.summary, this.redactionPatterns).text)
-            : "";
-        const publicSummary = explicitSummary || (mode === "none" ? "" : genericPublicSummary(id, { fileCount: deltas.length }));
-        const storePrompt = mode !== "none";
-        const storedPrompt = storePrompt
-            ? encKey
-                ? encryptAesGcm(safePrompt, encKey, id)
-                : safePrompt
-            : "";
-        const storedState = encKey && safeState !== undefined ? encryptAesGcm(safeState, encKey, id) : safeState;
-        const commitMessage = buildCommitMessage({
-            safePrompt,
-            summary: publicSummary,
-            intentId: id,
-            mode,
-            model: opts.model,
-            verifyCmd: opts.verifyCmd,
-        });
-        const intentBase = {
-            id,
-            parentId: headId,
-            author,
-            prompt: storedPrompt,
-            astDelta: deltas,
-            agentState: storedState,
-            verifyCmd: opts.verifyCmd,
-            timestamp,
-        };
-        const canonical = canonicalJson(intentBase);
-        const signature = signPayload(canonical, this.privateKeyPem);
-        const objectSha = sha256Hex(canonical);
-        // Store the path relative to the repo root so committed `.drift` metadata
-        // stays portable across machines (ADR-007).
-        const objectPath = join(".drift", "objects", objectSha.slice(0, 2), `${objectSha.slice(2)}.json`);
-        const absObjectPath = join(this.repoRoot, objectPath);
-        mkdirSync(dirname(absObjectPath), { recursive: true });
-        const objectData = JSON.stringify({ ...intentBase, gitCommitSha: "", signature }, null, 2);
-        const tmpPath = `${absObjectPath}.tmp-${process.pid}`;
-        writeFileSync(tmpPath, objectData);
-        renameSync(tmpPath, absObjectPath);
-        // --- ADR-009 atomic transaction ---------------------------------------
-        // Order is critical (docs/architecture.md "Realize transaction"):
-        //   1. build the V2 public manifest (NEVER contains the containing commit
-        //      SHA — that would be a self-referential cycle);
-        //   2. write + sign it on disk;
-        //   3. explicitly stage ONLY the approved public paths;
-        //   4. create ONE git commit containing source + public provenance;
-        //   5. record the resulting SHA only in the local private database.
-        // The commit's `Drift-Intent:` trailer is the canonical intent→commit
-        // association for every consumer (log/blame/status/export/Action/App).
-        const publicView = {
-            schemaVersion: 2,
-            id,
-            summary: publicSummary,
-            model: opts.model,
-            agent: { type: author.type, identifier: author.identifier },
-            verification: opts.verifyCmd,
-            files: deltas
-                .slice(0, PUBLIC_FILES_MAX)
-                .map((d) => ({ path: d.filePath, mutationType: d.type, summary: d.summary || undefined })),
-            timestamp,
-            signingKeyId: signingKeyIdFor(this.publicKeyPem),
-        };
-        // Write + sign the manifest BEFORE the git commit so the same commit that
-        // carries the source change also carries its provenance (no second manual
-        // `git add . && git commit` needed). The signature covers the V2 payload
-        // which has no commit SHA, so the manifest is stable once committed.
-        const manifestPath = this.publicStore.manifestPath(id);
-        this.publicStore.write(publicView, this.privateKeyPem);
-        // Stage ONLY the approved public paths — never .drift/private, objects,
-        // keys or drift.db. Staging uses explicit argument arrays, never shell
-        // interpolation.
-        const stagedPublic = this.stagePublicFiles(id);
-        let gitSha;
+        // Any failure BEFORE the git commit (redaction, store access, signing,
+        // manifest write, staging public files) must restore the user's index
+        // exactly and remove only the manifest this operation generated — never
+        // the user's source selections. Once the commit lands (phase
+        // "committing"/"recorded") the index restore is NOT performed: the source
+        // changes stay staged for a safe retry and a landed commit is never
+        // rewritten.
+        let manifestPath = null;
+        let phase = "building";
         try {
-            gitSha = commit(this.repoRoot, commitMessage);
-        }
-        catch (err) {
-            // Commit failed: unstage + remove ONLY the manifest this operation just
-            // generated (and only if we staged it). The user's source changes stay
-            // staged; the private object record is preserved for a safe retry.
-            execGit(this.repoRoot, ["reset", "-q", "--", relPath(this.repoRoot, manifestPath).replace(/\\/g, "/")], true);
+            const redactionResult = redact(prompt, this.redactionPatterns);
+            const safePrompt = redactionResult.text;
+            const safeState = opts.agentState
+                ? redact(opts.agentState, this.redactionPatterns).text
+                : undefined;
+            const headId = store.getHead();
+            const timestamp = Date.now();
+            const id = newIntentId();
+            const authorId = opts.author ?? (gitIdentity(this.repoRoot, "user.name") || "unknown");
+            const author = {
+                type: (opts.authorType ?? (opts.model ? "AGENT" : "HUMAN")),
+                identifier: authorId,
+                model: opts.model,
+            };
+            // v0.2.0 encryption at rest: when enabled, the intent's prompt and agent
+            // state are AES-256-GCM encrypted (AAD-bound to the intent id) before they
+            // are stored. The git commit message keeps the plaintext prompt so history
+            // stays readable; the signature covers the stored (encrypted) canonical
+            // form, so verification never requires the master key.
+            const encKey = this.config.encryption.enabled ? this.masterKeyOrThrow() : null;
+            // Prompt storage modes (PRD §17.x, docs/architecture.md):
+            //   commit-summary (default) — full prompt only in local .drift (gitignored);
+            //                              the git commit message carries a safe summary.
+            //   full                     — full prompt in the commit message too (legacy).
+            //   none                     — prompt text is not persisted anywhere.
+            // The PUBLIC summary is deliberately NOT derived from the prompt (ADR-009):
+            // the first line of a one-line prompt would otherwise be copied verbatim
+            // into git history, manifests and PR comments. It comes from an explicit
+            // `--summary` (redacted first, so secrets can't ride along) or a generic
+            // non-prompt fallback built from the intent id.
+            const mode = this.config.prompts.mode;
+            const explicitSummary = opts.summary
+                ? buildPublicSummary(redact(opts.summary, this.redactionPatterns).text)
+                : "";
+            // The public summary is NEVER empty: without an explicit `--summary` a
+            // generic non-prompt fallback is used even under `prompts.mode = "none"`
+            // ("none" means "do not persist the raw prompt" — it does not require an
+            // empty public provenance record). The manifest validator rejects empty
+            // summaries, so this also guarantees every written manifest is renderable.
+            const publicSummary = explicitSummary || genericPublicSummary(id, { fileCount: deltas.length });
+            const storePrompt = mode !== "none";
+            const storedPrompt = storePrompt
+                ? encKey
+                    ? encryptAesGcm(safePrompt, encKey, id)
+                    : safePrompt
+                : "";
+            const storedState = encKey && safeState !== undefined ? encryptAesGcm(safeState, encKey, id) : safeState;
+            const commitMessage = buildCommitMessage({
+                safePrompt,
+                summary: publicSummary,
+                intentId: id,
+                mode,
+                model: opts.model,
+                verifyCmd: opts.verifyCmd,
+            });
+            const intentBase = {
+                id,
+                parentId: headId,
+                author,
+                prompt: storedPrompt,
+                astDelta: deltas,
+                agentState: storedState,
+                verifyCmd: opts.verifyCmd,
+                timestamp,
+            };
+            const canonical = canonicalJson(intentBase);
+            const signature = signPayload(canonical, this.privateKeyPem);
+            const objectSha = sha256Hex(canonical);
+            // Store the path relative to the repo root so committed `.drift` metadata
+            // stays portable across machines (ADR-007).
+            const objectPath = join(".drift", "objects", objectSha.slice(0, 2), `${objectSha.slice(2)}.json`);
+            const absObjectPath = join(this.repoRoot, objectPath);
+            mkdirSync(dirname(absObjectPath), { recursive: true });
+            const objectData = JSON.stringify({ ...intentBase, gitCommitSha: "", signature }, null, 2);
+            const tmpPath = `${absObjectPath}.tmp-${process.pid}`;
+            writeFileSync(tmpPath, objectData);
+            renameSync(tmpPath, absObjectPath);
+            // --- ADR-009 atomic transaction ---------------------------------------
+            // Order is critical (docs/architecture.md "Realize transaction"):
+            //   1. build the V2 public manifest (NEVER contains the containing commit
+            //      SHA — that would be a self-referential cycle);
+            //   2. write + sign it on disk;
+            //   3. explicitly stage ONLY the approved public paths;
+            //   4. create ONE git commit containing source + public provenance;
+            //   5. record the resulting SHA only in the local private database.
+            // The commit's `Drift-Intent:` trailer is the canonical intent→commit
+            // association for every consumer (log/blame/status/export/Action/App).
+            const publicView = {
+                schemaVersion: 2,
+                id,
+                summary: publicSummary,
+                model: opts.model,
+                agent: { type: author.type, identifier: author.identifier },
+                verification: opts.verifyCmd,
+                files: deltas
+                    .slice(0, PUBLIC_FILES_MAX)
+                    .map((d) => ({ path: d.filePath, mutationType: d.type, summary: d.summary || undefined })),
+                timestamp,
+                signingKeyId: signingKeyIdFor(this.publicKeyPem),
+            };
+            // Write + sign the manifest BEFORE the git commit so the same commit that
+            // carries the source change also carries its provenance (no second manual
+            // `git add . && git commit` needed). The signature covers the V2 payload
+            // which has no commit SHA, so the manifest is stable once committed.
+            manifestPath = this.publicStore.manifestPath(id);
+            this.publicStore.write(publicView, this.privateKeyPem);
+            // Stage ONLY the approved public paths — never .drift/private, objects,
+            // keys or drift.db. Staging uses explicit argument arrays, never shell
+            // interpolation.
+            const stagedPublic = this.stagePublicFiles(id);
+            phase = "committing";
+            let gitSha;
             try {
-                rmSync(manifestPath, { force: true });
+                gitSha = commit(this.repoRoot, commitMessage);
             }
-            catch {
-                /* best-effort */
+            catch (err) {
+                // Commit failed: unstage + remove ONLY the manifest this operation just
+                // generated (and only if we staged it). The user's source changes stay
+                // staged; the private object record is preserved for a safe retry.
+                execGit(this.repoRoot, ["reset", "-q", "--", relPath(this.repoRoot, manifestPath).replace(/\\/g, "/")], true);
+                try {
+                    rmSync(manifestPath, { force: true });
+                }
+                catch {
+                    /* best-effort */
+                }
+                throw new DriftError(`git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your source changes are still staged; run \`drift realize\` again after fixing the problem.`);
             }
-            throw new DriftError(`git commit failed — no history was created: ${err instanceof Error ? err.message : String(err)}. Your source changes are still staged; run \`drift realize\` again after fixing the problem.`);
-        }
-        const intent = {
-            ...intentBase,
-            gitCommitSha: gitSha,
-            objectPath: objectPath.replace(/\\/g, "/"),
-            signature,
-        };
-        try {
-            store.insertIntent(intent);
+            phase = "recorded";
+            const intent = {
+                ...intentBase,
+                gitCommitSha: gitSha,
+                objectPath: objectPath.replace(/\\/g, "/"),
+                signature,
+            };
+            try {
+                store.insertIntent(intent);
+            }
+            catch (err) {
+                // Commit landed but intent recording failed — surface it so the user can
+                // run `drift doctor` (trailer-backref check) instead of a bare error.
+                throw new DriftError(`git commit landed (${gitSha}) but intent recording failed: ${err instanceof Error ? err.message : String(err)}. Public provenance was committed; run \`drift doctor\` to reindex the local store.`);
+            }
+            store.setHead(id);
+            void stagedPublic; // staged paths are intentionally not returned
+            return { gitSha, intentId: id, astDelta: deltas, redactions: redactionResult.count };
         }
         catch (err) {
-            // Commit landed but intent recording failed — surface it so the user can
-            // run `drift doctor` (trailer-backref check) instead of a bare error.
-            throw new DriftError(`git commit landed (${gitSha}) but intent recording failed: ${err instanceof Error ? err.message : String(err)}. Public provenance was committed; run \`drift doctor\` to reindex the local store.`);
+            // Only failures BEFORE the commit restore the index. Once the commit
+            // landed, the source changes must stay staged and the commit is never
+            // rewritten (the commit/insert failure paths above already handled
+            // their own cleanup).
+            if (phase === "building") {
+                restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+                if (manifestPath) {
+                    try {
+                        rmSync(manifestPath, { force: true });
+                    }
+                    catch {
+                        /* best-effort */
+                    }
+                }
+                throw err instanceof DriftError
+                    ? err
+                    : new DriftError(`realize aborted before committing — your staged changes were preserved: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            throw err;
         }
-        store.setHead(id);
-        void stagedPublic; // staged paths are intentionally not returned
-        return { gitSha, intentId: id, astDelta: deltas, redactions: redactionResult.count };
     }
     /**
-     * Stage ONLY approved public Drift paths for the realize commit: the
-     * ADR-009 gitignore (so `git add .` can never stage private data), the
-     * public key (first introduction), and the new manifest. Config is staged
-     * only when already tracked (respects a user who deliberately untracked it).
-     * Returns the repo-relative paths that were staged.
+     * Stage ONLY approved public Drift paths for the realize commit. The
+     * ADR-009 trust boundary is staged on genuine first introduction only:
+     *
+     *   - `.drift/.gitignore`        — staged when new or unchanged vs HEAD;
+     *                                  a user's unexpected working-tree edit is
+     *                                  left alone (never silently committed).
+     *   - `.drift/public/key.pem`    — staged on first introduction; if the key
+     *                                  is ALREADY tracked and its working-tree
+     *                                  content differs from HEAD, signing is
+     *                                  REFUSED instead of staging a trust-root
+     *                                  replacement the user did not approve.
+     *   - manifest                    — always staged (written by this operation).
+     *   - `.drift/config.toml`       — staged ONLY when byte-identical to the
+     *                                  safe public template (first
+     *                                  introduction). Never staged merely
+     *                                  because it is tracked: that could carry
+     *                                  an unstaged user edit into the commit.
+     *                                  A config the user already staged rides
+     *                                  along in the whole-index commit.
      */
     stagePublicFiles(intentId) {
+        const configAbs = join(this.driftDir, "config.toml");
+        const configIsUntouchedTemplate = existsSync(configAbs) && readFileSync(configAbs, "utf8") === CONFIG_TEMPLATE;
+        const rel = (abs) => relPath(this.repoRoot, abs).replace(/\\/g, "/");
+        const tracked = (abs) => execGit(this.repoRoot, ["ls-files", "--error-unmatch", "--", rel(abs)], true).status === 0;
+        const changedVsHead = (abs) => execGit(this.repoRoot, ["diff", "--quiet", "HEAD", "--", rel(abs)], true).status !== 0;
+        const keyAbs = this.publicStore.keyPath;
+        // A tracked trust-root file with unexpected working-tree changes must
+        // never be silently staged: that would swap the repository's trust root
+        // without an explicit rotation.
+        if (tracked(keyAbs) && changedVsHead(keyAbs)) {
+            throw new DriftError(`.drift/public/key.pem is tracked but its working-tree content differs from HEAD — refusing to stage an unapproved trust-root change. Revert or commit the key change deliberately before running drift realize.`);
+        }
+        const gitignoreAbs = join(this.driftDir, ".gitignore");
         const candidates = [
-            join(this.driftDir, ".gitignore"),
-            this.publicStore.keyPath,
-            this.publicStore.manifestPath(intentId),
-            join(this.driftDir, "config.toml"),
+            { abs: gitignoreAbs, always: true }, // staged when new or unchanged (see filter below)
+            { abs: keyAbs, always: true },
+            { abs: this.publicStore.manifestPath(intentId), always: true },
+            { abs: configAbs, always: configIsUntouchedTemplate },
         ];
         const toStage = candidates
-            .filter((p) => existsSync(p))
-            .map((p) => relPath(this.repoRoot, p).replace(/\\/g, "/"));
+            .filter((c) => {
+            if (!existsSync(c.abs))
+                return false;
+            if (c.abs === configAbs)
+                return c.always; // only the untouched template
+            if (c.abs === gitignoreAbs) {
+                // Stage the gitignore on first introduction; leave an unexpected
+                // user edit (tracked + changed) alone.
+                return !tracked(c.abs) || !changedVsHead(c.abs);
+            }
+            // key and manifest: key already passed the tracked+changed refusal;
+            // the manifest was just written by this operation.
+            return true;
+        })
+            .map((c) => rel(c.abs));
         if (toStage.length > 0)
             execGit(this.repoRoot, ["add", "--", ...toStage]);
         return toStage;
@@ -584,6 +753,14 @@ export class Drift {
         entries.sort((a, b) => b.timestamp - a.timestamp);
         const limit = filters.limit !== undefined ? safeClamp(filters.limit, 100) : 100;
         return entries.slice(0, limit);
+    }
+    /**
+     * Tracked manifests that fail strict schema validation. Consumers render
+     * only valid manifests; this surfaces the rest as an actionable diagnostic
+     * (never a crash, never a silent "valid").
+     */
+    publicManifestDiagnostics() {
+        return this.publicStore.listWithErrors().errors;
     }
     /**
      * Canonical provenance is the committed public manifest (ADR-009) — that is
@@ -844,9 +1021,26 @@ export class Drift {
      */
     verify(intentId, opts = {}) {
         const view = this.publicStore.getById(intentId);
+        const diagnostics = this.publicStore.getDiagnostics(intentId);
         const record = view ? null : (this.store ? this.store.getById(intentId) : null);
-        if (!record && !view)
+        if (!record && !view && !diagnostics)
             throw new DriftError(`Intent not found: ${intentId}`);
+        // A malformed public manifest is refused outright — never verified
+        // against the local record (which could mask the corruption) and never
+        // executed.
+        if (!view && diagnostics && diagnostics.length > 0) {
+            const first = diagnostics[0] ?? { field: "$", message: "invalid manifest" };
+            return {
+                intentId,
+                verifyCmd: null,
+                signature: "malformed",
+                status: "refused",
+                exitCode: null,
+                stdout: "",
+                stderr: "",
+                message: `malformed public manifest (${first.field}: ${first.message}). Fix or remove .drift/public/intents/${intentId}.json before verifying.`,
+            };
+        }
         const verifyCmd = record?.verifyCmd ?? view?.verification ?? null;
         const sig = this.signatureState(intentId, view, record);
         const base = {
@@ -881,8 +1075,11 @@ export class Drift {
         }
         // Executes with the user's shell ONLY after explicit authorization. The
         // timeout bounds runaway commands; output is captured, never logged as
-        // secrets; no env is inherited from the invoking shell beyond the process
-        // environment (no implicit GitHub/npm tokens are injected).
+        // secrets. By DEFAULT the child receives a SANITIZED environment (an
+        // allowlist of non-secret variables — never GITHUB_TOKEN / NPM_TOKEN /
+        // DRIFT_MASTER_KEY / AWS_* etc.); passing the full process environment
+        // requires the explicit `--inherit-env` opt-in, which the CLI gates
+        // behind a loud warning.
         const res = spawnSync(verifyCmd, {
             cwd: this.repoRoot,
             shell: true,
@@ -890,6 +1087,7 @@ export class Drift {
             maxBuffer: 8 * 1024 * 1024,
             windowsHide: true,
             timeout: opts.timeoutMs ?? VERIFY_TIMEOUT_MS,
+            env: opts.inheritEnv ? undefined : sanitizedVerifyEnv(),
         });
         const errno = res.error;
         const timedOut = errno?.code === "ETIMEDOUT" || res.signal === "SIGTERM";
@@ -1130,7 +1328,8 @@ export class Drift {
             return JSON.stringify({ schemaVersion: 2, containsPrivatePrompts: true, exportedAt, intents: entries }, null, 2);
         }
         const { byId: commitById } = this.intentCommitIndex();
-        const entries = this.publicStore.list().map((v) => ({
+        const { views, errors } = this.publicStore.listWithErrors();
+        const entries = views.map((v) => ({
             id: v.id,
             gitSha: commitById.get(v.id) ?? (v.schemaVersion === 1 ? v.commit : null) ?? null,
             authorType: v.agent?.type ?? "HUMAN",
@@ -1140,7 +1339,21 @@ export class Drift {
             timestamp: new Date(v.timestamp).toISOString(),
             files: (v.files ?? []).map((f) => ({ path: f.path, mutationType: f.mutationType, summary: f.summary ?? null })),
         }));
-        return JSON.stringify({ schemaVersion: 2, containsPrivatePrompts: false, exportedAt, intents: entries }, null, 2);
+        const out = {
+            schemaVersion: 2,
+            containsPrivatePrompts: false,
+            exportedAt,
+            intents: entries,
+        };
+        // Malformed tracked manifests are reported (never rendered as valid, and
+        // never silently dropped without a trace).
+        if (errors.length > 0) {
+            out.malformed = errors.map((e) => ({
+                id: e.id,
+                errors: e.errors.map((err) => `${err.field}: ${err.message}`),
+            }));
+        }
+        return JSON.stringify(out, null, 2);
     }
     verifyIntentSignature(intentId) {
         const view = this.publicStore.getById(intentId);
@@ -1163,9 +1376,29 @@ export class Drift {
             if (!view.signature)
                 return { state: "unsigned", detail: "manifest has no signature" };
             const valid = this.publicStore.verifySignature(view);
-            return valid
-                ? { state: "valid", detail: "signature verifies against the committed public key" }
-                : { state: "invalid", detail: "signature does not verify against the committed public key" };
+            if (!valid) {
+                return { state: "invalid", detail: "signature does not verify against the committed public key" };
+            }
+            // A cryptographically valid signature with a mismatched `signingKeyId`
+            // must not be reported as `valid`: the manifest's declared key id does
+            // not match the fingerprint of the trust root that actually verified.
+            if (view.schemaVersion === 2 && view.signingKeyId !== signingKeyIdFor(pub)) {
+                return {
+                    state: "invalid",
+                    detail: "signature verifies but manifest signingKeyId does not match the committed key fingerprint",
+                };
+            }
+            return { state: "valid", detail: "signature verifies against the committed public key" };
+        }
+        // A manifest file exists but fails strict schema validation — never fall
+        // back to the local record (which could mask the corruption), never
+        // report it as valid.
+        const diagnostics = this.publicStore.getDiagnostics(intentId);
+        if (diagnostics && diagnostics.length > 0) {
+            return {
+                state: "malformed",
+                detail: `malformed public manifest: ${diagnostics[0]?.field}: ${diagnostics[0]?.message}`,
+            };
         }
         if (record && this.store) {
             const obj = this.store.readObjectRecord(record.objectPath);

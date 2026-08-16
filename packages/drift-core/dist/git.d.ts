@@ -17,7 +17,32 @@ export declare function commitExists(repoRoot: string, sha: string): boolean;
 export declare function gitIdentity(repoRoot: string, key: "user.name" | "user.email"): string;
 /** Stage all changes except Drift's own metadata (`.drift/`). */
 export declare function stageAll(repoRoot: string, files?: string[]): void;
-export declare function unstage(repoRoot: string): void;
+/**
+ * Absolute path of the git index file for a repository (`git rev-parse
+ * --git-path index`). Falls back to plain `--git-path` on older git that
+ * lacks `--path-format=absolute`.
+ */
+export declare function gitIndexPath(repoRoot: string): string | null;
+/**
+ * A BYTE-FOR-BYTE backup of the git index file taken BEFORE Drift stages
+ * anything. Copying the actual index file (not a tree, not a cached diff)
+ * preserves every bit of staged state exactly: partially staged hunks,
+ * intent-to-add entries, renames, deletions, mode changes, assume-unchanged /
+ * skip-worktree flags and conflict stages — a `git write-tree`/`read-tree`
+ * round-trip or a patch replay cannot guarantee all of that.
+ *
+ * `backupPath` is null when NO index existed before Drift (a fresh repo with
+ * nothing staged) — restoring then means removing the index Drift created.
+ */
+export interface IndexSnapshot {
+    backupPath: string | null;
+}
+export declare function captureIndexSnapshot(repoRoot: string): IndexSnapshot;
+/**
+ * Restore the index captured by `captureIndexSnapshot`. Safe to call once.
+ * Never overwrites another git process's lock; never touches the worktree.
+ */
+export declare function restoreIndexSnapshot(repoRoot: string, snap: IndexSnapshot): void;
 export interface StagedFile {
     status: string;
     path: string;

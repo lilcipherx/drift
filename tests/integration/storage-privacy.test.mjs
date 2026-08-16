@@ -254,9 +254,14 @@ test("secret marker is absent everywhere under none mode", () => {
   for (const abs of allDriftFiles) {
     assert.ok(!readFileSync(abs, "utf8").includes(MARKER_NONE), `marker leaked into ${abs}`);
   }
-  // summary is empty too (none mode persists nothing derived from the prompt)
+  // the public summary is the generic NON-PROMPT fallback — never empty,
+  // never prompt text (none mode persists nothing derived from the prompt)
   const log = JSON.parse(run(repo, ["log", "--json"]).stdout);
-  assert.equal(log.intents[0].summary, "");
+  assert.ok(
+    log.intents[0].summary.startsWith("Drift intent "),
+    `none mode must use the generic non-prompt summary, got: ${log.intents[0].summary}`,
+  );
+  assert.ok(!log.intents[0].summary.includes(MARKER_NONE), log.intents[0].summary);
 });
 
 // -------------------------------------------------------------- fresh clone

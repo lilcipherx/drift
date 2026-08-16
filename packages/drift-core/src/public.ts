@@ -21,7 +21,7 @@
  *     `signingKeyId` (fingerprint of the signing public key).
  */
 
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { canonicalJson, signPayload, verifyPayload } from "./crypto.js";
@@ -30,6 +30,338 @@ import { canonicalJson, signPayload, verifyPayload } from "./crypto.js";
 export const PUBLIC_SUMMARY_MAX = 200;
 /** Maximum number of files recorded in a public manifest. */
 export const PUBLIC_FILES_MAX = 50;
+
+// ---------------------------------------------------------------------------
+// Strict manifest validation (trust-boundary parsing). A public manifest is
+// attacker-controlled input the moment it is committed by anyone — consumers
+// (log/status/export/verify/blame/Action/App/MCP) must never crash on it and
+// must never render it as valid. `parsePublicIntentManifest` is the single
+// strict parser; permissive type guards are not used for trusted rendering.
+// ---------------------------------------------------------------------------
+
+/** Max raw JSON size of one manifest (resource limit). */
+export const MANIFEST_MAX_BYTES = 256 * 1024;
+/** Max accepted `summary` length after sanitization. */
+export const MANIFEST_SUMMARY_MAX = 2000;
+/** Max accepted `files` entries (engine writes at most PUBLIC_FILES_MAX). */
+export const MANIFEST_FILES_MAX = PUBLIC_FILES_MAX;
+/** Max path length per file entry. */
+export const MANIFEST_FILE_PATH_MAX = 1024;
+/** Max per-file summary length. */
+export const MANIFEST_FILE_SUMMARY_MAX = 500;
+/** Max length of bounded metadata strings (agent identifier, model). */
+export const MANIFEST_META_MAX = 200;
+/** Max length of the recorded `verification` command string. */
+export const MANIFEST_VERIFY_MAX = 1000;
+/** Max length of a base64 signature. */
+export const MANIFEST_SIGNATURE_MAX = 4096;
+/** Max number of `symbols` entries when present. */
+export const MANIFEST_SYMBOLS_MAX = 200;
+/** Max length of one symbol string. */
+export const MANIFEST_SYMBOL_MAX = 300;
+/** Upper bound for `timestamp` (Date.MAX_VALUE) — rejects absurd values. */
+export const MANIFEST_TIMESTAMP_MAX = 8_640_000_000_000_000;
+/** Max nesting depth walked by the validator (bounded recursion). */
+export const MANIFEST_MAX_DEPTH = 24;
+
+/** Drift intent id format (mirrors the git-trailer regex everywhere). */
+export const INTENT_ID_RE = /^did_[0-9a-f]{32}$/;
+
+export interface ManifestValidationError {
+  /** Dot-path of the offending field (e.g. `files[3].path`). */
+  field: string;
+  message: string;
+}
+
+export type ManifestParseResult =
+  | { ok: true; value: PublicIntentView }
+  | { ok: false; errors: ManifestValidationError[] };
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+const MUTATION_ENUM = new Set(["ADDED", "MODIFIED", "DELETED"]);
+
+function hasControlChar(s: string): boolean {
+  return /[\x00-\x1f\x7f]/.test(s.replace(/\t/g, "").replace(/\n/g, "").replace(/\r/g, ""));
+}
+
+function push(errors: ManifestValidationError[], field: string, message: string): void {
+  if (errors.length < 50) errors.push({ field, message }); // bound diagnostics
+}
+
+function checkString(
+  errors: ManifestValidationError[],
+  value: unknown,
+  field: string,
+  opts: { required?: boolean; max?: number; noControl?: boolean; pattern?: RegExp; patternMsg?: string } = {},
+): string | null {
+  if (value === undefined || value === null) {
+    if (opts.required) push(errors, field, "missing required string");
+    return null;
+  }
+  if (typeof value !== "string") {
+    push(errors, field, "expected a string");
+    return null;
+  }
+  if (value.length > (opts.max ?? 1024)) {
+    push(errors, field, `exceeds maximum length ${opts.max ?? 1024}`);
+    return null;
+  }
+  if (value.includes("\0")) {
+    push(errors, field, "contains NUL bytes");
+    return null;
+  }
+  if (opts.noControl && hasControlChar(value)) {
+    push(errors, field, "contains control characters");
+    return null;
+  }
+  if (opts.pattern && !opts.pattern.test(value)) {
+    push(errors, field, opts.patternMsg ?? "does not match the required format");
+    return null;
+  }
+  return value;
+}
+
+function checkNonNegInt(
+  errors: ManifestValidationError[],
+  value: unknown,
+  field: string,
+  opts: { max?: number; required?: boolean } = {},
+): number | null {
+  if (value === undefined || value === null) {
+    if (opts.required) push(errors, field, "missing required integer");
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    push(errors, field, "expected a non-negative integer");
+    return null;
+  }
+  if (opts.max !== undefined && value > opts.max) {
+    push(errors, field, `exceeds maximum value ${opts.max}`);
+    return null;
+  }
+  return value;
+}
+
+function validateFiles(errors: ManifestValidationError[], value: unknown, depth: number): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) {
+    push(errors, "files", "expected an array");
+    return false;
+  }
+  if (value.length > MANIFEST_FILES_MAX) {
+    push(errors, "files", `exceeds maximum ${MANIFEST_FILES_MAX} entries`);
+    return false;
+  }
+  if (depth > MANIFEST_MAX_DEPTH) {
+    push(errors, "files", "nesting too deep");
+    return false;
+  }
+  let ok = true;
+  value.forEach((f, i) => {
+    if (!isRecord(f)) {
+      push(errors, `files[${i}]`, "expected an object");
+      ok = false;
+      return;
+    }
+    const path = checkString(errors, f.path, `files[${i}].path`, {
+      required: true,
+      max: MANIFEST_FILE_PATH_MAX,
+      noControl: true,
+    });
+    if (path !== null && path.length === 0) {
+      push(errors, `files[${i}].path`, "must not be empty");
+      ok = false;
+    }
+    const mutation = checkString(errors, f.mutationType, `files[${i}].mutationType`, {
+      required: true,
+      max: 16,
+    });
+    if (mutation !== null && !MUTATION_ENUM.has(mutation)) {
+      push(errors, `files[${i}].mutationType`, `unsupported mutation type "${mutation}"`);
+      ok = false;
+    }
+    const summary = checkString(errors, f.summary, `files[${i}].summary`, {
+      max: MANIFEST_FILE_SUMMARY_MAX,
+      noControl: true,
+    });
+    void summary;
+  });
+  return ok;
+}
+
+/**
+ * Strict, versioned public-manifest parser. Returns the validated manifest or
+ * a bounded list of actionable validation errors. Never throws on hostile
+ * input: the raw JSON byte size is capped, every field is type-checked with
+ * resource limits, ids must match the filename/request, and V2 requires a
+ * syntactically valid `signingKeyId`. Cryptographic checks (signature,
+ * `signingKeyId` fingerprint match) are performed by the callers that know
+ * the trust root.
+ */
+export function parsePublicIntentManifest(
+  json: unknown,
+  opts: { expectedId?: string; sourceName?: string } = {},
+): ManifestParseResult {
+  const errors: ManifestValidationError[] = [];
+  const fail = (): { ok: false; errors: ManifestValidationError[] } => ({
+    ok: false,
+    errors: errors.length > 0 ? errors : [{ field: "$schema", message: "not an object" }],
+  });
+  if (!isRecord(json)) return fail();
+  const schemaVersion = checkNonNegInt(errors, json.schemaVersion, "schemaVersion", { required: true });
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    push(errors, "schemaVersion", `unsupported schema version ${String(json.schemaVersion)}`);
+    return fail();
+  }
+  const id = checkString(errors, json.id, "id", {
+    required: true,
+    max: 64,
+    pattern: INTENT_ID_RE,
+    patternMsg: "invalid Drift intent id (expected did_<32 hex chars>)",
+  });
+  if (id !== null && opts.expectedId !== undefined && id !== opts.expectedId) {
+    push(errors, "id", `does not match ${opts.sourceName ?? "the requested intent"} (expected ${opts.expectedId})`);
+    return fail();
+  }
+  // A public manifest must carry a NON-EMPTY summary: an empty string is
+  // ambiguous (it blurs "missing" and "intentional") and would render as a
+  // blank PR comment / check-run line. `none` prompt mode still writes the
+  // generic non-prompt fallback (engine `genericPublicSummary`), so a real
+  // manifest is never empty here.
+  const summary = checkString(errors, json.summary, "summary", {
+    required: true,
+    max: MANIFEST_SUMMARY_MAX,
+    noControl: true,
+  });
+  if (summary !== null && summary.trim().length === 0) {
+    push(errors, "summary", "must not be empty or whitespace-only");
+  }
+  const timestamp = checkNonNegInt(errors, json.timestamp, "timestamp", {
+    required: true,
+    max: MANIFEST_TIMESTAMP_MAX,
+  });
+  const signature = checkString(errors, json.signature, "signature", {
+    max: MANIFEST_SIGNATURE_MAX,
+  });
+  if (signature !== null && signature.length > 0) {
+    // Bounded base64 encoding check — a non-base64 signature can never be
+    // cryptographically valid and should be reported as malformed, not
+    // silently verified against garbage.
+    try {
+      const decoded = Buffer.from(signature, "base64").toString("base64").replace(/=+$/, "");
+      const normalized = signature.replace(/=+$/, "");
+      if (decoded !== normalized) push(errors, "signature", "not valid base64");
+    } catch {
+      push(errors, "signature", "not valid base64");
+    }
+  }
+  if (json.agent !== undefined) {
+    if (!isRecord(json.agent)) {
+      push(errors, "agent", "expected an object");
+    } else {
+      const type = checkString(errors, json.agent.type, "agent.type", { required: true, max: 20 });
+      if (type !== null && schemaVersion === 2 && type !== "HUMAN" && type !== "AGENT") {
+        push(errors, "agent.type", `unsupported agent type "${type}"`);
+      }
+      checkString(errors, json.agent.identifier, "agent.identifier", {
+        required: true,
+        max: MANIFEST_META_MAX,
+        noControl: true,
+      });
+    }
+  }
+  if (json.model !== undefined) {
+    checkString(errors, json.model, "model", { max: MANIFEST_META_MAX, noControl: true });
+  }
+  if (json.verification !== undefined) {
+    checkString(errors, json.verification, "verification", {
+      max: MANIFEST_VERIFY_MAX,
+      noControl: true,
+    });
+  }
+  validateFiles(errors, json.files, 0);
+  if (json.symbols !== undefined) {
+    if (!Array.isArray(json.symbols)) {
+      push(errors, "symbols", "expected an array");
+    } else {
+      if (json.symbols.length > MANIFEST_SYMBOLS_MAX) {
+        push(errors, "symbols", `exceeds maximum ${MANIFEST_SYMBOLS_MAX} entries`);
+      }
+      json.symbols.forEach((s, i) => {
+        checkString(errors, s, `symbols[${i}]`, { max: MANIFEST_SYMBOL_MAX, noControl: true });
+      });
+    }
+  }
+  if (schemaVersion === 1) {
+    checkString(errors, json.commit, "commit", { max: 64 });
+  }
+  if (schemaVersion === 2) {
+    checkString(errors, json.signingKeyId, "signingKeyId", {
+      required: true,
+      max: 32,
+      pattern: /^[0-9a-f]{16}$/,
+      patternMsg: "must be a 16-hex-char key fingerprint",
+    });
+  }
+  if (errors.length > 0) return fail();
+  const base: PublicIntentManifestBase = {
+    id: id as string,
+    summary: summary as string,
+    timestamp: timestamp as number,
+  };
+  if (json.model !== undefined) base.model = json.model as string;
+  if (isRecord(json.agent)) {
+    base.agent = {
+      type: json.agent.type as "HUMAN" | "AGENT",
+      identifier: json.agent.identifier as string,
+    };
+  }
+  if (json.verification !== undefined) base.verification = json.verification as string;
+  if (Array.isArray(json.files)) {
+    base.files = (json.files as Record<string, unknown>[]).map((f) => ({
+      path: f.path as string,
+      mutationType: f.mutationType as string,
+      ...(typeof f.summary === "string" ? { summary: f.summary } : {}),
+    }));
+  }
+  if (schemaVersion === 1) {
+    return { ok: true, value: { ...base, schemaVersion: 1, commit: json.commit as string, signature: signature ?? "" } };
+  }
+  return { ok: true, value: { ...base, schemaVersion: 2, signingKeyId: json.signingKeyId as string, signature: signature ?? "" } };
+}
+
+/** Read + strictly parse one manifest file; null on parse failure. */
+export function readManifestFile(path: string): ManifestParseResult {
+  if (!existsSync(path)) return { ok: false, errors: [{ field: "$file", message: "manifest file not found" }] };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return { ok: false, errors: [{ field: "$file", message: "manifest file unreadable" }] };
+  }
+  if (Buffer.byteLength(raw, "utf8") > MANIFEST_MAX_BYTES) {
+    return { ok: false, errors: [{ field: "$file", message: `manifest exceeds maximum size ${MANIFEST_MAX_BYTES} bytes` }] };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, errors: [{ field: "$file", message: "manifest is not valid JSON" }] };
+  }
+  return parsePublicIntentManifest(parsed, {
+    expectedId: path.endsWith(".json") ? basename(path, ".json") : undefined,
+    sourceName: "the manifest filename",
+  });
+}
+
+export function basename(p: string, suffix = ""): string {
+  const parts = p.split(/[\\/]/);
+  const last = parts[parts.length - 1] ?? "";
+  return suffix ? last.slice(0, last.length - suffix.length) : last;
+}
 
 export interface PublicIntentFile {
   path: string;
@@ -135,19 +467,22 @@ export function genericPublicSummary(id: string, opts: { fileCount?: number } = 
 export const PUBLIC_KEY_PATH = join("public", "key.pem");
 export const PUBLIC_INTENTS_DIR = join("public", "intents");
 
-function isPublicIntentView(value: unknown): value is PublicIntentView {
-  if (typeof value !== "object" || value === null) return false;
-  const v = value as Record<string, unknown>;
-  // A missing/empty `signature` is NOT disqualifying: an unsigned manifest is
-  // still provenance (reported as state "unsigned"), it must never silently
-  // fall back to the private legacy record.
-  if (v.schemaVersion === 1) {
-    return typeof v.id === "string" && typeof v.summary === "string" && typeof v.commit === "string";
+/**
+ * Strictly parse one manifest file for `id`. Returns the validated manifest
+ * or null. Malformed manifests are NOT silently dropped: callers can ask for
+ * the diagnostic with `getDiagnostics` so a malformed file is reported (e.g.
+ * `drift verify` / `drift status`) instead of being confused with "missing".
+ */
+function parseManifestFileFor(id: string, path: string): ManifestParseResult {
+  const result = readManifestFile(path);
+  if (!result.ok) return result;
+  if (result.value.id !== id) {
+    return {
+      ok: false,
+      errors: [{ field: "id", message: `manifest id does not match its filename (expected ${id})` }],
+    };
   }
-  if (v.schemaVersion === 2) {
-    return typeof v.id === "string" && typeof v.summary === "string" && typeof v.signingKeyId === "string";
-  }
-  return false;
+  return result;
 }
 
 /**
@@ -205,27 +540,66 @@ export class PublicStore {
   }
 
   getById(id: string): PublicIntentView | null {
-    const path = this.manifestPath(id);
-    if (!existsSync(path)) return null;
-    try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-      return isPublicIntentView(parsed) ? parsed : null;
-    } catch {
-      return null;
-    }
+    const result = this.parseFor(id);
+    return result.ok ? result.value : null;
   }
 
-  /** Every manifest, newest first (timestamp desc). */
+  /**
+   * Validation errors for `id`'s manifest, or null when the file is missing
+   * or clean. Lets consumers distinguish "malformed" from "missing" (a
+   * malformed manifest must never silently fall back to the private record
+   * or be reported as valid).
+   */
+  getDiagnostics(id: string): ManifestValidationError[] | null {
+    // A missing manifest is NOT "malformed" — callers must keep treating it
+    // as absent (e.g. `drift verify` reports intent-not-found). Only an
+    // existing-but-invalid file yields diagnostics.
+    if (!existsSync(this.manifestPath(id))) return null;
+    const result = this.parseFor(id);
+    return result.ok ? null : result.errors;
+  }
+
+  /** Parse one manifest strictly (id must match its filename). */
+  private parseFor(id: string): ManifestParseResult {
+    const path = this.manifestPath(id);
+    if (!existsSync(path)) return { ok: false, errors: [{ field: "$file", message: "manifest file not found" }] };
+    return parseManifestFileFor(id, path);
+  }
+
+  /**
+   * Every VALID manifest, newest first (timestamp desc). Malformed manifests
+   * are excluded from rendering but surfaced through `listWithErrors` so
+   * status/log/export can report them as an actionable diagnostic instead of
+   * crashing or silently treating them as valid.
+   */
   list(): PublicIntentView[] {
+    return this.listWithErrors().views;
+  }
+
+  /**
+   * All manifests with per-file validation errors, newest first. Never
+   * throws on hostile files; oversized/unparseable files are reported as
+   * diagnostics rather than loaded.
+   */
+  listWithErrors(): { views: PublicIntentView[]; errors: { id: string; errors: ManifestValidationError[] }[] } {
     const dir = join(this.driftDir, PUBLIC_INTENTS_DIR);
-    if (!existsSync(dir)) return [];
     const views: PublicIntentView[] = [];
+    const errors: { id: string; errors: ManifestValidationError[] }[] = [];
+    if (!existsSync(dir)) return { views, errors };
     for (const name of readdirSync(dir)) {
       if (!name.endsWith(".json")) continue;
-      const view = this.getById(name.slice(0, -".json".length));
-      if (view) views.push(view);
+      const id = name.slice(0, -".json".length);
+      if (!INTENT_ID_RE.test(id)) {
+        errors.push({ id, errors: [{ field: "id", message: "filename is not a valid Drift intent id" }] });
+        continue;
+      }
+      const result = this.parseFor(id);
+      if (result.ok) views.push(result.value);
+      else errors.push({ id, errors: result.errors });
     }
-    return views.sort((a, b) => b.timestamp - a.timestamp);
+    views.sort((a, b) => b.timestamp - a.timestamp);
+    errors.sort((a, b) => a.id.localeCompare(b.id));
+    return { views, errors };
   }
 
   /**
@@ -250,10 +624,25 @@ export class PublicStore {
 }
 
 /**
- * Short fingerprint of an Ed25519 public key (first 16 hex chars of its
- * SHA-256). Used as `signingKeyId` in V2 manifests and by `drift status` /
- * key-state output — never the private key material.
+ * Canonical short fingerprint of an Ed25519 public key (first 16 hex chars
+ * of the SHA-256 of its SPKI DER subject-public-key bytes). Hashing the DER
+ * bytes — NOT the textual PEM — means LF/CRLF line endings and harmless
+ * surrounding whitespace can never produce a different key identity, and two
+ * PEM encodings of the same key always agree. Used as `signingKeyId` in V2
+ * manifests and by `drift status` / key-state output — never the private key
+ * material. A malformed PEM falls back to a stable hash of the text so the
+ * identifier is still deterministic (consumers treat such a key as
+ * unverifiable, never trusted).
  */
 export function signingKeyIdFor(publicKeyPem: string): string {
-  return createHash("sha256").update(publicKeyPem.trim(), "utf8").digest("hex").slice(0, 16);
+  try {
+    const key = createPublicKey(String(publicKeyPem ?? "").trim());
+    const der = key.export({ type: "spki", format: "der" }) as Buffer;
+    return createHash("sha256").update(der).digest("hex").slice(0, 16);
+  } catch {
+    return createHash("sha256")
+      .update(String(publicKeyPem ?? "").trim(), "utf8")
+      .digest("hex")
+      .slice(0, 16);
+  }
 }

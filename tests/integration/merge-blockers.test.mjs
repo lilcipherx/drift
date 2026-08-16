@@ -352,3 +352,307 @@ test("verify --run refuses invalid, unsigned, and unverifiable manifests (marker
   assert.ok(existsSync(markerFile), "explicit dangerous override executes");
   rmSync(markerFile, { force: true });
 });
+
+// --------------------------------------------------------------------- G: env
+test("verify --run: sanitized environment by default, --inherit-env opt-in (no secrets by default)", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  const probe = join(tmpdir(), `drift-env-probe-${Date.now()}.json`);
+  // A plain script avoids nested-quote portability issues on Windows cmd.exe.
+  const probeScript = join(tmpdir(), `drift-env-probe-${Date.now()}.js`);
+  writeFileSync(
+    probeScript,
+    `const fs = require("fs");
+const keys = ["GITHUB_TOKEN","GH_TOKEN","NPM_TOKEN","NODE_AUTH_TOKEN","DRIFT_MASTER_KEY","AWS_SECRET_ACCESS_KEY","SSH_AUTH_SOCK"].filter((k) => process.env[k] !== undefined);
+fs.writeFileSync(${JSON.stringify(probe)}, JSON.stringify(keys));`,
+  );
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 3;\n");
+  // The verify command runs the probe and records which secrets it can see.
+  const cmd = `node "${probeScript}"`;
+  assert.equal(run(repo, ["realize", "-p", "env test", "--summary", "Env test", "--verify-cmd", cmd]).status, 0);
+  const id = lastIntentId(repo);
+  const withSecrets = {
+    GITHUB_TOKEN: "DRIFT_ENV_SECRET_GITHUB_61a4",
+    GH_TOKEN: "DRIFT_ENV_SECRET_GH",
+    NPM_TOKEN: "DRIFT_ENV_SECRET_NPM_72b5",
+    NODE_AUTH_TOKEN: "DRIFT_ENV_SECRET_NODE_83c6",
+    DRIFT_MASTER_KEY: "DRIFT_ENV_SECRET_MASTER_94d7",
+    AWS_SECRET_ACCESS_KEY: "DRIFT_ENV_SECRET_AWS_a5e8",
+    SSH_AUTH_SOCK: "/tmp/drift-fake-agent",
+  };
+  // default --run: sanitized env, secrets must be invisible
+  const def = spawnSync(process.execPath, [CLI, "verify", id, "--run", "--json"], {
+    cwd: repo,
+    encoding: "utf8",
+    env: { ...process.env, ...withSecrets },
+  });
+  assert.equal(JSON.parse(def.stdout).verifyStatus, "pass");
+  const seenDefault = JSON.parse(readFileSync(probe, "utf8"));
+  assert.deepEqual(seenDefault, [], `secrets leaked into the default verify env: ${seenDefault.join(", ")}`);
+  // PATH-based tooling still works (node itself ran)
+
+  // --inherit-env: the same secrets ARE visible (explicit opt-in)
+  const inherited = spawnSync(process.execPath, [CLI, "verify", id, "--run", "--inherit-env", "--json"], {
+    cwd: repo,
+    encoding: "utf8",
+    env: { ...process.env, ...withSecrets },
+  });
+  assert.equal(JSON.parse(inherited.stdout).verifyStatus, "pass");
+  const seenInherited = JSON.parse(readFileSync(probe, "utf8"));
+  assert.ok(seenInherited.includes("GITHUB_TOKEN"), "--inherit-env exposes the parent environment");
+  assert.ok(seenInherited.includes("DRIFT_MASTER_KEY"));
+  rmSync(probe, { force: true });
+});
+
+// --------------------------------------------------------------------- E: strict
+function corruptManifest(repo, id, mutate) {
+  const p = join(repo, ".drift", "public", "intents", `${id}.json`);
+  const m = JSON.parse(readFileSync(p, "utf8"));
+  mutate(m);
+  writeFileSync(p, JSON.stringify(m));
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "corrupt manifest"]);
+}
+
+test("malformed tracked manifests never crash log/status/export and are never rendered as valid", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 4;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0);
+  const id = lastIntentId(repo);
+  // files as object + string timestamp + numeric signature — all invalid
+  corruptManifest(repo, id, (m) => {
+    m.files = { path: "x" };
+    m.timestamp = "not-a-number";
+    m.signature = 12345;
+  });
+
+  // log must not crash; the malformed manifest is skipped with a warning
+  const log = run(repo, ["log", "--json"]);
+  assert.equal(log.status, 0, log.stderr);
+  assert.equal(JSON.parse(log.stdout).status, "ok");
+  assert.ok(log.stderr.includes("malformed public manifest"), "log reports an actionable diagnostic");
+  const textLog = run(repo, ["log"]);
+  assert.equal(textLog.status, 0, textLog.stderr);
+  assert.ok(textLog.stderr.includes("malformed"), textLog.stderr);
+
+  // status reports the malformed count
+  const status = run(repo, ["status", "--json"]);
+  assert.equal(status.status, 0);
+  assert.equal(JSON.parse(status.stdout).malformedManifests.length, 1);
+
+  // export skips the malformed manifest and reports it, never crashes
+  const exp = run(repo, ["export"]);
+  assert.equal(exp.status, 0, exp.stderr);
+  const data = JSON.parse(exp.stdout);
+  assert.equal(data.intents.length, 0, "malformed manifest is not exported as valid");
+  assert.ok(data.malformed && data.malformed.length === 1, "export reports the malformed manifest");
+
+  // verify reports malformed, never valid, never executes
+  const v = run(repo, ["verify", id, "--json"]);
+  assert.equal(JSON.parse(v.stdout).signature, "malformed");
+  assert.equal(JSON.parse(v.stdout).verifyStatus, "refused");
+  const vRun = run(repo, ["verify", id, "--run", "--json"]);
+  assert.equal(JSON.parse(vRun.stdout).verifyStatus, "refused");
+});
+
+test("malformed manifest with a matching signature is not treated as valid (signingKeyId mismatch)", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 5;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0);
+  const id = lastIntentId(repo);
+  // rewrite signingKeyId to a wrong fingerprint WITHOUT touching the signature
+  const p = join(repo, ".drift", "public", "intents", `${id}.json`);
+  const m = JSON.parse(readFileSync(p, "utf8"));
+  m.signingKeyId = "ffffffffffffffff";
+  writeFileSync(p, JSON.stringify(m));
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "wrong key id"]);
+  const v = run(repo, ["verify", id, "--json"]);
+  assert.equal(JSON.parse(v.stdout).signature, "invalid", "signingKeyId mismatch must never report valid");
+});
+
+// --------------------------------------------------------------------- I: index
+test("realize syntax failure preserves the user's staged state exactly (staged, partial, intent-to-add)", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  // A fully staged with one hunk, B partially staged (staged + unstaged hunks),
+  // C intent-to-add, D a brand-new untracked file that fails syntax.
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 6;\n");
+  git(repo, ["add", "src/a.ts"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 6;\nexport const b = 1;\n"); // unstaged hunk
+  writeFileSync(join(repo, "src", "b.ts"), "export const b = 1;\n");
+  git(repo, ["add", "src/b.ts"]);
+  writeFileSync(join(repo, "src", "b.ts"), "export const b = 1;\nexport const c = 2;\n"); // unstaged hunk
+  writeFileSync(join(repo, "src", "c.ts"), "export const c = 3;\n");
+  git(repo, ["add", "-N", "src/c.ts"]); // intent-to-add
+  writeFileSync(join(repo, "src", "bad.ts"), "this is not valid typescript ;;;\n"); // untracked, invalid
+  const before = git(repo, ["diff", "--cached"]);
+  const beforeNameStatus = git(repo, ["diff", "--cached", "--name-status"]);
+  const res = run(repo, ["realize", "-p", "boom", "--summary", "Boom"]);
+  assert.equal(res.status, 2, res.stderr); // EXIT.SYNTAX
+  assert.ok(res.stderr.includes("Syntax error"), res.stderr);
+  assert.ok(res.stderr.includes("preserved"), res.stderr);
+  const after = git(repo, ["diff", "--cached"]);
+  const afterNameStatus = git(repo, ["diff", "--cached", "--name-status"]);
+  assert.equal(after, before, "staged hunks must be byte-identical after the failed realize");
+  assert.equal(afterNameStatus, beforeNameStatus);
+  assert.ok(beforeNameStatus.includes("a.ts"), "the pre-existing staged file is still staged");
+  assert.ok(beforeNameStatus.includes("b.ts"), "the partially staged file keeps its staged hunks");
+  // the bad file is NOT left staged, and no manifest was written
+  const stagedNames = git(repo, ["diff", "--cached", "--name-only"]);
+  assert.ok(!stagedNames.split("\n").some((l) => l.includes("bad.ts")), "failed realize must not leave its own staging behind");
+  const intentsDir = join(repo, ".drift", "public", "intents");
+  assert.equal(readdirSync(intentsDir).length, 0, "no manifest may be written for a failed realize");
+  // C remains intent-to-add (porcelain " A" = new-file entry in the index)
+  const status = git(repo, ["status", "--porcelain"]);
+  assert.ok(status.split("\n").some((l) => l.includes("c.ts") && l.startsWith(" A")), `c.ts should still be intent-to-add: ${status}`);
+  assert.ok(status.split("\n").some((l) => l.includes("bad.ts") && l.startsWith("??")), `bad.ts should remain untracked: ${status}`);
+});
+
+test("realize stages config.toml only when it is the safe template or already tracked", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  // user deliberately untracks config.toml after modifying it
+  const configPath = join(repo, ".drift", "config.toml");
+  git(repo, ["add", configPath]);
+  git(repo, ["commit", "-qm", "track config"]);
+  git(repo, ["rm", "--cached", "-q", configPath]);
+  git(repo, ["commit", "-qm", "untrack config"]);
+  writeFileSync(configPath, readFileSync(configPath, "utf8") + "\n[prompts]\nmode = \"none\"\n");
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 7;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0);
+  const inTree = git(repo, ["ls-tree", "-r", "--name-only", "HEAD"]).split("\n");
+  assert.ok(!inTree.includes(".drift/config.toml"), "a deliberately untracked config must stay untracked");
+});
+
+test("realize never stages a tracked config with an unstaged user edit", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  // config is committed, then the user edits it WITHOUT staging
+  const configPath = join(repo, ".drift", "config.toml");
+  git(repo, ["add", configPath]);
+  git(repo, ["commit", "-qm", "track config"]);
+  const edit = "\n[prompts]\nmode = \"full\"\n";
+  writeFileSync(configPath, readFileSync(configPath, "utf8") + edit);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 71;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0);
+  const headConfig = git(repo, ["show", "HEAD:.drift/config.toml"]);
+  assert.ok(!headConfig.includes("mode = \"full\""), "an unstaged config edit must not ride into the Drift commit");
+  // and the edit is still present in the working tree (untouched)
+  assert.ok(readFileSync(configPath, "utf8").includes("mode = \"full\""));
+});
+
+test("realize refuses to stage an unapproved working-tree change to the tracked public key", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 72;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0, "first realize commits the key");
+  // tamper with the committed trust root in the working tree
+  const keyPath = join(repo, ".drift", "public", "key.pem");
+  writeFileSync(keyPath, readFileSync(keyPath, "utf8") + "\n# tampered\n");
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 73;\n");
+  const res = run(repo, ["realize", "-p", "nope", "--summary", "Nope"]);
+  assert.notEqual(res.status, 0, "signing with a tampered trust root must be refused");
+  const keyAtHead = git(repo, ["show", "HEAD:.drift/public/key.pem"]);
+  assert.ok(!keyAtHead.includes("tampered"), "the tampered key must never be committed");
+});
+
+test("realize refuses when the git index has unmerged (conflict) entries", () => {
+  const repo = makeRepo("drift-mb-conflict-");
+  assert.equal(run(repo, ["init"]).status, 0);
+  git(repo, ["checkout", "-q", "-b", "side"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 2;\n");
+  git(repo, ["commit", "-qam", "side"]);
+  git(repo, ["checkout", "-q", "main"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 3;\n");
+  git(repo, ["commit", "-qam", "main"]);
+  const merged = spawnSync("git", ["merge", "--no-edit", "side"], { cwd: repo, encoding: "utf8" });
+  assert.notEqual(merged.status, 0, "expected a merge conflict");
+  assert.ok(git(repo, ["ls-files", "-u"]).length > 0, "index should contain unmerged entries");
+  const res = run(repo, ["realize", "-p", "x", "--summary", "X"]);
+  assert.notEqual(res.status, 0);
+  assert.ok(res.stderr.includes("unmerged"), `must refuse with an actionable message: ${res.stderr}`);
+});
+
+test("public summaries are never empty: whitespace-only explicit summary falls back to the generic form", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 74;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "   \n\t"]).status, 0);
+  const id = lastIntentId(repo);
+  const manifest = JSON.parse(readFileSync(join(repo, ".drift", "public", "intents", `${id}.json`), "utf8"));
+  assert.ok(manifest.summary.startsWith("Drift intent "), `got: ${JSON.stringify(manifest.summary)}`);
+});
+
+test("none mode with an explicit summary keeps the explicit summary and persists no prompt", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  const configPath = join(repo, ".drift", "config.toml");
+  writeFileSync(configPath, readFileSync(configPath, "utf8") + "\n[prompts]\nmode = \"none\"\n");
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 75;\n");
+  assert.equal(run(repo, ["realize", "-p", "private prompt text", "--summary", "Explicit safe summary"]).status, 0);
+  const id = lastIntentId(repo);
+  const manifest = JSON.parse(readFileSync(join(repo, ".drift", "public", "intents", `${id}.json`), "utf8"));
+  assert.equal(manifest.summary, "Explicit safe summary");
+  const msg = git(repo, ["log", "-1", "--format=%B"]);
+  assert.ok(!msg.includes("private prompt text"), msg);
+  const log = JSON.parse(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
+  assert.equal(log.intents[0].prompt, "");
+});
+
+test("an empty-summary public manifest is malformed (never rendered, never a crash)", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 76;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0);
+  const id = lastIntentId(repo);
+  const p = join(repo, ".drift", "public", "intents", `${id}.json`);
+  const m = JSON.parse(readFileSync(p, "utf8"));
+  m.summary = "   ";
+  writeFileSync(p, JSON.stringify(m));
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "empty summary"]);
+  const log = run(repo, ["log", "--json"]);
+  assert.equal(log.status, 0, log.stderr);
+  assert.ok(log.stderr.includes("malformed"), "empty summaries are malformed, not valid");
+  const v = run(repo, ["verify", id, "--json"]);
+  assert.equal(JSON.parse(v.stdout).signature, "malformed");
+});
+
+test("canonical key fingerprints: LF/CRLF and whitespace produce the same identity, different keys differ", async () => {
+  const { generateKeyPairSync } = await import("node:crypto");
+  const { signingKeyIdFor } = await import("../../packages/drift-core/dist/index.js");
+  const { publicKey } = generateKeyPairSync("ed25519");
+  const pem = publicKey.export({ type: "spki", format: "pem" }).toString().trim();
+  const lf = pem;
+  const crlf = pem.replace(/\n/g, "\r\n");
+  const padded = `\n\n  ${pem}  \n\n`;
+  const fp = signingKeyIdFor(lf);
+  assert.equal(signingKeyIdFor(crlf), fp, "CRLF PEM must hash identically to LF");
+  assert.equal(signingKeyIdFor(padded), fp, "harmless surrounding whitespace must not change the fingerprint");
+  const { publicKey: other } = generateKeyPairSync("ed25519");
+  const otherPem = other.export({ type: "spki", format: "pem" }).toString().trim();
+  assert.notEqual(signingKeyIdFor(otherPem), fp, "a different key must produce a different fingerprint");
+  assert.match(signingKeyIdFor("not a pem"), /^[0-9a-f]{16}$/, "malformed PEM yields a deterministic fallback id");
+});
+
+test("an oversized tracked manifest is reported as malformed without crashing or echoing content", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 77;\n");
+  assert.equal(run(repo, ["realize", "-p", "ok", "--summary", "OK"]).status, 0);
+  const id = lastIntentId(repo);
+  const p = join(repo, ".drift", "public", "intents", `${id}.json`);
+  const m = JSON.parse(readFileSync(p, "utf8"));
+  m.files = Array.from({ length: 20000 }, (_, i) => ({ path: `x${i}.ts`, mutationType: "ADDED", summary: "y".repeat(50) }));
+  writeFileSync(p, JSON.stringify(m));
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "oversize"]);
+  const log = run(repo, ["log", "--json"]);
+  assert.equal(log.status, 0, "log must not crash on oversized manifests");
+  assert.ok(log.stderr.includes("malformed"), log.stderr);
+  const v = run(repo, ["verify", id, "--json"]);
+  assert.equal(JSON.parse(v.stdout).signature, "malformed");
+});

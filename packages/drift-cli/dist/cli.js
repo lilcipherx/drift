@@ -200,6 +200,12 @@ function run(argv) {
                         console.log(`  pubkey fp:   ${result.publicKeyFingerprint}${result.privateKeyAvailable ? "" : " (private key absent — read-only)"}`);
                     }
                     console.log(`  signing:     ${result.signingAllowed ? "allowed" : "blocked"}`);
+                    if (result.malformedManifests && result.malformedManifests.length > 0) {
+                        for (const m of result.malformedManifests) {
+                            const first = m.errors[0];
+                            console.error(colorize(!noColor, "yellow", `  warning: malformed public manifest .drift/public/intents/${m.id}.json (${first?.field}: ${first?.message})`));
+                        }
+                    }
                     const branch = result.gitBranch ?? "(detached)";
                     console.log(`  git:         ${branch} @ ${result.gitHead ?? "?"}${result.gitDirty ? " (uncommitted changes)" : " (clean)"}`);
                     if (result.signerState === "read-only") {
@@ -252,9 +258,24 @@ function run(argv) {
                     file: stringFlag(flags, "file") ?? undefined,
                     limit: numberFlag(flags, "limit"),
                 });
+                const manifestDiagnostics = drift.publicManifestDiagnostics();
+                if (manifestDiagnostics.length > 0) {
+                    for (const d of manifestDiagnostics) {
+                        const first = d.errors[0];
+                        const where = first ? `${first.field}: ${first.message}` : "invalid manifest";
+                        const line = `drift: warning: skipping malformed public manifest .drift/public/intents/${d.id}.json (${where})`;
+                        if (json)
+                            process.stderr.write(`${line}\n`);
+                        else
+                            console.error(colorize(!noColor, "yellow", line));
+                    }
+                }
                 if (json) {
                     const serializable = entries.map((e) => includePrompt ? e : omitKey(e, "prompt"));
-                    console.log(JSON.stringify({ status: "ok", intents: serializable }));
+                    const out = { status: "ok", intents: serializable };
+                    if (manifestDiagnostics.length > 0)
+                        out.warnings = manifestDiagnostics;
+                    console.log(JSON.stringify(out));
                 }
                 else if (entries.length === 0) {
                     console.log(colorize(!noColor, "yellow", "No intents yet. Run `drift realize -p \"...\"` after your next change."));
@@ -323,7 +344,7 @@ function run(argv) {
                             console.log("");
                             console.log("  Verification:");
                             console.log(`    ${result.intent.verifyCmd}`);
-                            console.log(`    (run \`drift verify ${result.intent.id}\` to re-run)`);
+                            console.log(`    (run \`drift verify ${result.intent.id} --run\` to execute the recorded verification command)`);
                         }
                         console.log("");
                         console.log("  Intent:");
@@ -369,13 +390,20 @@ function run(argv) {
                 const drift = Drift.fromCwd(process.cwd());
                 const run = flags.has("run");
                 const allowUntrusted = flags.has("allow-untrusted-command");
+                const inheritEnv = flags.has("inherit-env");
                 if (allowUntrusted && !run) {
                     console.error(colorize(!noColor, "yellow", "warning: --allow-untrusted-command has no effect without --run (nothing is executed by default)"));
                 }
                 if (run && allowUntrusted) {
                     console.error(colorize(!noColor, "red", "⚠ DANGER: --run --allow-untrusted-command will execute a repository-provided command that may be untrusted. Only proceed if you trust this repository."));
                 }
-                const result = drift.verify(id, { run, allowUntrustedCommand: allowUntrusted });
+                if (inheritEnv && !run) {
+                    console.error(colorize(!noColor, "yellow", "warning: --inherit-env has no effect without --run (nothing is executed by default)"));
+                }
+                if (run && inheritEnv) {
+                    console.error(colorize(!noColor, "red", "⚠ DANGER: --run --inherit-env passes the full process environment (including credentials) to a repository-provided command."));
+                }
+                const result = drift.verify(id, { run, allowUntrustedCommand: allowUntrusted, inheritEnv });
                 if (json) {
                     console.log(JSON.stringify({
                         status: "ok",
@@ -454,6 +482,13 @@ function run(argv) {
                     console.error(colorize(!noColor, "yellow", "warning: --include-private-prompt exports the full local prompt — treat the output as secret, keep it outside the git repository"));
                 }
                 const drift = Drift.fromCwd(process.cwd());
+                if (!includePrivate) {
+                    const diagnostics = drift.publicManifestDiagnostics();
+                    for (const d of diagnostics) {
+                        const first = d.errors[0];
+                        console.error(colorize(!noColor, "yellow", `drift: warning: skipping malformed public manifest .drift/public/intents/${d.id}.json (${first?.field}: ${first?.message})`));
+                    }
+                }
                 const data = drift.exportJson({ includePrivatePrompt: includePrivate });
                 const out = stringFlag(flags, "out");
                 if (out) {

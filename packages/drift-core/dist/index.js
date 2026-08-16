@@ -1,5 +1,5 @@
-export { Drift, ensureDriftGitignore } from "./engine.js";
-export { PublicStore, buildPublicSummary, genericPublicSummary, sanitizePublicText, signingKeyIdFor, PUBLIC_FILES_MAX, PUBLIC_SUMMARY_MAX, } from "./public.js";
+export { Drift, ensureDriftGitignore, sanitizedVerifyEnv, VERIFY_ENV_ALLOWLIST } from "./engine.js";
+export { PublicStore, buildPublicSummary, genericPublicSummary, parsePublicIntentManifest, readManifestFile, sanitizePublicText, signingKeyIdFor, INTENT_ID_RE, MANIFEST_FILES_MAX, MANIFEST_MAX_BYTES, MANIFEST_SUMMARY_MAX, PUBLIC_FILES_MAX, PUBLIC_SUMMARY_MAX, } from "./public.js";
 export { DRIFT_INTENT_ID_RE, extractDriftIntentIds, parseGitTrailers } from "./trailers.js";
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export { ENCRYPTION_MARKER, canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";

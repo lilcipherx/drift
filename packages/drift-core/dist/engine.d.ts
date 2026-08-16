@@ -5,6 +5,20 @@
 import { type ASTDelta } from "@drift/ast";
 import { type DriftConfig, type PromptMode } from "./config.js";
 import { type IntentRecord, type LogEntry } from "./store.js";
+import { type ManifestValidationError } from "./public.js";
+/**
+ * Environment allowlist for `drift verify --run`. Repository-provided
+ * verification commands are UNTRUSTED code: by default the child process gets
+ * only the non-secret variables needed for ordinary PATH-based tooling on
+ * Linux/macOS/Windows (git, npm, node, shell). Secret-bearing variables
+ * (GITHUB_TOKEN, GH_TOKEN, NPM_TOKEN, NODE_AUTH_TOKEN, DRIFT_MASTER_KEY,
+ * AWS_*, AZURE_*, GOOGLE_*, GCP_*, SSH_AUTH_SOCK, DATABASE_URL, anything
+ * named *_TOKEN / *_SECRET / *PRIVATE_KEY*) are deliberately absent. Full
+ * inheritance requires an explicit `--inherit-env` opt-in.
+ */
+export declare const VERIFY_ENV_ALLOWLIST: readonly ["PATH", "HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "LANG", "LC_ALL", "LC_CTYPE", "CI", "GITHUB_ACTIONS", "SHELL", "TERM", "TERM_PROGRAM", "USER", "LOGNAME", "HOSTNAME", "PWD"];
+/** Build the sanitized child environment from a parent env (default: process). */
+export declare function sanitizedVerifyEnv(parent?: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
 export interface RealizeOptions {
     prompt: string;
     /**
@@ -99,8 +113,10 @@ export type SignerState = "ready" | "read-only" | "missing" | "mismatch";
  *   unverifiable — no verification material available (e.g. no committed key).
  *   untrusted-key— verifies only against a key that is NOT the trust root
  *                  (PR contexts: a replacement key from the same PR).
+ *   malformed    — a public manifest exists but fails strict schema
+ *                  validation (never reported as valid, never executed).
  */
-export type SignatureState = "valid" | "invalid" | "unsigned" | "unverifiable" | "untrusted-key";
+export type SignatureState = "valid" | "invalid" | "unsigned" | "unverifiable" | "untrusted-key" | "malformed";
 export interface DriftStatus {
     initialized: boolean;
     repoRoot: string | null;
@@ -112,6 +128,11 @@ export interface DriftStatus {
     publicIntents?: number;
     /** Local-only private store records (0 in a fresh clone before init). */
     localIntents?: number;
+    /** Tracked manifests that fail strict schema validation (never rendered as valid). */
+    malformedManifests?: {
+        id: string;
+        errors: ManifestValidationError[];
+    }[];
     head?: string | null;
     encryption?: boolean;
     promptMode?: PromptMode;
@@ -211,11 +232,25 @@ export declare class Drift {
     static status(cwd: string): DriftStatus;
     realize(opts: RealizeOptions): RealizeResult;
     /**
-     * Stage ONLY approved public Drift paths for the realize commit: the
-     * ADR-009 gitignore (so `git add .` can never stage private data), the
-     * public key (first introduction), and the new manifest. Config is staged
-     * only when already tracked (respects a user who deliberately untracked it).
-     * Returns the repo-relative paths that were staged.
+     * Stage ONLY approved public Drift paths for the realize commit. The
+     * ADR-009 trust boundary is staged on genuine first introduction only:
+     *
+     *   - `.drift/.gitignore`        — staged when new or unchanged vs HEAD;
+     *                                  a user's unexpected working-tree edit is
+     *                                  left alone (never silently committed).
+     *   - `.drift/public/key.pem`    — staged on first introduction; if the key
+     *                                  is ALREADY tracked and its working-tree
+     *                                  content differs from HEAD, signing is
+     *                                  REFUSED instead of staging a trust-root
+     *                                  replacement the user did not approve.
+     *   - manifest                    — always staged (written by this operation).
+     *   - `.drift/config.toml`       — staged ONLY when byte-identical to the
+     *                                  safe public template (first
+     *                                  introduction). Never staged merely
+     *                                  because it is tracked: that could carry
+     *                                  an unstaged user edit into the commit.
+     *                                  A config the user already staged rides
+     *                                  along in the whole-index commit.
      */
     private stagePublicFiles;
     log(filters?: {
@@ -224,6 +259,15 @@ export declare class Drift {
         file?: string;
         limit?: number;
     }): LogEntry[];
+    /**
+     * Tracked manifests that fail strict schema validation. Consumers render
+     * only valid manifests; this surfaces the rest as an actionable diagnostic
+     * (never a crash, never a silent "valid").
+     */
+    publicManifestDiagnostics(): {
+        id: string;
+        errors: ManifestValidationError[];
+    }[];
     /**
      * Canonical provenance is the committed public manifest (ADR-009) — that is
      * what survives a fresh clone and what the Action/App consume. The private
@@ -275,6 +319,8 @@ export declare class Drift {
         run?: boolean;
         allowUntrustedCommand?: boolean;
         timeoutMs?: number;
+        /** Pass the full process environment to the (untrusted) command. */
+        inheritEnv?: boolean;
     }): VerifyResult;
     replay(intentId: string, opts?: {
         checkout?: boolean;

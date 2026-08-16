@@ -1,4 +1,4 @@
-export { Drift, ensureDriftGitignore } from "./engine.js";
+export { Drift, ensureDriftGitignore, sanitizedVerifyEnv, VERIFY_ENV_ALLOWLIST } from "./engine.js";
 export type {
   BlameResult,
   DoctorCheck,
@@ -15,12 +15,20 @@ export {
   PublicStore,
   buildPublicSummary,
   genericPublicSummary,
+  parsePublicIntentManifest,
+  readManifestFile,
   sanitizePublicText,
   signingKeyIdFor,
+  INTENT_ID_RE,
+  MANIFEST_FILES_MAX,
+  MANIFEST_MAX_BYTES,
+  MANIFEST_SUMMARY_MAX,
   PUBLIC_FILES_MAX,
   PUBLIC_SUMMARY_MAX,
 } from "./public.js";
 export type {
+  ManifestParseResult,
+  ManifestValidationError,
   PublicAgent,
   PublicIntentFile,
   PublicIntentManifestBase,

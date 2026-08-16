@@ -44,6 +44,7 @@ import { DriftError, EXIT, NotInitializedError } from "./errors.js";
 import {
   blameLine,
   blameLines,
+  captureIndexSnapshot,
   checkout,
   commit,
   commitExists,
@@ -53,9 +54,9 @@ import {
   gitIdentity,
   gitLogMessages,
   readFileAt,
+  restoreIndexSnapshot,
   stageAll,
   stagedNameStatus,
-  unstage,
 } from "./git.js";
 import { IntentStore, type IntentRecord, type LogEntry } from "./store.js";
 import { compilePatterns, redact, type RedactResult } from "./redact.js";
@@ -65,6 +66,7 @@ import {
   PUBLIC_FILES_MAX,
   PublicStore,
   signingKeyIdFor,
+  type ManifestValidationError,
   type PublicIntentManifestV2,
   type PublicIntentView,
   type UnsignedPublicIntentView,
@@ -73,6 +75,82 @@ import { extractDriftIntentIds } from "./trailers.js";
 
 /** Default timeout for a `drift verify --run` verification command (ms). */
 const VERIFY_TIMEOUT_MS = 120_000;
+
+/**
+ * Environment allowlist for `drift verify --run`. Repository-provided
+ * verification commands are UNTRUSTED code: by default the child process gets
+ * only the non-secret variables needed for ordinary PATH-based tooling on
+ * Linux/macOS/Windows (git, npm, node, shell). Secret-bearing variables
+ * (GITHUB_TOKEN, GH_TOKEN, NPM_TOKEN, NODE_AUTH_TOKEN, DRIFT_MASTER_KEY,
+ * AWS_*, AZURE_*, GOOGLE_*, GCP_*, SSH_AUTH_SOCK, DATABASE_URL, anything
+ * named *_TOKEN / *_SECRET / *PRIVATE_KEY*) are deliberately absent. Full
+ * inheritance requires an explicit `--inherit-env` opt-in.
+ */
+export const VERIFY_ENV_ALLOWLIST = [
+  // PATH resolution + home for config lookups
+  "PATH",
+  "HOME",
+  "USERPROFILE",
+  // temp dirs (build tools, npm, git)
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  // Windows runtime essentials
+  "SystemRoot",
+  "WINDIR",
+  "ComSpec",
+  "PATHEXT",
+  "PROCESSOR_ARCHITECTURE",
+  "NUMBER_OF_PROCESSORS",
+  "OS",
+  // locale — affects encoding of command output
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  // non-secret CI signals
+  "CI",
+  "GITHUB_ACTIONS",
+  // interactive shell basics
+  "SHELL",
+  "TERM",
+  "TERM_PROGRAM",
+  "USER",
+  "LOGNAME",
+  "HOSTNAME",
+  "PWD",
+] as const;
+
+/** Build the sanitized child environment from a parent env (default: process). */
+export function sanitizedVerifyEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const key of VERIFY_ENV_ALLOWLIST) {
+    const value = parent[key];
+    if (value === undefined) continue;
+    // Belt-and-suspenders: even a future allowlist addition can never leak a
+    // variable that looks like a credential.
+    if (SECRET_ENV_PATTERNS.some((re) => re.test(key))) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Variables that must NEVER reach an untrusted verification child by default. */
+const SECRET_ENV_PATTERNS = [
+  /^GITHUB_TOKEN$/i,
+  /^GH_TOKEN$/i,
+  /^NPM_TOKEN$/i,
+  /^NODE_AUTH_TOKEN$/i,
+  /^DRIFT_MASTER_KEY$/i,
+  /^AWS_/,
+  /^AZURE_/,
+  /^GOOGLE_/,
+  /^GCP_/,
+  /^SSH_AUTH_SOCK$/i,
+  /^DATABASE_URL$/i,
+  /TOKEN/i,
+  /SECRET/i,
+  /PRIVATE_KEY/i,
+];
 
 export interface RealizeOptions {
   prompt: string;
@@ -174,13 +252,16 @@ export type SignerState = "ready" | "read-only" | "missing" | "mismatch";
  *   unverifiable — no verification material available (e.g. no committed key).
  *   untrusted-key— verifies only against a key that is NOT the trust root
  *                  (PR contexts: a replacement key from the same PR).
+ *   malformed    — a public manifest exists but fails strict schema
+ *                  validation (never reported as valid, never executed).
  */
 export type SignatureState =
   | "valid"
   | "invalid"
   | "unsigned"
   | "unverifiable"
-  | "untrusted-key";
+  | "untrusted-key"
+  | "malformed";
 
 export interface DriftStatus {
   initialized: boolean;
@@ -193,6 +274,8 @@ export interface DriftStatus {
   publicIntents?: number;
   /** Local-only private store records (0 in a fresh clone before init). */
   localIntents?: number;
+  /** Tracked manifests that fail strict schema validation (never rendered as valid). */
+  malformedManifests?: { id: string; errors: ManifestValidationError[] }[];
   head?: string | null;
   encryption?: boolean;
   promptMode?: PromptMode;
@@ -537,6 +620,7 @@ export class Drift {
       // store (e.g. right after `drift init` in a fresh clone) must never
       // shadow them, so `intents` is the MERGED count, with the public and
       // local-only parts reported separately.
+      const { errors: manifestErrors } = drift.publicStore.listWithErrors();
       const publicIntents = drift.publicStore.list().length;
       const localIntents = drift.store ? drift.store.allRows().length : 0;
       const publicProvenance = drift.publicStore.exists();
@@ -546,6 +630,7 @@ export class Drift {
         intents: drift.log({}).length,
         publicIntents,
         localIntents,
+        malformedManifests: manifestErrors.length > 0 ? manifestErrors : undefined,
         head: drift.store?.getHead() ?? null,
         encryption: drift.config.encryption.enabled,
         promptMode: drift.config.prompts.mode,
@@ -577,6 +662,20 @@ export class Drift {
     if (!prompt) {
       throw new DriftError("realize requires a prompt: drift realize -p \"what did you change and why\"");
     }
+
+    // Capture the user's staged state BEFORE Drift stages anything, so a
+    // syntax/analysis failure can restore the index exactly (staged files,
+    // partially staged hunks, intent-to-add entries, renames, deletions,
+    // assume-unchanged/skip-worktree flags). Never a broad `git reset` that
+    // discards the user's selections. Refuse to run against an unmerged index
+    // (a conflict in progress) before any write happens.
+    const unmerged = execGit(this.repoRoot, ["ls-files", "-u"], true);
+    if (unmerged.status === 0 && unmerged.stdout.trim().length > 0) {
+      throw new DriftError(
+        "the git index has unmerged (conflict) entries — resolve the merge conflict and run drift realize again",
+      );
+    }
+    const indexSnapshot = captureIndexSnapshot(this.repoRoot);
 
     stageAll(this.repoRoot, opts.files);
     const staged = stagedNameStatus(this.repoRoot);
@@ -637,15 +736,27 @@ export class Drift {
     }
 
     if (syntaxErrors.length > 0) {
-      unstage(this.repoRoot);
+      // Restore the user's exact pre-Drift index state — never `git reset`
+      // wholesale, which would discard their staged selections.
+      restoreIndexSnapshot(this.repoRoot, indexSnapshot);
       throw new DriftError(
-        `Syntax error — commit aborted, no history was polluted:\n  - ${syntaxErrors
+        `Syntax error — commit aborted, no history was polluted (your staged changes were preserved):\n  - ${syntaxErrors
           .map((e) => `${e.file}: ${e.message}`)
           .join("\n  - ")}\nFix the code and run realize again.`,
         EXIT.SYNTAX,
       );
     }
 
+    // Any failure BEFORE the git commit (redaction, store access, signing,
+    // manifest write, staging public files) must restore the user's index
+    // exactly and remove only the manifest this operation generated — never
+    // the user's source selections. Once the commit lands (phase
+    // "committing"/"recorded") the index restore is NOT performed: the source
+    // changes stay staged for a safe retry and a landed commit is never
+    // rewritten.
+    let manifestPath: string | null = null;
+    let phase: "building" | "committing" | "recorded" = "building";
+    try {
     const redactionResult: RedactResult = redact(prompt, this.redactionPatterns);
     const safePrompt = redactionResult.text;
     const safeState = opts.agentState
@@ -682,8 +793,12 @@ export class Drift {
     const explicitSummary = opts.summary
       ? buildPublicSummary(redact(opts.summary, this.redactionPatterns).text)
       : "";
-    const publicSummary =
-      explicitSummary || (mode === "none" ? "" : genericPublicSummary(id, { fileCount: deltas.length }));
+    // The public summary is NEVER empty: without an explicit `--summary` a
+    // generic non-prompt fallback is used even under `prompts.mode = "none"`
+    // ("none" means "do not persist the raw prompt" — it does not require an
+    // empty public provenance record). The manifest validator rejects empty
+    // summaries, so this also guarantees every written manifest is renderable.
+    const publicSummary = explicitSummary || genericPublicSummary(id, { fileCount: deltas.length });
     const storePrompt = mode !== "none";
     const storedPrompt = storePrompt
       ? encKey
@@ -756,7 +871,7 @@ export class Drift {
     // carries the source change also carries its provenance (no second manual
     // `git add . && git commit` needed). The signature covers the V2 payload
     // which has no commit SHA, so the manifest is stable once committed.
-    const manifestPath = this.publicStore.manifestPath(id);
+    manifestPath = this.publicStore.manifestPath(id);
     this.publicStore.write(publicView, this.privateKeyPem);
 
     // Stage ONLY the approved public paths — never .drift/private, objects,
@@ -764,6 +879,7 @@ export class Drift {
     // interpolation.
     const stagedPublic = this.stagePublicFiles(id);
 
+    phase = "committing";
     let gitSha: string;
     try {
       gitSha = commit(this.repoRoot, commitMessage);
@@ -771,9 +887,9 @@ export class Drift {
       // Commit failed: unstage + remove ONLY the manifest this operation just
       // generated (and only if we staged it). The user's source changes stay
       // staged; the private object record is preserved for a safe retry.
-      execGit(this.repoRoot, ["reset", "-q", "--", relPath(this.repoRoot, manifestPath).replace(/\\/g, "/")], true);
+      execGit(this.repoRoot, ["reset", "-q", "--", relPath(this.repoRoot, manifestPath!).replace(/\\/g, "/")], true);
       try {
-        rmSync(manifestPath, { force: true });
+        rmSync(manifestPath!, { force: true });
       } catch {
         /* best-effort */
       }
@@ -782,6 +898,7 @@ export class Drift {
       );
     }
 
+    phase = "recorded";
     const intent: IntentRecord = {
       ...intentBase,
       gitCommitSha: gitSha,
@@ -801,25 +918,92 @@ export class Drift {
 
     void stagedPublic; // staged paths are intentionally not returned
     return { gitSha, intentId: id, astDelta: deltas, redactions: redactionResult.count };
+    } catch (err) {
+      // Only failures BEFORE the commit restore the index. Once the commit
+      // landed, the source changes must stay staged and the commit is never
+      // rewritten (the commit/insert failure paths above already handled
+      // their own cleanup).
+      if (phase === "building") {
+        restoreIndexSnapshot(this.repoRoot, indexSnapshot);
+        if (manifestPath) {
+          try {
+            rmSync(manifestPath, { force: true });
+          } catch {
+            /* best-effort */
+          }
+        }
+        throw err instanceof DriftError
+          ? err
+          : new DriftError(
+              `realize aborted before committing — your staged changes were preserved: ${err instanceof Error ? err.message : String(err)}`,
+            );
+      }
+      throw err;
+    }
   }
 
   /**
-   * Stage ONLY approved public Drift paths for the realize commit: the
-   * ADR-009 gitignore (so `git add .` can never stage private data), the
-   * public key (first introduction), and the new manifest. Config is staged
-   * only when already tracked (respects a user who deliberately untracked it).
-   * Returns the repo-relative paths that were staged.
+   * Stage ONLY approved public Drift paths for the realize commit. The
+   * ADR-009 trust boundary is staged on genuine first introduction only:
+   *
+   *   - `.drift/.gitignore`        — staged when new or unchanged vs HEAD;
+   *                                  a user's unexpected working-tree edit is
+   *                                  left alone (never silently committed).
+   *   - `.drift/public/key.pem`    — staged on first introduction; if the key
+   *                                  is ALREADY tracked and its working-tree
+   *                                  content differs from HEAD, signing is
+   *                                  REFUSED instead of staging a trust-root
+   *                                  replacement the user did not approve.
+   *   - manifest                    — always staged (written by this operation).
+   *   - `.drift/config.toml`       — staged ONLY when byte-identical to the
+   *                                  safe public template (first
+   *                                  introduction). Never staged merely
+   *                                  because it is tracked: that could carry
+   *                                  an unstaged user edit into the commit.
+   *                                  A config the user already staged rides
+   *                                  along in the whole-index commit.
    */
   private stagePublicFiles(intentId: string): string[] {
-    const candidates = [
-      join(this.driftDir, ".gitignore"),
-      this.publicStore.keyPath,
-      this.publicStore.manifestPath(intentId),
-      join(this.driftDir, "config.toml"),
+    const configAbs = join(this.driftDir, "config.toml");
+    const configIsUntouchedTemplate =
+      existsSync(configAbs) && readFileSync(configAbs, "utf8") === CONFIG_TEMPLATE;
+    const rel = (abs: string): string => relPath(this.repoRoot, abs).replace(/\\/g, "/");
+    const tracked = (abs: string): boolean =>
+      execGit(this.repoRoot, ["ls-files", "--error-unmatch", "--", rel(abs)], true).status === 0;
+    const changedVsHead = (abs: string): boolean =>
+      execGit(this.repoRoot, ["diff", "--quiet", "HEAD", "--", rel(abs)], true).status !== 0;
+
+    const keyAbs = this.publicStore.keyPath;
+    // A tracked trust-root file with unexpected working-tree changes must
+    // never be silently staged: that would swap the repository's trust root
+    // without an explicit rotation.
+    if (tracked(keyAbs) && changedVsHead(keyAbs)) {
+      throw new DriftError(
+        `.drift/public/key.pem is tracked but its working-tree content differs from HEAD — refusing to stage an unapproved trust-root change. Revert or commit the key change deliberately before running drift realize.`,
+      );
+    }
+
+    const gitignoreAbs = join(this.driftDir, ".gitignore");
+    const candidates: { abs: string; always: boolean }[] = [
+      { abs: gitignoreAbs, always: true }, // staged when new or unchanged (see filter below)
+      { abs: keyAbs, always: true },
+      { abs: this.publicStore.manifestPath(intentId), always: true },
+      { abs: configAbs, always: configIsUntouchedTemplate },
     ];
     const toStage = candidates
-      .filter((p) => existsSync(p))
-      .map((p) => relPath(this.repoRoot, p).replace(/\\/g, "/"));
+      .filter((c) => {
+        if (!existsSync(c.abs)) return false;
+        if (c.abs === configAbs) return c.always; // only the untouched template
+        if (c.abs === gitignoreAbs) {
+          // Stage the gitignore on first introduction; leave an unexpected
+          // user edit (tracked + changed) alone.
+          return !tracked(c.abs) || !changedVsHead(c.abs);
+        }
+        // key and manifest: key already passed the tracked+changed refusal;
+        // the manifest was just written by this operation.
+        return true;
+      })
+      .map((c) => rel(c.abs));
     if (toStage.length > 0) execGit(this.repoRoot, ["add", "--", ...toStage]);
     return toStage;
   }
@@ -837,6 +1021,15 @@ export class Drift {
     entries.sort((a, b) => b.timestamp - a.timestamp);
     const limit = filters.limit !== undefined ? safeClamp(filters.limit, 100) : 100;
     return entries.slice(0, limit);
+  }
+
+  /**
+   * Tracked manifests that fail strict schema validation. Consumers render
+   * only valid manifests; this surfaces the rest as an actionable diagnostic
+   * (never a crash, never a silent "valid").
+   */
+  publicManifestDiagnostics(): { id: string; errors: ManifestValidationError[] }[] {
+    return this.publicStore.listWithErrors().errors;
   }
 
   /**
@@ -1096,11 +1289,34 @@ export class Drift {
    */
   verify(
     intentId: string,
-    opts: { run?: boolean; allowUntrustedCommand?: boolean; timeoutMs?: number } = {},
+    opts: {
+      run?: boolean;
+      allowUntrustedCommand?: boolean;
+      timeoutMs?: number;
+      /** Pass the full process environment to the (untrusted) command. */
+      inheritEnv?: boolean;
+    } = {},
   ): VerifyResult {
     const view = this.publicStore.getById(intentId);
+    const diagnostics = this.publicStore.getDiagnostics(intentId);
     const record = view ? null : (this.store ? this.store.getById(intentId) : null);
-    if (!record && !view) throw new DriftError(`Intent not found: ${intentId}`);
+    if (!record && !view && !diagnostics) throw new DriftError(`Intent not found: ${intentId}`);
+    // A malformed public manifest is refused outright — never verified
+    // against the local record (which could mask the corruption) and never
+    // executed.
+    if (!view && diagnostics && diagnostics.length > 0) {
+      const first = diagnostics[0] ?? { field: "$", message: "invalid manifest" };
+      return {
+        intentId,
+        verifyCmd: null,
+        signature: "malformed",
+        status: "refused",
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        message: `malformed public manifest (${first.field}: ${first.message}). Fix or remove .drift/public/intents/${intentId}.json before verifying.`,
+      };
+    }
     const verifyCmd = record?.verifyCmd ?? view?.verification ?? null;
     const sig = this.signatureState(intentId, view, record);
     const base = {
@@ -1135,8 +1351,11 @@ export class Drift {
     }
     // Executes with the user's shell ONLY after explicit authorization. The
     // timeout bounds runaway commands; output is captured, never logged as
-    // secrets; no env is inherited from the invoking shell beyond the process
-    // environment (no implicit GitHub/npm tokens are injected).
+    // secrets. By DEFAULT the child receives a SANITIZED environment (an
+    // allowlist of non-secret variables — never GITHUB_TOKEN / NPM_TOKEN /
+    // DRIFT_MASTER_KEY / AWS_* etc.); passing the full process environment
+    // requires the explicit `--inherit-env` opt-in, which the CLI gates
+    // behind a loud warning.
     const res = spawnSync(verifyCmd, {
       cwd: this.repoRoot,
       shell: true,
@@ -1144,6 +1363,7 @@ export class Drift {
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true,
       timeout: opts.timeoutMs ?? VERIFY_TIMEOUT_MS,
+      env: opts.inheritEnv ? undefined : sanitizedVerifyEnv(),
     });
     const errno = res.error as NodeJS.ErrnoException | undefined;
     const timedOut = errno?.code === "ETIMEDOUT" || res.signal === "SIGTERM";
@@ -1410,7 +1630,8 @@ export class Drift {
       );
     }
     const { byId: commitById } = this.intentCommitIndex();
-    const entries = this.publicStore.list().map((v) => ({
+    const { views, errors } = this.publicStore.listWithErrors();
+    const entries = views.map((v) => ({
       id: v.id,
       gitSha: commitById.get(v.id) ?? (v.schemaVersion === 1 ? v.commit : null) ?? null,
       authorType: v.agent?.type ?? "HUMAN",
@@ -1420,11 +1641,21 @@ export class Drift {
       timestamp: new Date(v.timestamp).toISOString(),
       files: (v.files ?? []).map((f) => ({ path: f.path, mutationType: f.mutationType, summary: f.summary ?? null })),
     }));
-    return JSON.stringify(
-      { schemaVersion: 2, containsPrivatePrompts: false, exportedAt, intents: entries },
-      null,
-      2,
-    );
+    const out: Record<string, unknown> = {
+      schemaVersion: 2,
+      containsPrivatePrompts: false,
+      exportedAt,
+      intents: entries,
+    };
+    // Malformed tracked manifests are reported (never rendered as valid, and
+    // never silently dropped without a trace).
+    if (errors.length > 0) {
+      out.malformed = errors.map((e) => ({
+        id: e.id,
+        errors: e.errors.map((err) => `${err.field}: ${err.message}`),
+      }));
+    }
+    return JSON.stringify(out, null, 2);
   }
 
   verifyIntentSignature(intentId: string): { ok: boolean; detail: string; state: SignatureState } {
@@ -1451,9 +1682,29 @@ export class Drift {
       if (!pub) return { state: "unverifiable", detail: "no committed public key in this checkout" };
       if (!view.signature) return { state: "unsigned", detail: "manifest has no signature" };
       const valid = this.publicStore.verifySignature(view);
-      return valid
-        ? { state: "valid", detail: "signature verifies against the committed public key" }
-        : { state: "invalid", detail: "signature does not verify against the committed public key" };
+      if (!valid) {
+        return { state: "invalid", detail: "signature does not verify against the committed public key" };
+      }
+      // A cryptographically valid signature with a mismatched `signingKeyId`
+      // must not be reported as `valid`: the manifest's declared key id does
+      // not match the fingerprint of the trust root that actually verified.
+      if (view.schemaVersion === 2 && view.signingKeyId !== signingKeyIdFor(pub)) {
+        return {
+          state: "invalid",
+          detail: "signature verifies but manifest signingKeyId does not match the committed key fingerprint",
+        };
+      }
+      return { state: "valid", detail: "signature verifies against the committed public key" };
+    }
+    // A manifest file exists but fails strict schema validation — never fall
+    // back to the local record (which could mask the corruption), never
+    // report it as valid.
+    const diagnostics = this.publicStore.getDiagnostics(intentId);
+    if (diagnostics && diagnostics.length > 0) {
+      return {
+        state: "malformed",
+        detail: `malformed public manifest: ${diagnostics[0]?.field}: ${diagnostics[0]?.message}`,
+      };
     }
     if (record && this.store) {
       const obj = this.store.readObjectRecord(record.objectPath);

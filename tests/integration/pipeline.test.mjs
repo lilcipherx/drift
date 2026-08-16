@@ -636,9 +636,14 @@ test("prompt modes: none stores no prompt anywhere (db, objects, commit)", () =>
   const msg = git(repo, ["log", "-1", "--format=%B"]);
   assert.ok(!msg.includes("top secret prompt"), msg);
 
-  // none mode: nothing derived from the prompt anywhere — summary is empty
+  // none mode: nothing derived from the prompt anywhere — the public summary
+  // is the generic NON-PROMPT fallback (never empty, never prompt text)
   const logSafe = parseJson(run(repo, ["log", "--json"]).stdout);
-  assert.equal(logSafe.intents[0].summary, "");
+  assert.ok(
+    logSafe.intents[0].summary.startsWith("Drift intent "),
+    `none mode must use the generic non-prompt summary, got: ${logSafe.intents[0].summary}`,
+  );
+  assert.ok(!logSafe.intents[0].summary.includes("top secret"), logSafe.intents[0].summary);
   const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
   assert.equal(log.intents[0].prompt, "");
 
@@ -650,7 +655,11 @@ test("prompt modes: none stores no prompt anywhere (db, objects, commit)", () =>
   const manifestDir = join(repo, ".drift", "public", "intents");
   const manifestFiles = readdirSync(manifestDir).filter((f) => f.endsWith(".json"));
   const manifest = JSON.parse(readFileSync(join(manifestDir, manifestFiles[0]), "utf8"));
-  assert.equal(manifest.summary, "", "none mode must persist no prompt-derived summary");
+  assert.ok(
+    manifest.summary.startsWith("Drift intent "),
+    `none mode persists a generic non-prompt summary, got: ${manifest.summary}`,
+  );
+  assert.ok(!manifest.summary.includes("top secret"), manifest.summary);
 });
 
 test("prompt modes: secrets are redacted before the summary reaches the commit message", () => {

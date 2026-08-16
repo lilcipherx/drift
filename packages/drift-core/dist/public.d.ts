@@ -24,6 +24,60 @@
 export declare const PUBLIC_SUMMARY_MAX = 200;
 /** Maximum number of files recorded in a public manifest. */
 export declare const PUBLIC_FILES_MAX = 50;
+/** Max raw JSON size of one manifest (resource limit). */
+export declare const MANIFEST_MAX_BYTES: number;
+/** Max accepted `summary` length after sanitization. */
+export declare const MANIFEST_SUMMARY_MAX = 2000;
+/** Max accepted `files` entries (engine writes at most PUBLIC_FILES_MAX). */
+export declare const MANIFEST_FILES_MAX = 50;
+/** Max path length per file entry. */
+export declare const MANIFEST_FILE_PATH_MAX = 1024;
+/** Max per-file summary length. */
+export declare const MANIFEST_FILE_SUMMARY_MAX = 500;
+/** Max length of bounded metadata strings (agent identifier, model). */
+export declare const MANIFEST_META_MAX = 200;
+/** Max length of the recorded `verification` command string. */
+export declare const MANIFEST_VERIFY_MAX = 1000;
+/** Max length of a base64 signature. */
+export declare const MANIFEST_SIGNATURE_MAX = 4096;
+/** Max number of `symbols` entries when present. */
+export declare const MANIFEST_SYMBOLS_MAX = 200;
+/** Max length of one symbol string. */
+export declare const MANIFEST_SYMBOL_MAX = 300;
+/** Upper bound for `timestamp` (Date.MAX_VALUE) — rejects absurd values. */
+export declare const MANIFEST_TIMESTAMP_MAX = 8640000000000000;
+/** Max nesting depth walked by the validator (bounded recursion). */
+export declare const MANIFEST_MAX_DEPTH = 24;
+/** Drift intent id format (mirrors the git-trailer regex everywhere). */
+export declare const INTENT_ID_RE: RegExp;
+export interface ManifestValidationError {
+    /** Dot-path of the offending field (e.g. `files[3].path`). */
+    field: string;
+    message: string;
+}
+export type ManifestParseResult = {
+    ok: true;
+    value: PublicIntentView;
+} | {
+    ok: false;
+    errors: ManifestValidationError[];
+};
+/**
+ * Strict, versioned public-manifest parser. Returns the validated manifest or
+ * a bounded list of actionable validation errors. Never throws on hostile
+ * input: the raw JSON byte size is capped, every field is type-checked with
+ * resource limits, ids must match the filename/request, and V2 requires a
+ * syntactically valid `signingKeyId`. Cryptographic checks (signature,
+ * `signingKeyId` fingerprint match) are performed by the callers that know
+ * the trust root.
+ */
+export declare function parsePublicIntentManifest(json: unknown, opts?: {
+    expectedId?: string;
+    sourceName?: string;
+}): ManifestParseResult;
+/** Read + strictly parse one manifest file; null on parse failure. */
+export declare function readManifestFile(path: string): ManifestParseResult;
+export declare function basename(p: string, suffix?: string): string;
 export interface PublicIntentFile {
     path: string;
     mutationType: string;
@@ -124,8 +178,34 @@ export declare class PublicStore {
     /** Sign a public view with the repo key and persist it (V2 schema). */
     write(view: UnsignedPublicIntentView, privateKeyPem: string): PublicIntentView;
     getById(id: string): PublicIntentView | null;
-    /** Every manifest, newest first (timestamp desc). */
+    /**
+     * Validation errors for `id`'s manifest, or null when the file is missing
+     * or clean. Lets consumers distinguish "malformed" from "missing" (a
+     * malformed manifest must never silently fall back to the private record
+     * or be reported as valid).
+     */
+    getDiagnostics(id: string): ManifestValidationError[] | null;
+    /** Parse one manifest strictly (id must match its filename). */
+    private parseFor;
+    /**
+     * Every VALID manifest, newest first (timestamp desc). Malformed manifests
+     * are excluded from rendering but surfaced through `listWithErrors` so
+     * status/log/export can report them as an actionable diagnostic instead of
+     * crashing or silently treating them as valid.
+     */
     list(): PublicIntentView[];
+    /**
+     * All manifests with per-file validation errors, newest first. Never
+     * throws on hostile files; oversized/unparseable files are reported as
+     * diagnostics rather than loaded.
+     */
+    listWithErrors(): {
+        views: PublicIntentView[];
+        errors: {
+            id: string;
+            errors: ManifestValidationError[];
+        }[];
+    };
     /**
      * Legacy V1-only association: find a V1 manifest whose embedded `commit`
      * field matches. V2 manifests never embed a commit SHA — their association
@@ -138,9 +218,15 @@ export declare class PublicStore {
     verifySignature(view: PublicIntentView): boolean;
 }
 /**
- * Short fingerprint of an Ed25519 public key (first 16 hex chars of its
- * SHA-256). Used as `signingKeyId` in V2 manifests and by `drift status` /
- * key-state output — never the private key material.
+ * Canonical short fingerprint of an Ed25519 public key (first 16 hex chars
+ * of the SHA-256 of its SPKI DER subject-public-key bytes). Hashing the DER
+ * bytes — NOT the textual PEM — means LF/CRLF line endings and harmless
+ * surrounding whitespace can never produce a different key identity, and two
+ * PEM encodings of the same key always agree. Used as `signingKeyId` in V2
+ * manifests and by `drift status` / key-state output — never the private key
+ * material. A malformed PEM falls back to a stable hash of the text so the
+ * identifier is still deterministic (consumers treat such a key as
+ * unverifiable, never trusted).
  */
 export declare function signingKeyIdFor(publicKeyPem: string): string;
 //# sourceMappingURL=public.d.ts.map

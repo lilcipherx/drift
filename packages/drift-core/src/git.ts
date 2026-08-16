@@ -4,8 +4,9 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, rmSync, mkdtempSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { DriftError } from "./errors.js";
 
 export interface GitResult {
@@ -71,8 +72,93 @@ export function stageAll(repoRoot: string, files?: string[]): void {
   execGit(repoRoot, ["add", "-A", "--", ".", ":(exclude).drift"]);
 }
 
-export function unstage(repoRoot: string): void {
-  execGit(repoRoot, ["reset"], true);
+// ---------------------------------------------------------------------------
+// Index snapshot / restore — Drift must never destroy the user's staged state
+// ---------------------------------------------------------------------------
+
+/**
+ * Absolute path of the git index file for a repository (`git rev-parse
+ * --git-path index`). Falls back to plain `--git-path` on older git that
+ * lacks `--path-format=absolute`.
+ */
+export function gitIndexPath(repoRoot: string): string | null {
+  const abs = execGit(repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"], true);
+  if (abs.status === 0 && abs.stdout.trim()) return abs.stdout.trim();
+  const plain = execGit(repoRoot, ["rev-parse", "--git-path", "index"], true);
+  if (plain.status !== 0 || !plain.stdout.trim()) return null;
+  const p = plain.stdout.trim();
+  return resolve(repoRoot, p);
+}
+
+/**
+ * A BYTE-FOR-BYTE backup of the git index file taken BEFORE Drift stages
+ * anything. Copying the actual index file (not a tree, not a cached diff)
+ * preserves every bit of staged state exactly: partially staged hunks,
+ * intent-to-add entries, renames, deletions, mode changes, assume-unchanged /
+ * skip-worktree flags and conflict stages — a `git write-tree`/`read-tree`
+ * round-trip or a patch replay cannot guarantee all of that.
+ *
+ * `backupPath` is null when NO index existed before Drift (a fresh repo with
+ * nothing staged) — restoring then means removing the index Drift created.
+ */
+export interface IndexSnapshot {
+  backupPath: string | null;
+}
+
+function indexLockExists(repoRoot: string): string | null {
+  const indexPath = gitIndexPath(repoRoot);
+  if (!indexPath) return null;
+  const lockPath = `${indexPath}.lock`;
+  return existsSync(lockPath) ? lockPath : null;
+}
+
+export function captureIndexSnapshot(repoRoot: string): IndexSnapshot {
+  const indexPath = gitIndexPath(repoRoot);
+  if (!indexPath) {
+    throw new DriftError("cannot determine the git index path — is this a git repository?");
+  }
+  const lock = indexLockExists(repoRoot);
+  if (lock) {
+    throw new DriftError(
+      `git index.lock exists (${lock}) — another git process may be running. Wait for it to finish, then run drift realize again.`,
+    );
+  }
+  if (!existsSync(indexPath)) return { backupPath: null };
+  const dir = mkdtempSync(join(tmpdir(), "drift-idx-"));
+  const backupPath = join(dir, "index");
+  copyFileSync(indexPath, backupPath);
+  return { backupPath };
+}
+
+/**
+ * Restore the index captured by `captureIndexSnapshot`. Safe to call once.
+ * Never overwrites another git process's lock; never touches the worktree.
+ */
+export function restoreIndexSnapshot(repoRoot: string, snap: IndexSnapshot): void {
+  const indexPath = gitIndexPath(repoRoot);
+  if (!indexPath) return; // repo vanished mid-operation — nothing we can do
+  const lock = indexLockExists(repoRoot);
+  if (lock) {
+    throw new DriftError(
+      `git index.lock exists (${lock}) — cannot restore the index while another git process is running. Drift's staging was NOT rolled back.`,
+    );
+  }
+  if (!snap.backupPath) {
+    // No index existed before Drift — remove the one Drift's git commands
+    // created so the repository is byte-identical to the pre-Drift state.
+    if (existsSync(indexPath)) rmSync(indexPath, { force: true });
+    return;
+  }
+  // Atomic replace in the same directory (fs.rename replaces atomically on
+  // POSIX and Windows). Never a plain overwrite of a live index.
+  const tmp = `${indexPath}.drift-restore-${process.pid}`;
+  copyFileSync(snap.backupPath, tmp);
+  renameSync(tmp, indexPath);
+  try {
+    rmSync(dirname(snap.backupPath), { recursive: true, force: true });
+  } catch {
+    /* best-effort cleanup */
+  }
 }
 
 export interface StagedFile {
