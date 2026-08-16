@@ -14,7 +14,10 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const require_ = createRequire(import.meta.url);
 
@@ -550,11 +553,97 @@ export function computeDelta(
   return { filePath, pre: preList, post: postList, changes };
 }
 
-function loadTypeScript(): typeof import("typescript") | null {
+/**
+ * The optional TypeScript compiler. Two generations are supported:
+ *   - TypeScript ≤ 5.x — ships the full JS API (`transpileModule`, …) which
+ *     `drift realize` uses for real parse-only validation.
+ *   - TypeScript 7.x — the native (Go) compiler: the JS API is REMOVED and
+ *     only the `tsc` CLI exists. Validation falls back to a `tsc --noCheck`
+ *     subprocess on a temp file, which reports parse errors only (type
+ *     errors never block commits, matching the transpile-only contract).
+ * The types are deliberately loose so this package compiles against both.
+ */
+interface TsApi {
+  transpileModule(
+    source: string,
+    options: {
+      reportDiagnostics: boolean;
+      compilerOptions: { allowJs: boolean; target: number; jsx: number };
+    },
+  ): { diagnostics?: { category: number; start?: number; messageText: string }[] };
+  ScriptTarget: Record<string, number>;
+  JsxEmit: Record<string, number>;
+  DiagnosticCategory: { Error: number };
+  flattenDiagnosticMessageText(messageText: string, newline: string): string;
+}
+
+function loadTypeScript(): TsApi | null {
   try {
-    return require_("typescript") as typeof import("typescript");
+    const ts = require_("typescript") as unknown as Partial<TsApi>;
+    if (typeof ts.transpileModule !== "function") return null;
+    return ts as TsApi;
   } catch {
     return null;
+  }
+}
+
+/** Path of the `tsc` CLI binary of the installed typescript package. */
+function tscBinPath(): string | null {
+  try {
+    // typescript 7 does not export "./bin/tsc", so resolve through
+    // "./package.json" (exported by both 5.x and 7.x) and read the bin field.
+    const pkgJsonPath = require_.resolve("typescript/package.json");
+    const pkg = require_("typescript/package.json") as { bin?: { tsc?: string } | string };
+    const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.tsc;
+    if (!bin) return null;
+    return join(dirname(pkgJsonPath), bin);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse-only TS/JS validation via the native `tsc --noCheck` CLI (TypeScript
+ * 7, where the JS compiler API no longer exists). `--noCheck` reports syntax
+ * errors but skips type checking — type errors never block a commit. Runs on
+ * a temp file so the repo's own tsconfig cannot interfere (`--ignoreConfig`).
+ */
+function validateSyntaxWithTscCli(source: string): string | null {
+  const tscPath = tscBinPath();
+  if (!tscPath) return null;
+  const dir = mkdtempSync(join(tmpdir(), "drift-ast-"));
+  // A .tsx temp file accepts both plain TS/JS and JSX under --jsx preserve.
+  const file = join(dir, "syntax-check.tsx");
+  writeFileSync(file, source, "utf8");
+  try {
+    const res = spawnSync(
+      process.execPath,
+      [
+        tscPath,
+        "--ignoreConfig",
+        "--noCheck",
+        "--allowJs",
+        "--jsx",
+        "preserve",
+        "--target",
+        "es2022",
+        "--noEmit",
+        file,
+      ],
+      { encoding: "utf8", timeout: 30_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+    );
+    if (res.status === 0) return null;
+    const out = `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+    // `path(line,col): error TSxxxx: message` — report the first parse error
+    const m = /\((\d+),\d+\): error TS\d+: (.+)$/m.exec(out.trim());
+    if (m) return `${m[2]!.trim()} (line ${m[1]})`;
+    return out.trim().split("\n")[0] || "invalid TypeScript/JavaScript";
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
   }
 }
 
@@ -563,7 +652,8 @@ function loadTypeScript(): typeof import("typescript") | null {
  * code never enters history, PRD §9.2).
  *
  * TypeScript/JavaScript: parsed by the TypeScript compiler (transpile only —
- * no typechecking, so type errors never block commits).
+ * no typechecking, so type errors never block commits). Works with the TS 5.x
+ * JS API and, when that is unavailable (TS 7 native), via `tsc --noCheck`.
  * Python: parsed with `ast` when a python interpreter is available.
  *
  * Returns a human-readable message for the first syntax error, or null when
@@ -575,13 +665,13 @@ export function validateSyntax(
 ): string | null {
   if (language === "typescript") {
     const ts = loadTypeScript();
-    if (!ts) return null; // cannot check — structural checks in parseSymbols still apply
+    if (!ts) return validateSyntaxWithTscCli(source); // TS 7 native compiler
     const result = ts.transpileModule(source, {
       reportDiagnostics: true,
       compilerOptions: {
         allowJs: true,
-        target: ts.ScriptTarget.ES2022,
-        jsx: ts.JsxEmit.Preserve,
+        target: ts.ScriptTarget.ES2022!,
+        jsx: ts.JsxEmit.Preserve!,
       },
     });
     const errors = (result.diagnostics ?? []).filter(
