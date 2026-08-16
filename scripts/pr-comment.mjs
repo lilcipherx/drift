@@ -78,6 +78,17 @@ export function validateManifest(json, { expectedId } = {}) {
     push("schemaVersion", `unsupported schema version ${String(sv)}`);
     return fail();
   }
+  // Strict unknown-field policy (mirrors @drift/core): every semantically
+  // accepted field is enumerated; anything else is rejected, so an unknown
+  // field can never silently join the signed payload.
+  const ALLOWED_FIELDS = new Set(
+    sv === 2
+      ? ["schemaVersion", "id", "summary", "timestamp", "signature", "agent", "model", "verification", "files", "signingKeyId"]
+      : ["schemaVersion", "id", "summary", "timestamp", "signature", "agent", "model", "verification", "files", "commit"],
+  );
+  for (const key of Object.keys(json)) {
+    if (!ALLOWED_FIELDS.has(key)) push(key, `unknown field (schema v${sv})`);
+  }
   const id = json.id;
   if (typeof id !== "string" || !INTENT_ID_RE.test(id)) {
     push("id", "invalid Drift intent id");
@@ -111,6 +122,9 @@ export function validateManifest(json, { expectedId } = {}) {
     } else {
       if (typeof json.agent.type !== "string" || json.agent.type.length === 0 || json.agent.type.length > 20) push("agent.type", "invalid");
       if (typeof json.agent.identifier !== "string" || json.agent.identifier.length > MANIFEST_META_MAX) push("agent.identifier", "invalid");
+      for (const key of Object.keys(json.agent)) {
+        if (key !== "type" && key !== "identifier") push(`agent.${key}`, "unknown field");
+      }
     }
   }
   if (json.model !== undefined && (typeof json.model !== "string" || json.model.length > MANIFEST_META_MAX)) push("model", "invalid");
@@ -126,6 +140,9 @@ export function validateManifest(json, { expectedId } = {}) {
       if (typeof f.path !== "string" || f.path.length === 0 || f.path.length > MANIFEST_FILE_PATH_MAX) push(`files[${i}].path`, "invalid");
       if (typeof f.mutationType !== "string" || !MUTATION_ENUM.has(f.mutationType)) push(`files[${i}].mutationType`, "unsupported");
       if (f.summary !== undefined && (typeof f.summary !== "string" || f.summary.length > MANIFEST_FILE_SUMMARY_MAX)) push(`files[${i}].summary`, "invalid");
+      for (const key of Object.keys(f)) {
+        if (key !== "path" && key !== "mutationType" && key !== "summary") push(`files[${i}].${key}`, "unknown field");
+      }
     });
   }
   if (sv === 1) {
@@ -394,9 +411,35 @@ function looksLikePublicKey(pem) {
   return typeof pem === "string" && pem.includes("PUBLIC KEY");
 }
 
-/** Short sha256 fingerprint of a PEM public key (first 16 hex chars). */
+/**
+ * Canonical short fingerprint of an Ed25519 public key: the first 16 hex
+ * chars of the SHA-256 of its SPKI DER bytes — NOT the textual PEM — exactly
+ * mirroring @drift/core `signingKeyIdFor`. LF/CRLF line endings and harmless
+ * surrounding whitespace can never change a key's identity, and a real
+ * Core-generated V2 manifest always matches. Malformed PEM falls back to a
+ * stable hash of the text (consumers treat such a key as unverifiable).
+ */
 export function signingKeyIdFor(publicKeyPem) {
-  return createHash("sha256").update(String(publicKeyPem ?? "").trim(), "utf8").digest("hex").slice(0, 16);
+  try {
+    const key = createPublicKey(String(publicKeyPem ?? "").trim());
+    const der = key.export({ type: "spki", format: "der" });
+    return createHash("sha256").update(der).digest("hex").slice(0, 16);
+  } catch {
+    return createHash("sha256")
+      .update(String(publicKeyPem ?? "").trim(), "utf8")
+      .digest("hex")
+      .slice(0, 16);
+  }
+}
+
+/**
+ * Canonical trust-root identity of a PEM key (or null when absent). Uses the
+ * SPKI-DER fingerprint, never textual comparison, so the same key with
+ * LF/CRLF or whitespace differences is never mistaken for a replacement.
+ */
+export function trustRootIdentity(publicKeyPem) {
+  if (publicKeyPem == null) return null;
+  return signingKeyIdFor(publicKeyPem);
 }
 
 /**
@@ -543,7 +586,9 @@ export function auditPublicProvenance({ repoRoot, baseSha, headSha, commits, git
         continue;
       }
       // Exactly one reference: atomic association requires the file's
-      // introducing commit to be the PR commit that carries the trailer.
+      // introducing commit to be the PR commit that carries the trailer, and
+      // the PR-head blob must be byte-identical to the introduced blob
+      // (added-then-modified detection — the final diff may still show "A").
       const introduced = gitImpl(repoRoot, ["log", "-1", "--format=%H", "--diff-filter=A", `${mergeBase}..${headSha}`, "--", entry.path]);
       const introSha = introduced.status === 0 ? introduced.stdout.trim() : "";
       if (!introSha || introCommit.get(id) !== introSha) {
@@ -553,6 +598,16 @@ export function auditPublicProvenance({ repoRoot, baseSha, headSha, commits, git
           detail: `new public manifest introduced by a different commit than its Drift-Intent trailer${introSha ? ` (introduced by ${introSha.slice(0, 7)})` : ""}`,
         });
         orphanIds.push(id);
+        continue;
+      }
+      const introBlob = getFileAt(repoRoot, introSha, entry.path, gitImpl);
+      const headBlob = getFileAt(repoRoot, headSha, entry.path, gitImpl);
+      if (introBlob !== headBlob) {
+        violations.push({
+          code: "mutated",
+          id,
+          detail: "manifest was modified after it was introduced in the same pull request (added-then-modified)",
+        });
       }
       continue;
     }
@@ -597,6 +652,28 @@ const SIGNATURE_LABELS = {
  */
 export const TRUST_ROOT_WARNING =
   "## ⚠ Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
+
+/** Signature/trust states that are provenance ERRORS (fail the workflow). */
+const FAILING_SIGNATURE_STATES = new Set(["invalid", "untrusted-key", "malformed"]);
+
+/**
+ * Whether the PR carries a provenance error that should fail the workflow
+ * when `fail-on-provenance-error` is true (the default): invalid signatures,
+ * untrusted/malformed manifests, trust-root replacement/removal, or ANY
+ * public-provenance integrity violation. Neutral states (bootstrap, unsigned,
+ * unverifiable, missing manifests, no intents) are NOT errors.
+ */
+export function hasProvenanceError({ intents, keyChange, audit }) {
+  if (keyChange === "replaced" || keyChange === "removed") return true;
+  if (Array.isArray(intents) && intents.some((i) => FAILING_SIGNATURE_STATES.has(i.signatureState))) return true;
+  if (
+    audit &&
+    (audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0)
+  ) {
+    return true;
+  }
+  return false;
+}
 
 /**
  * Build the summary comment body. Returns null when there is nothing to say
@@ -699,10 +776,11 @@ export function isDriftOwnedComment(comment) {
     comment.body.includes(SUMMARY_MARKER) ||
     LEGACY_SUMMARY_MARKERS.some((m) => comment.body.includes(m));
   if (!hasMarker) return false;
-  const login = comment.user?.login;
-  if (typeof login === "string" && login === "github-actions[bot]") return true;
-  // A performed_via_github_app comment is the App's, not the Action's.
-  return false;
+  // Ownership is GitHub-attested author identity: the composite Action posts
+  // as github-actions[bot] (type Bot). A user cannot forge that login, and a
+  // performed_via_github_app comment belongs to the App — the Action must
+  // never edit it (and vice versa).
+  return comment.user?.login === "github-actions[bot]" && comment.user?.type === "Bot";
 }
 
 /** Extract the absolute `rel="next"` URL from a GitHub Link header. */
@@ -817,6 +895,10 @@ async function main() {
   }
 
   const failOnError = process.env.FAIL_ON_COMMENT_ERROR === "true";
+  // `fail-on-provenance-error` (default true): a non-zero exit for invalid or
+  // tampered provenance, set only AFTER the safe step summary and comment are
+  // written. Neutral states never fail the workflow by default.
+  const failOnProvenanceError = process.env.FAIL_ON_PROVENANCE_ERROR !== "false";
   const repoRoot = process.env.DRIFT_REPO || process.cwd();
 
   // 2. PR commit range — never the last N repo-wide intents.
@@ -834,10 +916,15 @@ async function main() {
   // the "no intents" path.
   const baseKey = getFileAt(repoRoot, event.baseSha, ".drift/public/key.pem");
   const headKey = getFileAt(repoRoot, "HEAD", ".drift/public/key.pem");
+  // Canonical trust-root comparison: SPKI-DER fingerprints, never PEM text —
+  // the same key with LF/CRLF or whitespace formatting differences must not
+  // register as a replacement.
+  const baseId = trustRootIdentity(baseKey);
+  const headId = trustRootIdentity(headKey);
   let keyChange = "none";
-  if (!baseKey && headKey) keyChange = "bootstrap";
-  else if (baseKey && !headKey) keyChange = "removed";
-  else if (baseKey && headKey && baseKey.trim() !== headKey.trim()) keyChange = "replaced";
+  if (!baseId && headId) keyChange = "bootstrap";
+  else if (baseId && !headId) keyChange = "removed";
+  else if (baseId && headId && baseId !== headId) keyChange = "replaced";
   const hasKeyChange = keyChange === "replaced" || keyChange === "removed";
 
   // 4. intents from PR commits only, with per-intent signature/trust states.
@@ -886,6 +973,14 @@ async function main() {
       console.error("pr-comment: FAIL_ON_COMMENT_ERROR is set — exiting non-zero");
       process.exitCode = 1;
     }
+  }
+
+  // 8. Composite-Action failure policy: fail the workflow when Drift detected
+  // invalid or tampered provenance (default). The summary and comment were
+  // already generated above, so the failure is loud AND visible.
+  if (failOnProvenanceError && hasProvenanceError({ intents, keyChange, audit })) {
+    console.error("pr-comment: provenance error detected — failing the workflow (set fail-on-provenance-error: false to only report)");
+    process.exitCode = 1;
   }
 }
 

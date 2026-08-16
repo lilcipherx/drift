@@ -19,6 +19,9 @@ inputs:
   fail-on-comment-error:
     description: "When true, the job fails if the PR comment cannot be posted/updated (e.g. a fork's read-only token). Default false: warn and fall back to the step summary."
     default: "false"
+  fail-on-provenance-error:
+    description: "When true (default), the job fails when Drift detects invalid or tampered provenance: invalid signature, untrusted-key, malformed manifest, signingKeyId mismatch, trust-root replacement/removal, modified/deleted/renamed/orphan manifest, manifest/trailer commit mismatch, post-introduction modification, intent replay, or ambiguous intent association. Neutral states (valid bootstrap, unsigned/unverifiable/missing legacy manifests, no intents) never fail. The step summary and PR comment are still generated before the non-zero exit."
+    default: "true"
 runs:
   using: "composite"
   steps:
@@ -51,4 +54,5 @@ runs:
       env:
         GITHUB_TOKEN: ${{ github.token }}
         FAIL_ON_COMMENT_ERROR: ${{ inputs.fail-on-comment-error }}
+        FAIL_ON_PROVENANCE_ERROR: ${{ inputs.fail-on-provenance-error }}
       run: node "$GITHUB_ACTION_PATH/scripts/pr-comment.mjs"
