@@ -1,7 +1,19 @@
 {
   "name": "@drift/action",
   "version": "0.1.1",
-  "description": "Drift GitHub Action metadata (the runnable action.yml lives at the repository root).",
+  "description": "Drift GitHub Action metadata (the runnable action.yml lives at the repository root and is consumed via `uses: lilcipherx/drift@<ref>`).",
   "license": "MIT",
-  "files": ["action.yml"]
+  "files": [],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lilcipherx/drift.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lilcipherx/drift/issues"
+  },
+  "homepage": "https://github.com/lilcipherx/drift",
+  "keywords": ["drift", "intent", "versioning", "github-action"],
+  "publishConfig": {
+    "access": "public"
+  }
 }

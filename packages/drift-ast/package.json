@@ -7,6 +7,21 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lilcipherx/drift.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lilcipherx/drift/issues"
+  },
+  "homepage": "https://github.com/lilcipherx/drift",
+  "keywords": ["drift", "intent", "versioning", "ast", "git"],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -b"
   },
