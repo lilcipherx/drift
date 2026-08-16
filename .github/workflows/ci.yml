@@ -14,22 +14,147 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# Trust boundary (docs/SELF_HOSTED_ARM64_AUDIT.md):
+#
+# The `test-linux-arm64` job runs on a PERSISTENT self-hosted Oracle Cloud
+# runner (Ubuntu 24.04, ARM64, 2 OCPU / 12 GB). Persistent runners are not
+# ephemeral, so untrusted fork code must never execute there. That job is
+# therefore gated to trusted events: push to main, manual dispatch, or pull
+# requests whose head repo IS this repository. External fork PRs run the same
+# validation on an ephemeral GitHub-hosted runner (`test-linux-fork`), and
+# Windows coverage stays on GitHub-hosted runners (`test-windows`).
+# ---------------------------------------------------------------------------
+
 jobs:
-  test:
-    name: test (${{ matrix.os }}, node ${{ matrix.node }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
+  test-linux-arm64:
+    name: test (Linux ARM64, node 24)
+    runs-on: [self-hosted, Linux, ARM64]
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
+          # No `cache: npm` here on purpose: the npm cache key does not include
+          # the CPU architecture, so an ARM64 job must not write (or restore) a
+          # cache that a later x64 job could consume. `npm ci` on this pure-JS
+          # toolchain is fast enough without caching.
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Run the full test suite (incl. storage-privacy + fresh-clone)
+        run: npm test
+
+      - name: Eval harness regression gate
+        run: npm run eval
+
+      - name: MVS acceptance (PRD §4.2)
+        shell: bash
+        run: bash scripts/acceptance-mvs.sh
+
+      - name: Package smoke test (npm pack chain, no registry)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          for p in drift-ast drift-core drift-cli drift-mcp; do
+            (cd "packages/$p" && npm pack --pack-destination "$tmp" >/dev/null)
+          done
+          mkdir -p "$tmp/app" && cd "$tmp/app"
+          npm init -y >/dev/null
+          npm install \
+            "$tmp"/drift-ast-*.tgz \
+            "$tmp"/drift-core-*.tgz \
+            "$tmp"/drift-cli-*.tgz \
+            "$tmp"/drift-mcp-*.tgz >/dev/null
+          test -x node_modules/.bin/drift
+          test -x node_modules/.bin/drift-mcp
+          node_modules/.bin/drift version
+
+  # Fork PR fallback: identical validation on an ephemeral GitHub-hosted
+  # runner so external contributors still get full CI. Never runs on the
+  # persistent self-hosted machine.
+  test-linux-fork:
+    name: test (Linux x64, node 24, fork PR)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
           cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Run the full test suite (incl. storage-privacy + fresh-clone)
+        run: npm test
+
+      - name: Eval harness regression gate
+        run: npm run eval
+
+      - name: MVS acceptance (PRD §4.2)
+        shell: bash
+        run: bash scripts/acceptance-mvs.sh
+
+      - name: Package smoke test (npm pack chain, no registry)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          for p in drift-ast drift-core drift-cli drift-mcp; do
+            (cd "packages/$p" && npm pack --pack-destination "$tmp" >/dev/null)
+          done
+          mkdir -p "$tmp/app" && cd "$tmp/app"
+          npm init -y >/dev/null
+          npm install \
+            "$tmp"/drift-ast-*.tgz \
+            "$tmp"/drift-core-*.tgz \
+            "$tmp"/drift-cli-*.tgz \
+            "$tmp"/drift-mcp-*.tgz >/dev/null
+          test -x node_modules/.bin/drift
+          test -x node_modules/.bin/drift-mcp
+          node_modules/.bin/drift version
+
+  # Windows coverage stays on GitHub-hosted runners: the project has no
+  # Windows self-hosted runner, and ephemeral hosted runners are safe for
+  # untrusted fork code (the exact opposite of the persistent ARM64 box).
+  test-windows:
+    name: test (Windows, node 24)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
