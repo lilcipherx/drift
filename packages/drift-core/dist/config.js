@@ -25,6 +25,7 @@ export const DEFAULT_CONFIG = {
     },
     encryption: { enabled: false, key_provider: "env:DRIFT_MASTER_KEY" },
     telemetry: { enabled: false },
+    prompts: { mode: "commit-summary" },
 };
 export const CONFIG_TEMPLATE = `# Drift configuration (PRD §17.1)
 [core]
@@ -48,6 +49,16 @@ patterns = [
   "sk_live_[A-Za-z0-9]{24,}",
   "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
 ]
+
+# Prompt storage: how (and whether) the full prompt is persisted.
+#   commit-summary (default) — full prompt only in local .drift/ (gitignored);
+#                              the git commit message carries a safe summary
+#                              (Intent / Model / Verification / Drift-Intent).
+#   full                     — full prompt also in the git commit message.
+#   none                     — prompt text is not stored anywhere.
+# Encryption at rest ([encryption] enabled = true) applies on top of any mode.
+[prompts]
+mode = "commit-summary"
 
 [encryption]
 enabled = false
@@ -168,6 +179,13 @@ export function loadConfig(driftDir) {
         const tel = parsed["telemetry"];
         if (tel && typeof tel.enabled === "boolean")
             config.telemetry.enabled = tel.enabled;
+        const pr = parsed["prompts"];
+        if (pr && typeof pr.mode === "string") {
+            const mode = pr.mode;
+            if (mode === "commit-summary" || mode === "full" || mode === "none") {
+                config.prompts.mode = mode;
+            }
+        }
         return config;
     }
     catch {

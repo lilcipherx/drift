@@ -28,6 +28,7 @@ Every command accepts `--json` for machine-readable output and `--no-color`
 | Command | What it does |
 | :--- | :--- |
 | `drift init` | Create `.drift/` in the current git repo (SQLite DAG, `config.toml`, Ed25519 keypair). Idempotent. |
+| `drift status` | Show repo state — intents, head, prompt mode, encryption, git branch — and the next step. Friendly before `init`. |
 | `drift realize -p "<prompt>" [files...]` | Stage + commit changes with an intent. Rejects broken syntax (exit 2) before anything is committed. |
 | `drift log [--author a] [--model m] [--file f] [--limit n]` | List intents. |
 | `drift blame <file> --line N \| --function NAME` | Map a line/function to the intent that created it. |
@@ -118,7 +119,30 @@ key_provider = "env:DRIFT_MASTER_KEY"
 
 [telemetry]
 enabled = false
+
+[prompts]
+mode = "commit-summary"   # commit-summary | full | none
 ```
+
+### Prompt storage modes
+
+Controls how (and whether) the **full prompt** is persisted:
+
+| Mode | Full prompt in `.drift` (gitignored, local) | Full prompt in the git commit message |
+| :--- | :---: | :---: |
+| `commit-summary` (default) | ✅ | ❌ — commit carries `Intent:` (first line, ≤72 chars), `Model:`, `Verification:`, `Drift-Intent:` |
+| `full` | ✅ | ✅ — legacy behaviour (`git commit -m "<full redacted prompt>…"`) |
+| `none` | ❌ (empty) | ❌ — generic `Intent recorded` subject, only trailers |
+
+> The summary is derived from the **already-redacted** prompt, so a secret in
+> the first line is `[REDACTED]` before it can reach the commit message. For
+> a one-line prompt, `commit-summary`'s `Intent:` line *is* that line — use
+> `none` if even that must never appear.
+>
+> `[encryption] enabled = true` applies **on top of** any mode: whatever is
+> stored in `.drift` (prompt, agent state) is AES-256-GCM encrypted.
+> Changing the mode only affects **new** intents; existing history is never
+> rewritten.
 
 ---
 

@@ -130,6 +130,44 @@ export class Drift {
     get publicKey() {
         return this.publicKeyPem;
     }
+    // ---------------------------------------------------------------- status
+    /**
+     * First-run friendly status: always succeeds as a read, reports whether the
+     * repo is initialized and what the next step is. Never throws for missing
+     * init (a corrupted store still surfaces as exit 5).
+     */
+    static status(cwd) {
+        const root = findRepoRoot(cwd, process.env.DRIFT_REPO);
+        if (!root) {
+            return { initialized: false, repoRoot: null, reason: "no-git" };
+        }
+        const driftDir = join(root, ".drift");
+        if (!existsSync(driftDir)) {
+            return { initialized: false, repoRoot: root, reason: "not-initialized" };
+        }
+        const drift = new Drift(root);
+        try {
+            const last = drift.log({ limit: 1 })[0] ?? null;
+            const branchRes = execGit(root, ["branch", "--show-current"], true);
+            const headRes = execGit(root, ["rev-parse", "--short", "HEAD"], true);
+            const ws = execGit(root, ["status", "--porcelain", "--", ".", ":(exclude).drift"], true);
+            return {
+                initialized: true,
+                repoRoot: root,
+                intents: drift.store.allRows().length,
+                head: drift.store.getHead(),
+                encryption: drift.config.encryption.enabled,
+                promptMode: drift.config.prompts.mode,
+                gitBranch: branchRes.status === 0 ? branchRes.stdout.trim() : null,
+                gitHead: headRes.status === 0 ? headRes.stdout.trim() : null,
+                gitDirty: ws.stdout.trim().length > 0,
+                lastIntent: last ? { id: last.id, timestamp: last.timestamp, prompt: last.prompt } : null,
+            };
+        }
+        finally {
+            drift.close();
+        }
+    }
     // ---------------------------------------------------------------- realize
     realize(opts) {
         const prompt = (opts.prompt ?? "").trim();
@@ -216,8 +254,26 @@ export class Drift {
         // stays readable; the signature covers the stored (encrypted) canonical
         // form, so verification never requires the master key.
         const encKey = this.config.encryption.enabled ? this.masterKeyOrThrow() : null;
-        const storedPrompt = encKey ? encryptAesGcm(safePrompt, encKey, id) : safePrompt;
+        // Prompt storage modes (PRD §17.x, docs/architecture.md):
+        //   commit-summary (default) — full prompt only in local .drift (gitignored);
+        //                              the git commit message carries a safe summary.
+        //   full                     — full prompt in the commit message too (legacy).
+        //   none                     — prompt text is not persisted anywhere.
+        // The summary is derived from the ALREADY-redacted prompt, so a secret in
+        // the first line is redacted before it can reach the commit message.
+        const mode = this.config.prompts.mode;
+        const storePrompt = mode !== "none";
+        const storedPrompt = storePrompt
+            ? encKey
+                ? encryptAesGcm(safePrompt, encKey, id)
+                : safePrompt
+            : "";
         const storedState = encKey && safeState !== undefined ? encryptAesGcm(safeState, encKey, id) : safeState;
+        const commitMessage = buildCommitMessage(safePrompt, id, {
+            mode,
+            model: opts.model,
+            verifyCmd: opts.verifyCmd,
+        });
         const intentBase = {
             id,
             parentId: headId,
@@ -240,7 +296,7 @@ export class Drift {
         const tmpPath = `${absObjectPath}.tmp-${process.pid}`;
         writeFileSync(tmpPath, objectData);
         renameSync(tmpPath, absObjectPath);
-        const gitSha = commit(this.repoRoot, `${safePrompt}\n\nDrift-Intent: ${id}`);
+        const gitSha = commit(this.repoRoot, commitMessage);
         const intent = {
             ...intentBase,
             gitCommitSha: gitSha,
@@ -557,6 +613,38 @@ export class Drift {
         const valid = verifyPayload(canonical, this.publicKeyPem, obj.signature);
         return { ok: valid, detail: valid ? "valid" : "invalid" };
     }
+}
+/**
+ * Build the git commit message from the (redacted) prompt.
+ *
+ * `commit-summary` / `none`:
+ *   Intent: <first line, truncated to 72 chars>
+ *
+ *   Model: <model>              (when recorded)
+ *   Verification: <verifyCmd>   (when recorded)
+ *   Drift-Intent: <id>
+ *
+ * `full` (legacy): the complete redacted prompt, then the trailer.
+ */
+function buildCommitMessage(safePrompt, intentId, opts) {
+    if (opts.mode === "full") {
+        return `${safePrompt}\n\nDrift-Intent: ${intentId}`;
+    }
+    const trailers = [];
+    if (opts.model)
+        trailers.push(`Model: ${opts.model}`);
+    if (opts.verifyCmd)
+        trailers.push(`Verification: ${opts.verifyCmd}`);
+    trailers.push(`Drift-Intent: ${intentId}`);
+    // `none`: the subject must never be derived from the prompt — a one-line
+    // prompt would otherwise leak verbatim into git history. Use a generic
+    // subject; the trailer carries the machine-readable link.
+    if (opts.mode === "none") {
+        return `Intent recorded\n\n${trailers.join("\n")}`;
+    }
+    const firstLine = (safePrompt.split(/\r?\n/)[0] ?? "").trim();
+    const summary = (firstLine.length > 72 ? `${firstLine.slice(0, 71)}…` : firstLine) || "intent recorded";
+    return `Intent: ${summary}\n\n${trailers.join("\n")}`;
 }
 function publicKeyFromPrivate(privateKeyPem) {
     return createPublicKey(privateKeyPem).export({ type: "spki", format: "pem" }).toString();

@@ -35,11 +35,25 @@ test against production or third-party systems.
 | :--- | :--- |
 | Tampering with `.drift/objects` | Content-addressed objects; hash chain breaks on edit |
 | Repudiation | Every intent is Ed25519-signed with the repo key |
-| Secret leakage in prompts | Regex redaction before any storage |
+| Secret leakage in prompts | Regex redaction before any storage; default `commit-summary` mode keeps the full prompt out of git history |
 | Data at rest (prompt / agent state) | AES-256-GCM via `DRIFT_MASTER_KEY` when `[encryption] enabled = true` (v0.2.0); GCM auth detects tampering |
 | Prompt injection via code comments | Reviewer/merge LLM prompts ignore code comments; LLM output re-validated |
 | Malformed AST input | Parsers are bounded; parse failure aborts commit (exit code 2) |
 | Malicious `verifyCmd` / `--verify-cmd` | `drift verify` re-runs the recorded command with the user's shell. Only run `verify` on intents you trust (local or from a trusted upstream); verify `verifyCmd` before recording it via `realize --verify-cmd`. |
+
+## Prompt storage (default: summary-only commits)
+
+The full prompt is **never** written to public git history by default. The
+`.drift/config.toml` `[prompts] mode` setting controls persistence:
+
+| Mode | Full prompt in `.drift` (local) | Full prompt in `git log` |
+| :--- | :---: | :---: |
+| `commit-summary` (default) | ✅ | ❌ — commit carries only `Intent:`/`Model:`/`Verification:`/`Drift-Intent:` |
+| `full` | ✅ | ✅ (opt-in, legacy) |
+| `none` | ❌ | ❌ |
+
+The summary is built **after** secret redaction, so secrets cannot leak via
+it. The mode only affects new intents; history is never rewritten.
 
 ## Encryption at rest (v0.2.0)
 
@@ -49,8 +63,8 @@ intent's `prompt` and `agentState` are then AES-256-GCM encrypted before
 storage, bound to the intent id via AAD. Legacy plaintext intents remain
 readable. `drift replay` of encrypted state without the key fails with exit 4.
 
-**Known limitation:** the commit message itself carries the plaintext prompt
-(PRD §9.1 keeps history readable), so the prompt remains visible in `git log`
-to anyone with repo access. Encryption protects the `.drift` intent storage
-and the agent state, not the git commit subject. If prompts must never be
-readable, do not put secrets in them (redaction still applies).
+**Known limitation:** encryption protects the `.drift` intent storage and the
+agent state, not the git commit subject. In `full` mode the commit message
+carries the plaintext (redacted) prompt; in the default `commit-summary` mode
+it carries only the truncated first line. If prompts must never be readable,
+use `none` or keep secrets out of prompts (redaction still applies).

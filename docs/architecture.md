@@ -64,6 +64,22 @@ parse pre-state (HEAD) → stage → parse post-state
 Signature verification uses the intent's **object file** as the source of truth
 (the canonical JSON it was signed over), so verification is byte-exact.
 
+## Prompt storage modes
+
+What lands in public git history is configurable per-repo
+(`[prompts] mode` in `.drift/config.toml`):
+
+| Mode | `.drift` store | Git commit message |
+| :--- | :--- | :--- |
+| `commit-summary` (**default**) | full (redacted) prompt | `Intent:` first line (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers — the full prompt never enters git history automatically |
+| `full` | full (redacted) prompt | full (redacted) prompt (legacy behaviour) |
+| `none` | nothing | generic `Intent recorded` subject + trailers only |
+
+The summary is computed **after** secret redaction, so a secret in the first
+line is redacted before it can reach the commit message. Encryption at rest
+applies on top of any mode. The mode affects only new intents — history is
+never rewritten. `drift status` reports the active mode.
+
 ## Encryption at rest (v0.2.0)
 
 When `[encryption] enabled = true` in `.drift/config.toml`, the intent's

@@ -66,6 +66,20 @@ test("parseToml strips inline comments outside strings", () => {
   assert.deepEqual(parsed.redaction.patterns, ["a#b", "c"]);
 });
 
+test("prompts mode defaults to commit-summary and parses full/none", () => {
+  const dir = mkdtempSync(join(tmpdir(), "drift-config-"));
+  assert.equal(loadConfig(dir).prompts.mode, "commit-summary");
+  for (const mode of ["full", "none", "commit-summary"]) {
+    const d2 = mkdtempSync(join(tmpdir(), "drift-config-"));
+    writeFileSync(join(d2, "config.toml"), `[prompts]\nmode = "${mode}"\n`);
+    assert.equal(loadConfig(d2).prompts.mode, mode);
+  }
+  // invalid value falls back to the safe default, never crashes
+  const d3 = mkdtempSync(join(tmpdir(), "drift-config-"));
+  writeFileSync(join(d3, "config.toml"), `[prompts]\nmode = "banana"\n`);
+  assert.equal(loadConfig(d3).prompts.mode, "commit-summary");
+});
+
 test("loadConfig merges file over defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "drift-config-"));
   mkdirSync(dir, { recursive: true });

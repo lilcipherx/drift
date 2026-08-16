@@ -3,7 +3,7 @@
  * by the SDK. The MCP server delegates here through the CLI (PRD §11 contract).
  */
 import { type ASTDelta } from "@drift/ast";
-import { type DriftConfig } from "./config.js";
+import { type DriftConfig, type PromptMode } from "./config.js";
 import { type IntentRecord, type LogEntry } from "./store.js";
 export interface RealizeOptions {
     prompt: string;
@@ -61,6 +61,24 @@ export interface InitResult {
     driftDir: string;
     publicKeyPem: string;
 }
+export interface DriftStatus {
+    initialized: boolean;
+    repoRoot: string | null;
+    /** Why status is not fully initialized. */
+    reason?: "no-git" | "not-initialized";
+    intents?: number;
+    head?: string | null;
+    encryption?: boolean;
+    promptMode?: PromptMode;
+    gitBranch?: string | null;
+    gitHead?: string | null;
+    gitDirty?: boolean;
+    lastIntent?: {
+        id: string;
+        timestamp: number;
+        prompt: string;
+    } | null;
+}
 export declare class Drift {
     readonly repoRoot: string;
     readonly driftDir: string;
@@ -88,6 +106,12 @@ export declare class Drift {
     private loadKeys;
     close(): void;
     get publicKey(): string;
+    /**
+     * First-run friendly status: always succeeds as a read, reports whether the
+     * repo is initialized and what the next step is. Never throws for missing
+     * init (a corrupted store still surfaces as exit 5).
+     */
+    static status(cwd: string): DriftStatus;
     realize(opts: RealizeOptions): RealizeResult;
     log(filters?: {
         author?: string;

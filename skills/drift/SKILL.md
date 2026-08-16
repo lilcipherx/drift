@@ -9,6 +9,16 @@ Use the `drift` CLI instead of a bare `git commit` whenever the repository has
 a `.drift/` directory (check with `ls .drift` or `drift doctor`). Drift records
 *why* code exists — the prompt, model and provenance — not just what changed.
 
+## status — where are we?
+
+```bash
+drift status
+```
+
+Reports the repo state (intents, head, prompt mode, encryption, git branch)
+and the next step. Run it first in an unfamiliar checkout — if Drift is not
+initialized it says so and tells you to run `drift init`.
+
 ## realize — commit with intent
 
 ```bash
@@ -19,6 +29,10 @@ drift realize -p "<prompt: what and why>" --agent --model <model>
 - Secrets in prompts are redacted automatically; never paste keys anyway.
 - Exit 3 means there was nothing to commit (`E_NO_CHANGES`).
 - `--verify-cmd "<cmd>"` records a verification command re-run by `drift verify`.
+- **Prompt storage** is controlled by `[prompts] mode` in `.drift/config.toml`:
+  `commit-summary` (default — full prompt only in local `.drift/`, git commit
+  carries a safe `Intent:`/`Model:`/`Verification:` summary), `full` (prompt
+  also in the commit message), `none` (prompt stored nowhere).
 
 ## blame / context — trace intent
 

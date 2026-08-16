@@ -8,12 +8,16 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { compilePatterns } from "./redact.js";
 
+/** How (and whether) prompts are persisted. See `docs/architecture.md`. */
+export type PromptMode = "commit-summary" | "full" | "none";
+
 export interface DriftConfig {
   core: { version: number; default_model: string };
   ast: { parsers: string[]; fallback_to_text_on_error: boolean };
   redaction: { patterns: string[] };
   encryption: { enabled: boolean; key_provider: string };
   telemetry: { enabled: boolean };
+  prompts: { mode: PromptMode };
 }
 
 export const DEFAULT_CONFIG: DriftConfig = {
@@ -35,6 +39,7 @@ export const DEFAULT_CONFIG: DriftConfig = {
   },
   encryption: { enabled: false, key_provider: "env:DRIFT_MASTER_KEY" },
   telemetry: { enabled: false },
+  prompts: { mode: "commit-summary" },
 };
 
 export const CONFIG_TEMPLATE = `# Drift configuration (PRD §17.1)
@@ -59,6 +64,16 @@ patterns = [
   "sk_live_[A-Za-z0-9]{24,}",
   "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
 ]
+
+# Prompt storage: how (and whether) the full prompt is persisted.
+#   commit-summary (default) — full prompt only in local .drift/ (gitignored);
+#                              the git commit message carries a safe summary
+#                              (Intent / Model / Verification / Drift-Intent).
+#   full                     — full prompt also in the git commit message.
+#   none                     — prompt text is not stored anywhere.
+# Encryption at rest ([encryption] enabled = true) applies on top of any mode.
+[prompts]
+mode = "commit-summary"
 
 [encryption]
 enabled = false
@@ -168,6 +183,13 @@ export function loadConfig(driftDir: string): DriftConfig {
     const tel = parsed["telemetry"];
     if (tel && typeof tel.enabled === "boolean")
       config.telemetry.enabled = tel.enabled;
+    const pr = parsed["prompts"];
+    if (pr && typeof pr.mode === "string") {
+      const mode = pr.mode;
+      if (mode === "commit-summary" || mode === "full" || mode === "none") {
+        config.prompts.mode = mode;
+      }
+    }
     return config;
   } catch {
     return DEFAULT_CONFIG;
