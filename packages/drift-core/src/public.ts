@@ -308,11 +308,14 @@ export function parsePublicIntentManifest(
       if (type !== null && schemaVersion === 2 && type !== "HUMAN" && type !== "AGENT") {
         push(errors, "agent.type", `unsupported agent type "${type}"`);
       }
-      checkString(errors, json.agent.identifier, "agent.identifier", {
+      const agentIdentifier = checkString(errors, json.agent.identifier, "agent.identifier", {
         required: true,
         max: MANIFEST_META_MAX,
         noControl: true,
       });
+      if (agentIdentifier !== null && agentIdentifier.trim().length === 0) {
+        push(errors, "agent.identifier", "must not be empty or whitespace-only");
+      }
     }
   }
   if (json.model !== undefined) {
