@@ -34,18 +34,22 @@ state and the exact next command.
 Edit a file, then:
 
 ```bash
-node /path/to/drift/packages/drift-cli/dist/cli.js realize -p "Add login flow with validation" --agent --model claude-3-5-sonnet
+node /path/to/drift/packages/drift-cli/dist/cli.js realize \
+  --prompt "Private implementation requirements…" \
+  --summary "Add validated login flow" \
+  --agent \
+  --model claude-3-5-sonnet
 ```
 
 `realize` stages the change, checks the syntax (broken code → exit 2, **no
 commit**), redacts secrets from your prompt, computes the AST delta, signs the
-intent, stores it in `.drift/objects/`, and commits with a `Drift-Intent: <id>`
-trailer. **By default the raw prompt stays in the private, gitignored
-`.drift/` store** (ADR-009). What is public is your explicit `--summary` — or a
-generic `Drift intent did_…` fallback — never the prompt itself: pass
-`drift realize --summary "Add login flow with validation" -p "…"` to make
-`log`/`blame`/PR comments meaningful (see `[prompts] mode` in
-[api.md](api.md#configuration-driftconfigtoml)).
+intent, and creates **one git commit** containing the source change, the
+signed public manifest and a `Drift-Intent: <id>` trailer (no second manual
+commit needed). **By default the raw prompt stays in the private, gitignored
+`.drift/` store** (ADR-009). What is public is your explicit `--summary` — or
+a generic `Drift intent did_…` fallback — never the prompt itself and never
+the commit subject. Pass `--summary` to make `log`/`blame`/PR comments
+meaningful (see `[prompts] mode` in [api.md](api.md#configuration-driftconfigtoml)).
 
 ## 4. See the "why"
 

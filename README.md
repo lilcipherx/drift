@@ -168,13 +168,21 @@ MCP tool).
   `.drift/public/` — the public key and signed intent manifests carrying a
   safe summary.
 - **Default CLI/JSON output is safe for automation.** `drift log` / `blame` /
-  `context` / `status` return the public `summary`; the full local prompt
-  needs the explicit `--include-private-prompt` flag (never used in CI).
+  `context` / `status` and `drift export` return public data only; the full
+  local prompt needs the explicit `--include-private-prompt` flag (never used
+  in CI; private exports refuse to write inside the repository).
+- **`drift verify` never executes recorded commands by default.** It reports
+  the signature/trust state; a verification command runs only with an
+  explicit `drift verify <id> --run` on a validly signed manifest.
 - **A fresh clone still works.** `drift log` / `blame` / `verify-intent`
   serve from the committed public manifests without any private database.
-- **`[prompts] mode`** in `.drift/config.toml`: `commit-summary` (default —
-  only the first line of the redacted prompt is ever public), `full`
-  (opt-in, legacy, writes the prompt into the commit message), `none`
+- **The raw prompt stays private; the public summary is separate.** The
+  prompt is never used to build the public summary. You supply a separate
+  explicit `--summary` (`drift realize -p "private requirements…" --summary
+  "Add validated login flow"`); when none is given, Drift uses a generic
+  non-prompt fallback (`Drift intent did_… (2 files)`).
+- **`[prompts] mode`** in `.drift/config.toml`: `commit-summary` (default),
+  `full` (opt-in, legacy, writes the prompt into the commit message), `none`
   (prompt stored nowhere).
 - **Secrets are redacted** (AWS, OpenAI, GitHub, Slack, JWT, PEM, …) before
   any storage.

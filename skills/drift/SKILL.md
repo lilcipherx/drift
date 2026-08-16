@@ -51,15 +51,21 @@ edit of a pre-Drift function reports "pre-Drift baseline".
 ## verify / replay
 
 ```bash
-drift verify <intent-id>         # re-run the recorded --verify-cmd
-drift replay --checkout          # restore a prior cognitive state (agentState)
+drift verify <intent-id>         # INFORMATION ONLY — shows the recorded
+                                 # --verify-cmd + signature state, never runs it
+drift verify <intent-id> --run   # execute the recorded command (only when the
+                                 # manifest is validly signed by the repo key)
+drift replay <intent-id> --checkout  # restore a prior cognitive state (agentState)
 ```
 
 ## doctor / export
 
 ```bash
 drift doctor                     # health check; detects corrupt .drift store (exit 5)
-drift export                     # portable JSON export of all intents
+drift export                     # portable PUBLIC-ONLY JSON export
+                                 # (--include-private-prompt for local prompts,
+                                 # refuses to write inside the repo)
+drift key import --file <path>   # restore the repo signing key in a read-only clone
 ```
 
 If `doctor` reports corruption, never edit `.drift/` by hand — re-run
@@ -84,7 +90,8 @@ Add `--json` for machine-readable output. Successful commands print
 stderr, usage errors to stdout; MCP merges both). `log --json` returns
 intents with `authorType` (`"AGENT"`/`"HUMAN"`, uppercase), `model`, `summary`,
 `gitSha`; `verify --json` returns
-`verifyStatus: "pass"|"fail"|"no-command"`.
+`verifyStatus: "pass"|"fail"|"timeout"|"no-command"|"not-executed"|"refused"`
+plus `signature` (never executes without `--run`).
 
 ## Environment
 

@@ -42,17 +42,31 @@ drift-app (webhook server) ── PR commits ─────┘
 
 ## The realize pipeline
 
+One atomic transaction — the source change, the signed public manifest, the
+public key (first introduction) and the `Drift-Intent:` trailer all land in
+**one git commit**; no second manual commit is needed.
+
 ```
-parse pre-state (HEAD) → stage → parse post-state
+parse pre-state (HEAD) → stage source (never .drift private paths)
+   → parse post-state
    → validate syntax (TS via tsc transpile, Python via ast)   [fail ⇒ exit 2, no commit]
    → compute AST delta (ADDED/MODIFIED/DELETED/MOVED/RENAMED)
    → redact secrets from prompt & state
    → build intent → canonical JSON → SHA-256 → Ed25519 signature
    → write object to .drift/objects/aa/bb….json (private, atomic write-rename)
-   → write signed public manifest to .drift/public/intents/<id>.json
-   → git commit -m "<summary>\n\nModel: … / Verification: … / Drift-Intent: <id>"
-   → insert DAG rows → update head
+   → build V2 public manifest (schemaVersion 2, signingKeyId) — NO containing
+     commit SHA (a self-referential cycle), the association comes from the
+     Drift-Intent trailer in the commit message
+   → write + sign the public manifest to .drift/public/intents/<id>.json
+   → explicitly stage ONLY the approved public paths (.drift/.gitignore,
+     config.toml, public/key.pem, public/intents/<id>.json)
+   → git commit -m "<public summary>\n\nModel: … / Verification: … / Drift-Intent: <id>"
+   → insert DAG rows (git SHA recorded only in the local private DB) → update head
 ```
+
+If `git commit` fails (e.g. an identity or pre-commit-hook error) the
+newly generated manifest is removed and only the manifest is unstaged — the
+user's source changes stay staged for a safe retry.
 
 ## Storage
 
@@ -124,8 +138,10 @@ GitHub HMAC signature, then on `pull_request` `opened` / `synchronize` /
 1. Reads `Drift-Intent: <id>` trailers from the PR commits (paginated,
    git-trailer aligned).
 2. Hydrates the **public manifests** from `.drift/public/intents/<id>.json`
-   at the PR head (falls back to the commit subject). Never touches private
-   objects or prompts.
+   at the PR head. When a manifest is missing it uses a generic non-prompt
+   fallback (`Drift intent <id>`) — the commit subject is NEVER used, because
+   legacy `full`-mode subjects may contain a complete private prompt. Never
+   touches private objects or prompts.
 3. Posts a **privacy-safe summary comment** (marker `<!-- drift:summary -->`,
    sanitized, `summary` only) plus a check run.
 
@@ -165,9 +181,17 @@ and degrades gracefully on forks (step summary + warning, no
 - **Public rendering:** PR comments / step summaries render only the safe
   public `summary`; all strings are sanitized (control chars, ANSI, HTML
   comments, mention spam) and length-limited.
-- **Shell execution:** `drift verify` / `--verify-cmd` re-runs the recorded
-  command with your shell — only run `verify` on intents you trust (local or
-  from a trusted upstream).
+- **PR trust root:** manifests in a pull request are verified against the
+  BASE-branch `.drift/public/key.pem`. A PR that replaces the key is flagged
+  prominently and its provenance marked unverified — the replacement key is
+  never silently trusted.
+- **Shell execution (opt-in):** `drift verify <id>` is informational by
+  default — it validates the manifest, reports the signature/trust state and
+  shows the recorded command WITHOUT executing it. A recorded verification
+  string is code, so it runs only with an explicit `drift verify <id> --run`,
+  and only when the manifest is validly signed by the repository key
+  (`--allow-untrusted-command` forces it, with a prominent warning). Never
+  enabled by the GitHub Action, the App, or default MCP tools.
 - **Path containment:** `drift blame` / `drift context` reject paths that
   escape the repository root (`../`, absolute/cross-drive paths, symlinks via
   realpath) before any filesystem read.

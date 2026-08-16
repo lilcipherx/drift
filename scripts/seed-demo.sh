@@ -111,11 +111,13 @@ provenance (`.drift/public/`, `config.toml`, `.gitignore`) is committed —
 see the copy at the repository root for the full walkthrough.
 EOF
 
-# 4. ADR-009: commit ONLY the public provenance (config + ignore + public/).
-#    The SQLite DB, content-addressed objects and the signing key stay
-#    untracked — `git add .` can never stage them (see .drift/.gitignore).
-git add README.md .drift/config.toml .drift/.gitignore .drift/public
-git commit -qm "chore: seed drift intents (public provenance)"
+# 4. Each `drift realize` above already committed source + signed public
+#    manifest + key + trailer atomically (ADR-009 V2). The SQLite DB,
+#    content-addressed objects and the signing key stay untracked — `git add
+#    .` can never stage them (see .drift/.gitignore). This final commit only
+#    adds the walkthrough README.
+git add README.md
+git commit -qm "docs: demo walkthrough"
 
 # 5. sanity: prove `git add .` cannot stage private Drift data
 if git check-ignore -q .drift/drift.db && git check-ignore -q .drift/keys/ed25519.pem; then

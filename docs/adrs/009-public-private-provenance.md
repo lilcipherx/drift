@@ -55,26 +55,39 @@ Verified empirically with `git check-ignore` / `git add -A`: `drift.db`,
 - `agentState`, the Ed25519 private key, the SQLite database.
 - Anything under `.drift/private/`.
 
-### What is public (committed to git)?
+### What is public (committed to git)?  - `.drift/config.toml`, `.drift/.gitignore`.
 
-- `.drift/config.toml`, `.drift/.gitignore`.
+
 - `.drift/public/key.pem` — the public verification key.
 - `.drift/public/intents/<id>.json` — a **PublicIntentView**:
 
 ```ts
-type PublicIntentView = {
-  schemaVersion: 1;
-  id: string;
-  summary: string;        // explicit --summary (redacted → sanitized → truncated)
-                          // or a generic non-prompt fallback; NEVER prompt text
-  model?: string;
-  agent?: { type: "HUMAN" | "AGENT"; identifier: string };
-  verification?: string;  // verify command metadata
-  files?: { path: string; mutationType: string; summary?: string }[];
-  commit: string;         // git sha of the intent's commit
-  timestamp: number;
-  signature: string;      // Ed25519 over the canonical public view
-};
+type PublicIntentView =
+  | {
+      schemaVersion: 1;   // legacy — read and verified as-is; the `commit`
+      id: string;         //   field is treated as UNTRUSTED legacy metadata
+      summary: string;    // explicit --summary (redacted → sanitized → truncated)
+      commit: string;     //   or a generic non-prompt fallback; NEVER prompt text
+      timestamp: number;
+      signature: string;
+    }
+  | {
+      schemaVersion: 2;   // current
+      id: string;
+      summary: string;    // explicit --summary or generic non-prompt fallback
+      model?: string;
+      agent?: { type: "HUMAN" | "AGENT"; identifier: string };
+      verification?: string;  // verify command metadata (shown, not auto-run)
+      files?: { path: string; mutationType: string; summary?: string }[];
+      timestamp: number;
+      signingKeyId: string;   // fingerprint of the signing public key
+      signature: string;      // Ed25519 over the canonical public view
+      // NOTE: no `commit` field. A manifest cannot sign the SHA of the git
+      // commit that contains it (a self-referential cycle). The intent →
+      // commit association is derived from the `Drift-Intent:` trailer in
+      // the commit message (engine intentCommitIndex), shared by log,
+      // context, blame, status, export, the Action and the App.
+    };
 ```
 
 The `summary` is **never derived from the prompt** — the first line of a one-line
@@ -108,10 +121,18 @@ After `git clone`, `.drift/` exists with `config.toml` + `public/` but **no**
 - `drift status` → `initialized: true`, counts from manifests, prompt mode from
   `config.toml`.
 - `drift verify-intent` → verifies the manifest signature with
-  `.drift/public/key.pem`.
-- `drift verify` (re-runs the recorded command) works from manifest metadata.
+  `.drift/public/key.pem` and reports `valid | invalid | unsigned |
+  unverifiable` (a regenerated or absent local key never yields a false
+  `valid`).
+- `drift verify` is **informational by default** (never executes a recorded
+  command); `--run` executes only when the manifest is validly signed by the
+  repository key, and `--allow-untrusted-command` forces it with a warning.
 - `drift replay` and `drift realize` need the private store/keys → clear error:
   "Run `drift init` to create the local intent store."
+- `drift export` is **public-only by default** (`containsPrivatePrompts:
+  false`); private prompts need `--include-private-prompt`, which warns on
+  stderr and refuses to write inside the repository unless
+  `--allow-repository-output` is given.
 
 It is acceptable to say "Private prompt: unavailable in this clone"; it is never
 acceptable to crash because the private database is missing.
@@ -134,15 +155,23 @@ Both integrations switch to the same canonical source:
 2. Parse `Drift-Intent: <id>` trailers from those commits' messages with a
    git-trailer-aligned parser (not substring search).
 3. Load `.drift/public/intents/<id>.json` (Action: from the checkout; App: via the
-   contents API at the PR head). Missing records degrade to the commit subject.
-4. Render only `summary` + safe metadata. `prompt` is never rendered, never
-   returned by default JSON, and never posted to a comment.
+   contents API at the PR head). Missing records degrade to a generic
+   non-prompt fallback (`Drift intent <id>`) — the commit subject is NEVER
+   used as a summary (legacy `full`-mode subjects may contain the whole
+   private prompt).
+4. Verify each manifest against the **base-branch** `.drift/public/key.pem`;
+   a PR that replaces the key is flagged and its provenance marked
+   unverified (never silently trusted).
+5. Render only `summary` + safe metadata + signature/trust state. `prompt` is
+   never rendered, never returned by default JSON, and never posted to a comment.
 
 ## Migration of existing repositories
 
 - `drift init` re-runs safely: it merges the required ignore rules into
-  `.drift/.gitignore` (never deletes user lines), writes `.drift/public/key.pem` and
-  the `public/intents/` directory.
+  `.drift/.gitignore` (never deletes user lines), creates the missing private
+  dirs/db, and ensures `.drift/public/key.pem` exists — generating a keypair
+  only when neither key exists (State A). It NEVER overwrites an existing
+  committed public key.
 - `drift realize` starts writing public manifests alongside the existing private
   records; the DB and `objects/` stay where they are (backward compatible).
 - `drift doctor` gains checks that report whether private files are ignored, whether
@@ -163,9 +192,18 @@ Both integrations switch to the same canonical source:
   is deliberately generic so prompt text can never leak into history.
 - `none` mode keeps prompts out of everything; public manifests carry a summary only
   when the user explicitly passes `--summary`.
-- Running `drift init` on a fresh clone regenerates the local signing key (the
-  private key never leaves the origin machine), so previously committed signatures
-  verify as `valid` before init (against the committed public key) and report
-  `invalid` after init — never falsely `valid` with a new key.
+- **Key model (trust root).** `.drift/public/key.pem` is the repository trust
+  root. `drift init` in a fresh clone (State C) PRESERVES it byte-for-byte,
+  creates only the missing private dirs/db, and enters **read-only signer
+  mode** — old signatures stay `valid`, and `drift realize` is refused with an
+  actionable message until the matching private key is imported via
+  `drift key import --file <path>`. A mismatched local key (State E) fails
+  safely and is never used to sign or judged as the trust root. No
+  auto-rotation through `drift init`; single-signer rotation is a separate
+  controlled operation.
 - Fresh-clone `drift blame`/`log` can only show what the public manifest recorded
   (no private agent state, no prompt).
+- **`drift realize` is atomic:** source + signed public manifest + key (first
+  introduction) + `Drift-Intent:` trailer land in ONE git commit; if the
+  commit fails, only the newly generated manifest is removed and the user's
+  source stays staged for a retry.

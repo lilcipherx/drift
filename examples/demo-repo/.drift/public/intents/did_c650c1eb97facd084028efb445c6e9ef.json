@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "id": "did_63bc00a7ee382f92022504fb458178cd",
+  "schemaVersion": 2,
+  "id": "did_c650c1eb97facd084028efb445c6e9ef",
   "summary": "Add clearRefreshCache for tests",
   "agent": {
     "type": "HUMAN",
@@ -13,7 +13,7 @@
       "summary": "function \"clearRefreshCache\" added (line 18)"
     }
   ],
-  "commit": "b5ac072fff51d4627bdebc89c08bf40365b02b8f",
-  "timestamp": 1786874843664,
-  "signature": "VHTKYV2R7geuYFFJC4dgS9MAvg0eGJOX9j0ZsQiTADtGV4Q9fjmK2+fdFfQwOaQyVySMgRagt/z8SIvs9zWjCA=="
+  "timestamp": 1786879992606,
+  "signingKeyId": "89031c64758b09f8",
+  "signature": "xANz6fX03uaKV00XBD9KZsbZPCu3/exEHLPrpehOw920Z1n1gChQbpW6UawyfE/tPGO/T1wnAupmohe1rpL2Bg=="
 }

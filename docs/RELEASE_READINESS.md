@@ -52,11 +52,21 @@ compatible). Every command below was **run**, not assumed._
 - The demo repo's embedded git history cannot be committed inside the
   repository — a fresh clone must run `bash scripts/seed-demo.sh` first
   (documented in `examples/demo-repo/README.md`).
-- `drift verify` re-runs the recorded command with the user's shell — only
-  run it on intents you trust (documented in SECURITY.md and api.md).
+- `drift verify <id>` is informational (never executes). A recorded
+  verification command runs only with `--run` on a validly signed manifest;
+  `--allow-untrusted-command` forces it with a prominent warning (documented
+  in SECURITY.md and api.md).
 - Redaction is regex-based defense-in-depth, not a guarantee.
 - Encryption at rest protects `.drift` storage; the git commit subject carries
-  a summary (default) or the full prompt (only in `[prompts] mode = "full"`).
+  the safe public summary (default) or the full prompt (only in
+  `[prompts] mode = "full"`).
+- Manifest schema: V2 (schemaVersion 2) never embeds the containing commit
+  SHA — the intent→commit association is derived from `Drift-Intent:`
+  trailers; V1 manifests (with a legacy `commit` field) are still read and
+  verified but their `commit` field is treated as untrusted legacy metadata.
+- A fresh clone's `drift init` preserves `.drift/public/key.pem` byte-for-byte
+  and enters read-only signer mode until `drift key import --file <path>`
+  restores the matching private key.
 - `--limit` values and other numeric flags are clamped, never thrown into SQL
   verbatim.
 

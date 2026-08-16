@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "id": "did_cbe6577e0ef93401327a429a444ac096",
+  "schemaVersion": 2,
+  "id": "did_6bb505af2d826c8ecf922f28e6f64e01",
   "summary": "Fix race condition in token refresh",
   "model": "claude-3-5-sonnet",
   "agent": {
@@ -19,7 +19,7 @@
       "summary": "function \"refreshToken\" added (line 12)"
     }
   ],
-  "commit": "366f6202fe8db281ff540e03c56512e429109f8b",
-  "timestamp": 1786874842855,
-  "signature": "qIcNKfD0J4DnAFrLROEweGfBi+Ht6QagSThIBYETTXQ7S3oiMEHrZUiu/fn2KgdvonyUnhubHRQf6X1kwIowCA=="
+  "timestamp": 1786879991635,
+  "signingKeyId": "89031c64758b09f8",
+  "signature": "lAQ6DBkqUf/iEE010LEgf2IzAdTgCDNXYWaWjH2zJ2uomklMXIwcQFwFdAhkTLJmhaO4Brz5FLJKLOlVFePyCQ=="
 }
