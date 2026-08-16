@@ -18,7 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -126,16 +126,34 @@ test("realize commits public provenance atomically — no second manual commit (
   assert.equal(exp.intents[0].gitSha, out.gitSha, "export resolves the commit from the trailer");
 });
 
-test("realize failure cleanup: source changes stay staged, generated manifest is removed (Part 12)", () => {
+test("realize failure cleanup: failed git commit restores the EXACT original index and removes the generated manifest", () => {
   const repo = makeRepo();
   assert.equal(run(repo, ["init"]).status, 0);
+  // The user's state BEFORE realize: a partially staged file (staged hunk +
+  // unstaged hunk), a fully staged file, an intent-to-add file, and an
+  // unstaged source edit — all of which must survive a commit failure.
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 96;\n");
+  git(repo, ["add", "src/a.ts"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 96;\nexport const partial = 1;\n"); // unstaged hunk
+  writeFileSync(join(repo, "src", "b.ts"), "export const b = 1;\n");
+  git(repo, ["add", "src/b.ts"]);
+  writeFileSync(join(repo, "src", "c.ts"), "export const c = 1;\n");
+  git(repo, ["add", "-N", "src/c.ts"]); // intent-to-add
   // Force `git commit` to fail deterministically (no identity configured).
   git(repo, ["config", "--unset-all", "user.name"]);
   git(repo, ["config", "--unset-all", "user.email"]);
-  writeFileSync(join(repo, "src", "a.ts"), "export const a = 99;\n");
+
+  const indexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+  const indexBefore = existsSync(indexPath) ? sha256(readFileSync(indexPath)) : "absent";
+  const cachedBefore = git(repo, ["diff", "--cached", "--binary"]);
+  const statusBefore = git(repo, ["status", "--porcelain=v2"]);
+  const stageBefore = git(repo, ["ls-files", "--stage"]);
+  const debugBefore = git(repo, ["ls-files", "--debug"]);
+
   const res = run(repo, ["realize", "-p", "do the thing", "--summary", "Do the thing"]);
   assert.notEqual(res.status, 0, "commit must fail without identity");
   assert.ok(res.stderr.includes("no history was created"), res.stderr);
+  assert.ok(res.stderr.includes("restored exactly"), res.stderr);
 
   // the generated manifest must not survive as if committed
   const onDisk = readdirSync(join(repo, ".drift", "public", "intents")).filter((f) => f.endsWith(".json"));
@@ -144,9 +162,49 @@ test("realize failure cleanup: source changes stay staged, generated manifest is
   for (const f of tracked) {
     assert.ok(!f.startsWith(".drift/public/intents"), `no manifest tracked after failure: ${f}`);
   }
-  // the user's source change is still staged for a safe retry
-  const staged = git(repo, ["diff", "--cached", "--name-only"]).split("\n").filter(Boolean);
-  assert.ok(staged.includes("src/a.ts"), "user source changes must remain staged");
+  // the index is byte-for-byte identical to the pre-Drift state: staged
+  // hunks, intent-to-add, staged files and Drift's own staging all restored
+  const indexAfter = existsSync(indexPath) ? sha256(readFileSync(indexPath)) : "absent";
+  assert.equal(indexAfter, indexBefore, "index file bytes must be identical after a failed commit");
+  assert.equal(git(repo, ["diff", "--cached", "--binary"]), cachedBefore, "staged diff must be byte-identical");
+  assert.equal(git(repo, ["status", "--porcelain=v2"]), statusBefore, "porcelain v2 status must be identical");
+  assert.equal(git(repo, ["ls-files", "--stage"]), stageBefore, "stage entries must be identical");
+  assert.equal(git(repo, ["ls-files", "--debug"]), debugBefore, "index flags (assume-unchanged etc.) must be identical");
+  // the working-tree source edit is intact (unstaged)
+  assert.ok(readFileSync(join(repo, "src", "a.ts"), "utf8").includes("export const partial = 1;"));
+});
+
+test("failed pre-commit hook also restores the exact original index (commit failure after public files staged)", () => {
+  const repo = makeRepo();
+  assert.equal(run(repo, ["init"]).status, 0);
+  // a pre-commit hook that always fails — the commit lands only AFTER the
+  // public files are staged, so this exercises the late-failure path
+  const hooksDir = join(repo, ".git", "hooks");
+  mkdirSync(hooksDir, { recursive: true });
+  writeFileSync(join(hooksDir, "pre-commit"), "#!/bin/sh\nexit 1\n");
+  if (process.platform !== "win32") {
+    // executable bit is irrelevant for git hooks (they run via the shell), but
+    // keep the file mode honest on POSIX
+    chmodSync(join(hooksDir, "pre-commit"), 0o755);
+  }
+  // user state: one fully staged file + one unstaged edit
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 97;\n");
+  git(repo, ["add", "src/a.ts"]);
+  writeFileSync(join(repo, "src", "b.ts"), "export const b = 2;\n"); // unstaged
+  const indexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+  const indexBefore = existsSync(indexPath) ? sha256(readFileSync(indexPath)) : "absent";
+  const cachedBefore = git(repo, ["diff", "--cached", "--binary"]);
+
+  const res = run(repo, ["realize", "-p", "hooked", "--summary", "Hooked"]);
+  assert.notEqual(res.status, 0, "the pre-commit hook must fail the commit");
+  assert.ok(res.stderr.includes("no history was created"), res.stderr);
+
+  const indexAfter = existsSync(indexPath) ? sha256(readFileSync(indexPath)) : "absent";
+  assert.equal(indexAfter, indexBefore, "index file bytes must be identical after the hook failure");
+  assert.equal(git(repo, ["diff", "--cached", "--binary"]), cachedBefore, "staged diff must be byte-identical");
+  assert.equal(readdirSync(join(repo, ".drift", "public", "intents")).filter((f) => f.endsWith(".json")).length, 0, "no manifest may survive");
+  // the unstaged edit is intact
+  assert.ok(readFileSync(join(repo, "src", "b.ts"), "utf8").includes("export const b = 2;"));
 });
 
 // ----------------------------------------------------------------- blocker B
