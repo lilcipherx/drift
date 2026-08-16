@@ -12,6 +12,7 @@ export type {
 export {
   PublicStore,
   buildPublicSummary,
+  genericPublicSummary,
   sanitizePublicText,
   PUBLIC_FILES_MAX,
   PUBLIC_SUMMARY_MAX,

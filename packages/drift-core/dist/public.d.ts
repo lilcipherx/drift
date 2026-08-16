@@ -10,7 +10,7 @@
  * signing key live in private (gitignored) locations. This module never sees
  * them: everything here is safe to commit and safe to render publicly.
  */
-/** Maximum length of the public summary (first line of the redacted prompt). */
+/** Maximum length of a public summary (explicit `--summary` or fallback). */
 export declare const PUBLIC_SUMMARY_MAX = 200;
 /** Maximum number of files recorded in a public manifest. */
 export declare const PUBLIC_FILES_MAX = 50;
@@ -48,14 +48,20 @@ export type UnsignedPublicIntentView = Omit<PublicIntentView, "signature">;
  */
 export declare function sanitizePublicText(text: string): string;
 /**
- * Redacted + sanitized + length-limited public summary for an intent.
- *
- * Only the FIRST LINE of the (already redacted) prompt is used — the same
- * rule as the commit-message `Intent:` subject — so a multi-paragraph prompt
- * can never fit into git history, a manifest, or a PR comment. `none` mode
- * passes "" and persists nothing derived from the prompt.
+ * Sanitize + length-limit a USER-SUPPLIED public summary (ADR-009). The caller
+ * redacts secrets first; this never touches the raw prompt. A one-line prompt
+ * is deliberately NOT used as a summary: the full first line of a one-line
+ * prompt would otherwise be copied verbatim into git history.
  */
-export declare function buildPublicSummary(redactedPrompt: string): string;
+export declare function buildPublicSummary(text: string): string;
+/**
+ * Generic fallback summary derived ONLY from non-prompt metadata (intent id,
+ * affected file count) — never from prompt text, so it is always safe to
+ * commit, clone, and render. Used when the user supplies no explicit summary.
+ */
+export declare function genericPublicSummary(id: string, opts?: {
+    fileCount?: number;
+}): string;
 export declare const PUBLIC_KEY_PATH: string;
 export declare const PUBLIC_INTENTS_DIR: string;
 /**

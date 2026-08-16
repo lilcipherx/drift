@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, join } from "node:path";
 import { canonicalJson, signPayload, verifyPayload } from "./crypto.js";
 
-/** Maximum length of the public summary (first line of the redacted prompt). */
+/** Maximum length of a public summary (explicit `--summary` or fallback). */
 export const PUBLIC_SUMMARY_MAX = 200;
 /** Maximum number of files recorded in a public manifest. */
 export const PUBLIC_FILES_MAX = 50;
@@ -71,18 +71,27 @@ export function sanitizePublicText(text: string): string {
 }
 
 /**
- * Redacted + sanitized + length-limited public summary for an intent.
- *
- * Only the FIRST LINE of the (already redacted) prompt is used — the same
- * rule as the commit-message `Intent:` subject — so a multi-paragraph prompt
- * can never fit into git history, a manifest, or a PR comment. `none` mode
- * passes "" and persists nothing derived from the prompt.
+ * Sanitize + length-limit a USER-SUPPLIED public summary (ADR-009). The caller
+ * redacts secrets first; this never touches the raw prompt. A one-line prompt
+ * is deliberately NOT used as a summary: the full first line of a one-line
+ * prompt would otherwise be copied verbatim into git history.
  */
-export function buildPublicSummary(redactedPrompt: string): string {
-  const firstLine = (sanitizePublicText(redactedPrompt).split(/\r?\n/)[0] ?? "").trim();
-  return firstLine.length <= PUBLIC_SUMMARY_MAX
-    ? firstLine
-    : `${firstLine.slice(0, PUBLIC_SUMMARY_MAX - 1)}…`;
+export function buildPublicSummary(text: string): string {
+  const cleaned = sanitizePublicText(text).trim();
+  return cleaned.length <= PUBLIC_SUMMARY_MAX
+    ? cleaned
+    : `${cleaned.slice(0, PUBLIC_SUMMARY_MAX - 1)}…`;
+}
+
+/**
+ * Generic fallback summary derived ONLY from non-prompt metadata (intent id,
+ * affected file count) — never from prompt text, so it is always safe to
+ * commit, clone, and render. Used when the user supplies no explicit summary.
+ */
+export function genericPublicSummary(id: string, opts: { fileCount?: number } = {}): string {
+  const base = `Drift intent ${id}`;
+  const n = opts.fileCount ?? 0;
+  return n > 0 ? `${base} (${n} file${n === 1 ? "" : "s"})` : base;
 }
 
 export const PUBLIC_KEY_PATH = join("public", "key.pem");

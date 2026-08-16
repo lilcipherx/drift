@@ -7,6 +7,13 @@ import { type DriftConfig, type PromptMode } from "./config.js";
 import { type IntentRecord, type LogEntry } from "./store.js";
 export interface RealizeOptions {
     prompt: string;
+    /**
+     * Explicit PUBLIC summary (ADR-009). Redacted, sanitized, length-limited
+     * before it can reach git history, manifests, PR comments or default JSON.
+     * When omitted, a generic non-prompt fallback is used instead of copying
+     * prompt text. Never derives from `prompt`.
+     */
+    summary?: string;
     files?: string[];
     model?: string;
     author?: string;
@@ -67,7 +74,12 @@ export interface DriftStatus {
     repoRoot: string | null;
     /** Why status is not fully initialized. */
     reason?: "no-git" | "not-initialized";
+    /** Merged intent count (committed public + local-only legacy). */
     intents?: number;
+    /** Committed public provenance count (canonical, survives clones). */
+    publicIntents?: number;
+    /** Local-only private store records (0 in a fresh clone before init). */
+    localIntents?: number;
     head?: string | null;
     encryption?: boolean;
     promptMode?: PromptMode;
@@ -132,8 +144,19 @@ export declare class Drift {
         file?: string;
         limit?: number;
     }): LogEntry[];
-    /** Safe public summary for an intent: manifest first, then derived. */
-    summaryFor(id: string, localPrompt: string): string;
+    /**
+     * Canonical provenance is the committed public manifest (ADR-009) — that is
+     * what survives a fresh clone and what the Action/App consume. The private
+     * store only enriches those entries with the local prompt; store-only
+     * (legacy pre-ADR-009) intents are kept so old repos keep working.
+     */
+    private mergeIntents;
+    /**
+     * Safe public summary for an intent: committed manifest first; for legacy
+     * pre-ADR-009 records without a manifest, a generic non-prompt fallback
+     * (never prompt text — public summaries cannot be reconstructed safely).
+     */
+    summaryFor(id: string, _localPrompt: string): string;
     blame(filePath: string, opts?: {
         line?: number;
         functionName?: string;

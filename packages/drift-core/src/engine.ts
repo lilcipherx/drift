@@ -60,9 +60,9 @@ import { IntentStore, type IntentRecord, type LogEntry } from "./store.js";
 import { compilePatterns, redact, type RedactResult } from "./redact.js";
 import {
   buildPublicSummary,
+  genericPublicSummary,
   PUBLIC_FILES_MAX,
   PublicStore,
-  sanitizePublicText,
   type PublicIntentView,
   type UnsignedPublicIntentView,
 } from "./public.js";
@@ -70,6 +70,13 @@ import { extractDriftIntentIds } from "./trailers.js";
 
 export interface RealizeOptions {
   prompt: string;
+  /**
+   * Explicit PUBLIC summary (ADR-009). Redacted, sanitized, length-limited
+   * before it can reach git history, manifests, PR comments or default JSON.
+   * When omitted, a generic non-prompt fallback is used instead of copying
+   * prompt text. Never derives from `prompt`.
+   */
+  summary?: string;
   files?: string[];
   model?: string;
   author?: string;
@@ -135,7 +142,12 @@ export interface DriftStatus {
   repoRoot: string | null;
   /** Why status is not fully initialized. */
   reason?: "no-git" | "not-initialized";
+  /** Merged intent count (committed public + local-only legacy). */
   intents?: number;
+  /** Committed public provenance count (canonical, survives clones). */
+  publicIntents?: number;
+  /** Local-only private store records (0 in a fresh clone before init). */
+  localIntents?: number;
   head?: string | null;
   encryption?: boolean;
   promptMode?: PromptMode;
@@ -243,10 +255,16 @@ export class Drift {
     if (!root) throw new DriftError("Not inside a git repository");
     const driftDir = join(root, ".drift");
     const firstTime = !existsSync(driftDir);
+    // Always (re)create the directories: `drift init` must also work on a
+    // fresh clone where `.drift/` exists (public provenance) but the local
+    // store, objects and keys do not (ADR-009). mkdir recursive is a no-op
+    // when they already exist. The config template is only written on first
+    // setup so a user-edited config.toml is never overwritten.
+    mkdirSync(driftDir, { recursive: true });
+    mkdirSync(join(driftDir, "objects"), { recursive: true });
+    mkdirSync(join(driftDir, "keys"), { recursive: true });
+    mkdirSync(join(driftDir, "public", "intents"), { recursive: true });
     if (firstTime) {
-      mkdirSync(join(driftDir, "objects"), { recursive: true });
-      mkdirSync(join(driftDir, "keys"), { recursive: true });
-      mkdirSync(join(driftDir, "public", "intents"), { recursive: true });
       writeFileSync(join(driftDir, "config.toml"), CONFIG_TEMPLATE);
     }
     // Idempotent merge: never deletes user lines, only ensures the ADR-009
@@ -331,10 +349,18 @@ export class Drift {
       const branchRes = execGit(root, ["branch", "--show-current"], true);
       const headRes = execGit(root, ["rev-parse", "--short", "HEAD"], true);
       const ws = execGit(root, ["status", "--porcelain", "--", ".", ":(exclude).drift"], true);
+      // Committed public manifests are canonical (ADR-009): an empty local
+      // store (e.g. right after `drift init` in a fresh clone) must never
+      // shadow them, so `intents` is the MERGED count, with the public and
+      // local-only parts reported separately.
+      const publicIntents = drift.publicStore.list().length;
+      const localIntents = drift.store ? drift.store.allRows().length : 0;
       return {
         initialized: true,
         repoRoot: root,
-        intents: drift.store ? drift.store.allRows().length : drift.publicStore.list().length,
+        intents: drift.log({}).length,
+        publicIntents,
+        localIntents,
         head: drift.store?.getHead() ?? null,
         encryption: drift.config.encryption.enabled,
         promptMode: drift.config.prompts.mode,
@@ -453,9 +479,17 @@ export class Drift {
     //                              the git commit message carries a safe summary.
     //   full                     — full prompt in the commit message too (legacy).
     //   none                     — prompt text is not persisted anywhere.
-    // The summary is derived from the ALREADY-redacted prompt, so a secret in
-    // the first line is redacted before it can reach the commit message.
+    // The PUBLIC summary is deliberately NOT derived from the prompt (ADR-009):
+    // the first line of a one-line prompt would otherwise be copied verbatim
+    // into git history, manifests and PR comments. It comes from an explicit
+    // `--summary` (redacted first, so secrets can't ride along) or a generic
+    // non-prompt fallback built from the intent id.
     const mode: PromptMode = this.config.prompts.mode;
+    const explicitSummary = opts.summary
+      ? buildPublicSummary(redact(opts.summary, this.redactionPatterns).text)
+      : "";
+    const publicSummary =
+      explicitSummary || (mode === "none" ? "" : genericPublicSummary(id, { fileCount: deltas.length }));
     const storePrompt = mode !== "none";
     const storedPrompt = storePrompt
       ? encKey
@@ -464,7 +498,10 @@ export class Drift {
       : "";
     const storedState =
       encKey && safeState !== undefined ? encryptAesGcm(safeState, encKey, id) : safeState;
-    const commitMessage = buildCommitMessage(safePrompt, id, {
+    const commitMessage = buildCommitMessage({
+      safePrompt,
+      summary: publicSummary,
+      intentId: id,
       mode,
       model: opts.model,
       verifyCmd: opts.verifyCmd,
@@ -524,7 +561,7 @@ export class Drift {
     const publicView: UnsignedPublicIntentView = {
       schemaVersion: 1,
       id,
-      summary: mode === "none" ? "" : buildPublicSummary(safePrompt),
+      summary: publicSummary,
       model: opts.model,
       agent: { type: author.type, identifier: author.identifier },
       verification: opts.verifyCmd,
@@ -541,36 +578,54 @@ export class Drift {
 
   // -------------------------------------------------------------------- log
   log(filters: { author?: string; model?: string; file?: string; limit?: number } = {}): LogEntry[] {
-    if (this.store) {
-      return this.store.listIntents(filters).map((e) => {
-        const prompt = this.decryptText(e.prompt, e.id);
-        return { ...e, prompt, summary: this.summaryFor(e.id, prompt) };
-      });
-    }
-    // Public-only (fresh clone): serve the committed public manifests.
-    let views = this.publicStore.list();
-    if (filters.author) {
-      views = views.filter((v) => v.agent?.identifier === filters.author);
-    }
-    if (filters.model) {
-      views = views.filter((v) => v.model === filters.model);
-    }
+    let entries = this.mergeIntents();
+    if (filters.author) entries = entries.filter((e) => e.authorId === filters.author);
+    if (filters.model) entries = entries.filter((e) => e.model === filters.model);
     if (filters.file) {
-      views = views.filter((v) =>
-        (v.files ?? []).some((f) => f.path === filters.file || f.path.startsWith(`${filters.file}/`)),
-      );
+      // prefix semantics mirror the store's SQL LIKE (e.g. `--file src/auth`
+      // matches src/auth.ts)
+      entries = entries.filter((e) => e.files.some((f) => f.path.startsWith(filters.file!)));
     }
+    entries.sort((a, b) => b.timestamp - a.timestamp);
     const limit = filters.limit !== undefined ? safeClamp(filters.limit, 100) : 100;
-    return views.slice(0, limit).map(publicViewToLogEntry);
+    return entries.slice(0, limit);
   }
 
-  /** Safe public summary for an intent: manifest first, then derived. */
-  summaryFor(id: string, localPrompt: string): string {
+  /**
+   * Canonical provenance is the committed public manifest (ADR-009) — that is
+   * what survives a fresh clone and what the Action/App consume. The private
+   * store only enriches those entries with the local prompt; store-only
+   * (legacy pre-ADR-009) intents are kept so old repos keep working.
+   */
+  private mergeIntents(): LogEntry[] {
+    const byId = new Map<string, LogEntry>();
+    for (const view of this.publicStore.list()) {
+      if (!byId.has(view.id)) byId.set(view.id, publicViewToLogEntry(view));
+    }
+    if (this.store) {
+      for (const e of this.store.listIntents({})) {
+        const existing = byId.get(e.id);
+        if (existing) {
+          existing.prompt = this.decryptText(e.prompt, e.id);
+          existing.summary = existing.summary || this.summaryFor(e.id, existing.prompt);
+        } else {
+          const prompt = this.decryptText(e.prompt, e.id);
+          byId.set(e.id, { ...e, prompt, summary: this.summaryFor(e.id, prompt) });
+        }
+      }
+    }
+    return [...byId.values()];
+  }
+
+  /**
+   * Safe public summary for an intent: committed manifest first; for legacy
+   * pre-ADR-009 records without a manifest, a generic non-prompt fallback
+   * (never prompt text — public summaries cannot be reconstructed safely).
+   */
+  summaryFor(id: string, _localPrompt: string): string {
     const view = this.publicStore.getById(id);
     if (view) return view.summary;
-    // Pre-ADR-009 local intent with no manifest yet — derive a safe summary
-    // from the (already redacted) stored prompt.
-    return localPrompt ? buildPublicSummary(sanitizePublicText(localPrompt)) : "";
+    return genericPublicSummary(id);
   }
 
   // ------------------------------------------------------------------ blame
@@ -647,31 +702,45 @@ export class Drift {
     const committed = sha !== "0000000000000000000000000000000000000000";
     let intent: (IntentRecord & { signatureValid: boolean; summary: string }) | null = null;
     if (committed) {
-      let record: IntentRecord | null = this.store?.findByGitSha(sha) ?? null;
+      let record: IntentRecord | null = null;
       let signatureValid = false;
-      if (!record) {
-        // Fresh clone (no private DB): resolve via the committed manifest.
-        const view = this.publicStore.findByCommit(sha);
-        if (view) {
-          record = publicViewToIntentRecord(view);
-          signatureValid = this.publicStore.verifySignature(view);
+      // Canonical provenance is the committed public manifest (ADR-009) — it
+      // verifies against the COMMITTED public key, so a fresh clone or a
+      // regenerated local key can never make a real signature look valid
+      // (or invalid) by accident. The private store is only a legacy fallback
+      // for pre-ADR-009 intents that have no manifest yet.
+      const view = this.publicStore.findByCommit(sha);
+      const localRecord = this.store?.findByGitSha(sha) ?? null;
+      if (view) {
+        record = publicViewToIntentRecord(view);
+        signatureValid = this.publicStore.verifySignature(view);
+        // Enrich with the LOCAL private prompt/state when present (surfaced
+        // only through the CLI's explicit --include-private-prompt flag).
+        if (localRecord) {
+          record.prompt = localRecord.prompt;
+          record.agentState = localRecord.agentState;
+          record.objectPath = localRecord.objectPath;
+          record.signature = localRecord.signature;
         }
-      } else if (this.store) {
-        const obj = this.store.readObjectRecord(record.objectPath);
-        const canonical = obj
-          ? canonicalJson({
-              id: (obj.id as string) ?? record.id,
-              parentId: (obj.parentId as string | null) ?? record.parentId,
-              author: obj.author ?? record.author,
-              prompt: (obj.prompt as string) ?? record.prompt,
-              astDelta: obj.astDelta ?? record.astDelta,
-              agentState: obj.agentState ?? record.agentState,
-              verifyCmd: obj.verifyCmd ?? record.verifyCmd,
-              timestamp: (obj.timestamp as number) ?? record.timestamp,
-            })
-          : "";
-        const signature = (obj?.signature as string | undefined) ?? record.signature;
-        signatureValid = signature ? verifyPayload(canonical, this.publicKeyPem, signature) : false;
+      } else if (localRecord) {
+        record = localRecord;
+        if (this.store) {
+          const obj = this.store.readObjectRecord(record.objectPath);
+          const canonical = obj
+            ? canonicalJson({
+                id: (obj.id as string) ?? record.id,
+                parentId: (obj.parentId as string | null) ?? record.parentId,
+                author: obj.author ?? record.author,
+                prompt: (obj.prompt as string) ?? record.prompt,
+                astDelta: obj.astDelta ?? record.astDelta,
+                agentState: obj.agentState ?? record.agentState,
+                verifyCmd: obj.verifyCmd ?? record.verifyCmd,
+                timestamp: (obj.timestamp as number) ?? record.timestamp,
+              })
+            : "";
+          const signature = (obj?.signature as string | undefined) ?? record.signature;
+          signatureValid = signature ? verifyPayload(canonical, this.publicKeyPem, signature) : false;
+        }
       }
       if (record) {
         const prompt = this.decryptText(record.prompt, record.id);
@@ -704,23 +773,17 @@ export class Drift {
     if (!isInsideRepo(this.repoRoot, file)) {
       throw new DriftError(`Path escapes the repository root: ${filePath}`);
     }
-    if (this.store) {
-      return this.store.contextForFile(relative, limit).map((e) => {
-        const prompt = this.decryptText(e.prompt, e.id);
-        return { ...e, prompt, summary: this.summaryFor(e.id, prompt) };
-      });
-    }
-    return this.publicStore
-      .list()
-      .filter((v) => (v.files ?? []).some((f) => f.path === relative))
-      .slice(0, safeClamp(limit, 5))
-      .map(publicViewToLogEntry);
+    const entries = this.mergeIntents().filter((e) => e.files.some((f) => f.path === relative));
+    entries.sort((a, b) => b.timestamp - a.timestamp);
+    return entries.slice(0, safeClamp(limit, 5));
   }
 
   // ---------------------------------------------------------------- verify
   verify(intentId: string): VerifyResult {
-    const record = this.store ? this.store.getById(intentId) : null;
-    const view = record ? null : this.publicStore.getById(intentId);
+    // Committed public manifest is canonical (ADR-009); the private store is
+    // only a legacy fallback, so a fresh clone can still run `drift verify`.
+    const view = this.publicStore.getById(intentId);
+    const record = view ? null : (this.store ? this.store.getById(intentId) : null);
     if (!record && !view) throw new DriftError(`Intent not found: ${intentId}`);
     const verifyCmd = record?.verifyCmd ?? view?.verification ?? null;
     if (!verifyCmd) {
@@ -990,68 +1053,74 @@ export class Drift {
   }
 
   verifyIntentSignature(intentId: string): { ok: boolean; detail: string } {
+    // Canonical provenance is the committed public manifest, verified against
+    // the COMMITTED public key — a newly generated local key (e.g. after
+    // `drift init` in a clone) must never be used to judge an old record.
+    const view = this.publicStore.getById(intentId);
+    if (view) {
+      const pub = this.publicStore.publicKey();
+      if (!pub) return { ok: false, detail: "unverifiable: no committed public key" };
+      const valid = this.publicStore.verifySignature(view);
+      return { ok: valid, detail: valid ? "valid" : "invalid" };
+    }
+    // Legacy pre-ADR-009 intent: verify the private object against the public
+    // key recorded in the local store (the key that originally signed it).
     if (this.store) {
       const intent = this.store.getById(intentId);
       if (!intent) return { ok: false, detail: "not found" };
       const obj = this.store.readObjectRecord(intent.objectPath);
       if (!obj?.signature) return { ok: false, detail: "object or signature missing" };
-      const canonical = obj
-        ? canonicalJson({
-            id: obj.id,
-            parentId: obj.parentId,
-            author: obj.author,
-            prompt: obj.prompt,
-            astDelta: obj.astDelta,
-            agentState: obj.agentState,
-            verifyCmd: obj.verifyCmd,
-            timestamp: obj.timestamp,
-          })
-        : "";
-      const valid = verifyPayload(canonical, this.publicKeyPem, obj.signature as string);
+      const canonical = canonicalJson({
+        id: obj.id,
+        parentId: obj.parentId,
+        author: obj.author,
+        prompt: obj.prompt,
+        astDelta: obj.astDelta,
+        agentState: obj.agentState,
+        verifyCmd: obj.verifyCmd,
+        timestamp: obj.timestamp,
+      });
+      const recordedPub = this.store.getMeta("public_key") ?? this.publicKeyPem;
+      const valid = verifyPayload(canonical, recordedPub, obj.signature as string);
       return { ok: valid, detail: valid ? "valid" : "invalid" };
     }
-    // Public-only clone: verify the committed manifest signature.
-    const view = this.publicStore.getById(intentId);
-    if (!view) return { ok: false, detail: "not found" };
-    const valid = this.publicStore.verifySignature(view);
-    return { ok: valid, detail: valid ? "valid" : "invalid" };
+    return { ok: false, detail: "not found" };
   }
 }
 
 /**
- * Build the git commit message from the (redacted) prompt.
+ * Build the git commit message. The subject is the PUBLIC summary — an
+ * explicit `--summary` or a generic non-prompt fallback — never prompt text
+ * (ADR-009), so a one-line prompt can never leak verbatim into history.
  *
  * `commit-summary` / `none`:
- *   Intent: <first line, truncated to 72 chars>
+ *   Intent: <public summary, truncated to 72 chars>
  *
  *   Model: <model>              (when recorded)
  *   Verification: <verifyCmd>   (when recorded)
  *   Drift-Intent: <id>
  *
- * `full` (legacy): the complete redacted prompt, then the trailer.
+ * `full` (legacy, explicit opt-in): the complete redacted prompt, then the
+ * trailer. This mode is visibly unsafe and documented as such.
  */
-function buildCommitMessage(
-  safePrompt: string,
-  intentId: string,
-  opts: { mode: PromptMode; model?: string; verifyCmd?: string },
-): string {
+function buildCommitMessage(opts: {
+  safePrompt: string;
+  summary: string;
+  intentId: string;
+  mode: PromptMode;
+  model?: string;
+  verifyCmd?: string;
+}): string {
   if (opts.mode === "full") {
-    return `${safePrompt}\n\nDrift-Intent: ${intentId}`;
+    return `${opts.safePrompt}\n\nDrift-Intent: ${opts.intentId}`;
   }
   const trailers: string[] = [];
   if (opts.model) trailers.push(`Model: ${opts.model}`);
   if (opts.verifyCmd) trailers.push(`Verification: ${opts.verifyCmd}`);
-  trailers.push(`Drift-Intent: ${intentId}`);
-  // `none`: the subject must never be derived from the prompt — a one-line
-  // prompt would otherwise leak verbatim into git history. Use a generic
-  // subject; the trailer carries the machine-readable link.
-  if (opts.mode === "none") {
-    return `Intent recorded\n\n${trailers.join("\n")}`;
-  }
-  const firstLine = (safePrompt.split(/\r?\n/)[0] ?? "").trim();
-  const summary =
-    (firstLine.length > 72 ? `${firstLine.slice(0, 71)}…` : firstLine) || "intent recorded";
-  return `Intent: ${summary}\n\n${trailers.join("\n")}`;
+  trailers.push(`Drift-Intent: ${opts.intentId}`);
+  const subject = (opts.summary || "Intent recorded").replace(/\s+/g, " ").trim();
+  const trimmed = subject.length > 72 ? `${subject.slice(0, 71)}…` : subject;
+  return `Intent: ${trimmed}\n\n${trailers.join("\n")}`;
 }
 
 function publicKeyFromPrivate(privateKeyPem: string): string {

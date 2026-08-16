@@ -1,6 +1,6 @@
 export { Drift, ensureDriftGitignore } from "./engine.js";
 export type { BlameResult, DoctorCheck, DoctorResult, InitResult, RealizeOptions, RealizeResult, ReplayResult, VerifyResult, } from "./engine.js";
-export { PublicStore, buildPublicSummary, sanitizePublicText, PUBLIC_FILES_MAX, PUBLIC_SUMMARY_MAX, } from "./public.js";
+export { PublicStore, buildPublicSummary, genericPublicSummary, sanitizePublicText, PUBLIC_FILES_MAX, PUBLIC_SUMMARY_MAX, } from "./public.js";
 export type { PublicAgent, PublicIntentFile, PublicIntentView, UnsignedPublicIntentView, } from "./public.js";
 export { DRIFT_INTENT_ID_RE, extractDriftIntentIds, parseGitTrailers } from "./trailers.js";
 export type { GitTrailer } from "./trailers.js";
