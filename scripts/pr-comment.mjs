@@ -24,17 +24,142 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { createPublicKey, verify as nodeVerify } from "node:crypto";
+import { createHash, createPublicKey, verify as nodeVerify } from "node:crypto";
 import { readFileSync, existsSync, appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
 
-export const SUMMARY_MARKER = "<!-- drift:summary -->";
+// Distinct marker version 2: the composite Action owns
+// `<!-- drift:action-summary:v2 -->` and the GitHub App owns
+// `<!-- drift:app-summary:v2 -->` — each integration never edits the other's
+// comment. The interim `<!-- drift:pr-summary:v2 -->` marker (used by both
+// before the split) and the legacy v1 `<!-- drift:summary -->` marker are
+// still recognized for in-place migration, but ONLY when comment ownership
+// is independently verified (see isDriftOwnedComment) — a user-authored
+// spoofed marker is never touched.
+export const SUMMARY_MARKER = "<!-- drift:action-summary:v2 -->";
+export const LEGACY_SUMMARY_MARKERS = ["<!-- drift:pr-summary:v2 -->", "<!-- drift:summary -->"];
 const MAX_INTENTS = 10;
 const MAX_FILES = 10;
 const SUMMARY_LIMIT = 500;
 const META_LIMIT = 120;
 const TOTAL_LIMIT = 12000;
+
+// ---------------------------------------------------------------------------
+// Strict public-manifest validation (dependency-free mirror of @drift/core
+// parsePublicIntentManifest — a committed manifest is attacker-controlled
+// input and must never crash a consumer or be rendered as valid).
+// ---------------------------------------------------------------------------
+
+const INTENT_ID_RE = /^did_[0-9a-f]{32}$/;
+const MUTATION_ENUM = new Set(["ADDED", "MODIFIED", "DELETED"]);
+const MANIFEST_MAX_BYTES = 256 * 1024;
+const MANIFEST_SUMMARY_MAX = 2000;
+const MANIFEST_FILES_MAX = 50;
+const MANIFEST_FILE_PATH_MAX = 1024;
+const MANIFEST_FILE_SUMMARY_MAX = 500;
+const MANIFEST_META_MAX = 200;
+const MANIFEST_VERIFY_MAX = 1000;
+const MANIFEST_SIGNATURE_MAX = 4096;
+const MANIFEST_TIMESTAMP_MAX = 8_640_000_000_000_000;
+
+export function validateManifest(json, { expectedId } = {}) {
+  const errors = [];
+  const push = (field, message) => {
+    if (errors.length < 50) errors.push({ field, message });
+  };
+  const fail = () => ({ ok: false, errors });
+  if (typeof json !== "object" || json === null || Array.isArray(json)) {
+    push("$schema", "not an object");
+    return fail();
+  }
+  const sv = json.schemaVersion;
+  if (!Number.isInteger(sv) || (sv !== 1 && sv !== 2)) {
+    push("schemaVersion", `unsupported schema version ${String(sv)}`);
+    return fail();
+  }
+  const id = json.id;
+  if (typeof id !== "string" || !INTENT_ID_RE.test(id)) {
+    push("id", "invalid Drift intent id");
+    return fail();
+  }
+  if (expectedId !== undefined && id !== expectedId) {
+    push("id", `does not match ${expectedId}`);
+    return fail();
+  }
+  if (typeof json.summary !== "string") push("summary", "expected a string");
+  else if (json.summary.length > MANIFEST_SUMMARY_MAX) push("summary", "too long");
+  else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(json.summary)) push("summary", "control characters");
+  if (typeof json.timestamp !== "number" || !Number.isInteger(json.timestamp) || json.timestamp < 0) {
+    push("timestamp", "expected a non-negative integer");
+  } else if (json.timestamp > MANIFEST_TIMESTAMP_MAX) push("timestamp", "out of range");
+  if (json.signature !== undefined && json.signature !== null) {
+    if (typeof json.signature !== "string" || json.signature.length > MANIFEST_SIGNATURE_MAX) {
+      push("signature", "expected a bounded string");
+    } else if (json.signature.length > 0) {
+      try {
+        const decoded = Buffer.from(json.signature, "base64").toString("base64").replace(/=+$/, "");
+        if (decoded !== json.signature.replace(/=+$/, "")) push("signature", "not valid base64");
+      } catch {
+        push("signature", "not valid base64");
+      }
+    }
+  }
+  if (json.agent !== undefined) {
+    if (typeof json.agent !== "object" || json.agent === null || Array.isArray(json.agent)) {
+      push("agent", "expected an object");
+    } else {
+      if (typeof json.agent.type !== "string" || json.agent.type.length === 0 || json.agent.type.length > 20) push("agent.type", "invalid");
+      if (typeof json.agent.identifier !== "string" || json.agent.identifier.length > MANIFEST_META_MAX) push("agent.identifier", "invalid");
+    }
+  }
+  if (json.model !== undefined && (typeof json.model !== "string" || json.model.length > MANIFEST_META_MAX)) push("model", "invalid");
+  if (json.verification !== undefined && (typeof json.verification !== "string" || json.verification.length > MANIFEST_VERIFY_MAX)) push("verification", "invalid");
+  if (json.files !== undefined) {
+    if (!Array.isArray(json.files)) push("files", "expected an array");
+    else if (json.files.length > MANIFEST_FILES_MAX) push("files", "too many entries");
+    else json.files.forEach((f, i) => {
+      if (typeof f !== "object" || f === null || Array.isArray(f)) {
+        push(`files[${i}]`, "expected an object");
+        return;
+      }
+      if (typeof f.path !== "string" || f.path.length === 0 || f.path.length > MANIFEST_FILE_PATH_MAX) push(`files[${i}].path`, "invalid");
+      if (typeof f.mutationType !== "string" || !MUTATION_ENUM.has(f.mutationType)) push(`files[${i}].mutationType`, "unsupported");
+      if (f.summary !== undefined && (typeof f.summary !== "string" || f.summary.length > MANIFEST_FILE_SUMMARY_MAX)) push(`files[${i}].summary`, "invalid");
+    });
+  }
+  if (sv === 1) {
+    if (typeof json.commit !== "string" || json.commit.length > 64) push("commit", "invalid");
+  } else {
+    if (typeof json.signingKeyId !== "string" || !/^[0-9a-f]{16}$/.test(json.signingKeyId)) {
+      push("signingKeyId", "must be a 16-hex-char key fingerprint");
+    }
+  }
+  return errors.length > 0 ? fail() : { ok: true, value: json };
+}
+
+/** Read + strictly validate one manifest. Never throws on hostile files. */
+export function readManifest(repoRoot, id) {
+  const path = join(repoRoot, ".drift", "public", "intents", `${id}.json`);
+  if (!existsSync(path)) return { manifest: null, errors: null };
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return { manifest: null, errors: [{ field: "$file", message: "manifest file unreadable" }] };
+  }
+  if (Buffer.byteLength(raw, "utf8") > MANIFEST_MAX_BYTES) {
+    return { manifest: null, errors: [{ field: "$file", message: "manifest exceeds maximum size" }] };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { manifest: null, errors: [{ field: "$file", message: "not valid JSON" }] };
+  }
+  const result = validateManifest(parsed, { expectedId: id });
+  return result.ok ? { manifest: result.value, errors: null } : { manifest: null, errors: result.errors };
+}
 
 // ---------------------------------------------------------------------------
 // Sanitization (mirrors @drift/core sanitizePublicText so this script stays
@@ -181,16 +306,6 @@ export function extractDriftIntentIds(message, gitImpl = git, repoRoot = process
 // Intent loading — public manifests only
 // ---------------------------------------------------------------------------
 
-export function readManifest(repoRoot, id) {
-  const path = join(repoRoot, ".drift", "public", "intents", `${id}.json`);
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
 /** Read a file's content at a git ref (`git show ref:path`), or null. */
 export function getFileAt(repoRoot, ref, path, gitImpl = git) {
   const res = gitImpl(repoRoot, ["show", `${ref}:${path}`]);
@@ -235,22 +350,53 @@ export function verifyManifestSignature(manifest, publicKeyPem) {
  * Resolve the signature/trust state of one manifest against the TRUSTED base
  * key and the PR-head key (which is untrusted until a controlled rotation):
  *   valid           — verifies against the base-branch trust root.
- *   invalid         — a signature exists but verifies against neither key.
+ *   invalid         — a signature exists but verifies against neither key,
+ *                     OR (bootstrap) the head signature fails cryptographic
+ *                     verification — a failed signature is NEVER "bootstrap".
  *   unsigned        — no signature recorded.
- *   unverifiable    — no verification material available (no base key).
+ *   unverifiable    — no usable verification material (malformed key, or no
+ *                     base key and no head key).
  *   untrusted-key   — verifies ONLY against a PR-replaced key (rotation).
- *   bootstrap       — base has no Drift key at all (initial adoption).
+ *   bootstrap       — base has no Drift key at all AND the head signature
+ *                     verifies against the head key (initial adoption).
+ *   malformed       — the manifest fails strict schema validation.
  */
-export function signatureStateFor(manifest, { baseKey, headKey }) {
+export function signatureStateFor(manifest, { baseKey, headKey, malformed = false }) {
+  if (malformed) return "malformed";
   if (!manifest) return "missing";
   if (typeof manifest.signature !== "string" || !manifest.signature) return "unsigned";
-  if (!baseKey && !headKey) return "unverifiable";
-  if (baseKey && verifyManifestSignature(manifest, baseKey)) return "valid";
-  if (headKey && verifyManifestSignature(manifest, headKey)) {
-    return baseKey ? "untrusted-key" : "bootstrap";
+  const baseUsable = baseKey != null && looksLikePublicKey(baseKey);
+  const headUsable = headKey != null && looksLikePublicKey(headKey);
+  // A malformed base trust root is unusable — mark unverifiable rather than
+  // guessing. (If the PR also replaced it, the key-change warning fires
+  // separately.)
+  if (baseKey != null && !baseUsable) return "unverifiable";
+  const baseValid = baseUsable && verifyManifestSignature(manifest, baseKey);
+  const headValid = headUsable && verifyManifestSignature(manifest, headKey);
+  if (baseUsable) {
+    if (baseValid) {
+      // A cryptographically valid signature with a mismatched V2
+      // `signingKeyId` must not be reported as valid.
+      if (manifest.schemaVersion === 2 && manifest.signingKeyId !== signingKeyIdFor(baseKey)) return "invalid";
+      return "valid";
+    }
+    if (headValid) return "untrusted-key";
+    return "invalid";
   }
-  if (!baseKey) return "bootstrap";
-  return "invalid";
+  // No base trust root (initial adoption): the head signature must actually
+  // VERIFY to count as bootstrap — a failed signature is simply invalid.
+  if (headUsable && headValid) return "bootstrap";
+  if (headUsable) return "invalid";
+  return "unverifiable";
+}
+
+function looksLikePublicKey(pem) {
+  return typeof pem === "string" && pem.includes("PUBLIC KEY");
+}
+
+/** Short sha256 fingerprint of a PEM public key (first 16 hex chars). */
+export function signingKeyIdFor(publicKeyPem) {
+  return createHash("sha256").update(String(publicKeyPem ?? "").trim(), "utf8").digest("hex").slice(0, 16);
 }
 
 /**
@@ -279,11 +425,14 @@ export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManif
 
   const intents = [];
   for (const id of ids) {
-    const manifest = readManifestImpl(repoRoot, id);
+    const loaded = readManifestImpl(repoRoot, id);
+    const manifest = loaded?.manifest ?? null;
+    const malformed = Boolean(loaded && Array.isArray(loaded.errors) && loaded.errors.length > 0);
     intents.push({
       id,
       summary: manifest?.summary ?? `Drift intent ${id}`,
-      missingManifest: !manifest,
+      missingManifest: !manifest && !malformed,
+      malformedManifest: malformed,
       model: manifest?.model ?? null,
       authorId: manifest?.agent?.identifier ?? null,
       authorType: manifest?.agent?.type ?? null,
@@ -302,6 +451,131 @@ export function intentsFromCommits({ repoRoot, commits, gitImpl = git, readManif
 }
 
 // ---------------------------------------------------------------------------
+// Public-provenance integrity audit (append-only rules)
+// ---------------------------------------------------------------------------
+
+/**
+ * Audit ALL changes under `.drift/public/` between the merge base and the PR
+ * head — not just trailer-derived intents. A pull request can tamper with
+ * public provenance without introducing any new `Drift-Intent:` trailer, and
+ * that must be visible. Rules (ADR-009 append-only model):
+ *
+ *   added manifest      → OK only when introduced by a PR commit whose message
+ *                         carries exactly ONE matching Drift-Intent trailer
+ *                         (atomic association); otherwise an orphan.
+ *   modified manifest   → violation (append-only).
+ *   deleted manifest    → violation (append-only).
+ *   renamed manifest    → violation (append-only).
+ *   trailer for an id whose manifest already existed at base → replay.
+ *   one id referenced by >1 distinct PR commit → ambiguous association.
+ *   trailer without manifest → missing-manifest (not a violation; surfaced
+ *                         as the missing state).
+ *
+ * Returns { violations, replayIds, ambiguousIds, orphanIds } where each
+ * violation is { code, id, detail } (codes: modified/deleted/renamed/orphan).
+ */
+export function auditPublicProvenance({ repoRoot, baseSha, headSha, commits, gitImpl = git }) {
+  const violations = [];
+  const replayIds = [];
+  const ambiguousIds = [];
+  const orphanIds = [];
+  const mb = gitImpl(repoRoot, ["merge-base", baseSha, headSha]);
+  const mergeBase = mb.status === 0 && mb.stdout.trim() ? mb.stdout.trim() : baseSha;
+
+  // NUL-safe diff of the public tree (bounded output).
+  const diff = gitImpl(repoRoot, ["diff", "--name-status", "-z", mergeBase, headSha, "--", ".drift/public"]);
+  const parts = (diff.stdout ?? "").split("\0").filter((p) => p.length > 0);
+  const entries = [];
+  let i = 0;
+  while (i < parts.length) {
+    const status = parts[i++] ?? "";
+    const code = status[0];
+    if (code === "R") {
+      const oldPath = parts[i++];
+      const newPath = parts[i++];
+      if (oldPath && newPath) entries.push({ status: "R", oldPath, newPath });
+    } else {
+      const path = parts[i++];
+      if (path) entries.push({ status: code, path });
+    }
+  }
+
+  const manifestId = (path) => {
+    const m = /^\.drift\/public\/intents\/(did_[0-9a-f]{32})\.json$/.exec(path);
+    return m ? m[1] : null;
+  };
+
+  // Which ids do the PR commits reference, and how often? (ambiguous = >1)
+  const commitCount = new Map();
+  const introCommit = new Map();
+  for (const sha of commits) {
+    const res = gitImpl(repoRoot, ["log", "-1", "--format=%B", sha]);
+    if (res.status !== 0) continue;
+    for (const id of extractDriftIntentIds(res.stdout, gitImpl, repoRoot)) {
+      commitCount.set(id, (commitCount.get(id) ?? 0) + 1);
+      if (!introCommit.has(id)) introCommit.set(id, sha);
+    }
+  }
+
+  for (const entry of entries) {
+    if (entry.status === "R") {
+      const oldId = manifestId(entry.oldPath);
+      const newId = manifestId(entry.newPath);
+      if (oldId || newId) {
+        violations.push({ code: "renamed", id: oldId ?? newId, detail: `${entry.oldPath} → ${entry.newPath}` });
+      }
+      continue;
+    }
+    const id = manifestId(entry.path);
+    if (entry.status === "A" && id) {
+      const n = commitCount.get(id) ?? 0;
+      if (n === 0) {
+        violations.push({
+          code: "orphan",
+          id,
+          detail: "new public manifest added without any Drift-Intent trailer on this PR",
+        });
+        orphanIds.push(id);
+        continue;
+      }
+      if (n > 1) {
+        ambiguousIds.push(id);
+        continue;
+      }
+      // Exactly one reference: atomic association requires the file's
+      // introducing commit to be the PR commit that carries the trailer.
+      const introduced = gitImpl(repoRoot, ["log", "-1", "--format=%H", "--diff-filter=A", `${mergeBase}..${headSha}`, "--", entry.path]);
+      const introSha = introduced.status === 0 ? introduced.stdout.trim() : "";
+      if (!introSha || introCommit.get(id) !== introSha) {
+        violations.push({
+          code: "orphan",
+          id,
+          detail: `new public manifest introduced by a different commit than its Drift-Intent trailer${introSha ? ` (introduced by ${introSha.slice(0, 7)})` : ""}`,
+        });
+        orphanIds.push(id);
+      }
+      continue;
+    }
+    if (id) {
+      if (entry.status === "M") violations.push({ code: "modified", id, detail: "an existing public manifest must be append-only" });
+      else if (entry.status === "D") violations.push({ code: "deleted", id, detail: "an existing public manifest must not be deleted by a pull request" });
+    }
+  }
+
+  // Replay: a PR commit references an intent whose manifest already exists
+  // on the base branch.
+  for (const [id] of commitCount) {
+    const exists = gitImpl(repoRoot, ["cat-file", "-e", `${baseSha}:.drift/public/intents/${id}.json`]).status === 0;
+    if (exists) replayIds.push(id);
+  }
+  // Ambiguous: the same intent id referenced from multiple distinct commits.
+  for (const [id, n] of commitCount) {
+    if (n > 1) ambiguousIds.push(id);
+  }
+  return { violations, replayIds, ambiguousIds, orphanIds };
+}
+
+// ---------------------------------------------------------------------------
 // Comment building (safe public data only)
 // ---------------------------------------------------------------------------
 
@@ -313,15 +587,37 @@ const SIGNATURE_LABELS = {
   unverifiable: "⚠ unverifiable (no verification key)",
   "untrusted-key": "⚠ unverified — signed with a different key than the base branch",
   bootstrap: "unverified bootstrap (base branch has no Drift key yet)",
+  malformed: "⚠ malformed public manifest — not verified",
   missing: "⚠ public provenance manifest missing",
 };
 
-/** Build the summary comment body. Returns null when there is nothing to say. */
-export function buildSummary(intents) {
-  if (!Array.isArray(intents) || intents.length === 0) return null;
+/**
+ * Prominent trust-root warning (also used for key-only PRs, where it is the
+ * entire body). Never auto-trusts a replacement key.
+ */
+export const TRUST_ROOT_WARNING =
+  "## ⚠ Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
+
+/**
+ * Build the summary comment body. Returns null when there is nothing to say
+ * (no intents, no trust-root change, no provenance-integrity violations).
+ */
+export function buildSummary(intents, { keyChange, audit } = {}) {
+  const hasIntents = Array.isArray(intents) && intents.length > 0;
+  const integrityIssues =
+    audit &&
+    (audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0);
+  if (!hasIntents && !keyChange && !integrityIssues) return null;
+  const lines = [SUMMARY_MARKER];
+  if (keyChange) {
+    lines.push(TRUST_ROOT_WARNING);
+    if (!hasIntents && !integrityIssues) return lines.join("\n");
+    lines.push("", "---", "");
+  }
+  lines.push("## Drift — Why this changed");
+  lines.push("");
   const shown = intents.slice(0, MAX_INTENTS);
   const truncatedIntents = intents.length > MAX_INTENTS;
-  const lines = [SUMMARY_MARKER, "## Drift — Why this changed", ""];
   lines.push(`${shown.length} intent${shown.length === 1 ? "" : "s"} on this PR`);
   for (const intent of shown) {
     lines.push("", `### Intent \`${safe(intent.id, 12)}\``, "");
@@ -364,6 +660,18 @@ export function buildSummary(intents) {
   if (truncatedIntents) {
     lines.push("", `_… and ${intents.length - MAX_INTENTS} more intent(s) not shown._`);
   }
+  if (integrityIssues) {
+    lines.push("", "## ⚠ Public provenance integrity violations", "");
+    for (const v of audit.violations) {
+      lines.push(`- **${safe(v.code, 16)}** \`${safe(v.id, 40)}\` — ${safe(v.detail, 200)}`);
+    }
+    for (const id of audit.replayIds) {
+      lines.push(`- **replayed** \`${safe(id, 40)}\` — this intent's manifest already exists on the base branch; a new commit must not re-reference it`);
+    }
+    for (const id of audit.ambiguousIds) {
+      lines.push(`- **ambiguous** \`${safe(id, 40)}\` — the intent id is referenced by more than one commit on this PR`);
+    }
+  }
   lines.push("", "---", "_Generated by [Drift](https://github.com/lilcipherx/drift) — Git tracks what changed. Drift tracks why._");
   let body = lines.join("\n");
   if (body.length > TOTAL_LIMIT) {
@@ -377,9 +685,43 @@ export function buildSummary(intents) {
 // ---------------------------------------------------------------------------
 
 /**
- * Post the comment, or update the FIRST existing Drift comment in place
- * (idempotent across `synchronize` deliveries). Never posts a duplicate when
- * a marker comment already exists; never touches comments without the marker.
+ * A comment belongs to the ACTION ONLY when GitHub itself attests that the
+ * composite Action authored it (`github-actions[bot]` login is
+ * server-controlled — a commenter cannot set it). Comments authored by the
+ * GitHub App (`performed_via_github_app`) are owned by the App and the
+ * Action must NEVER edit them; user-authored bodies that merely contain a
+ * marker are spoofs and are never touched.
+ */
+export function isDriftOwnedComment(comment) {
+  if (!comment || typeof comment !== "object") return false;
+  if (typeof comment.body !== "string") return false;
+  const hasMarker =
+    comment.body.includes(SUMMARY_MARKER) ||
+    LEGACY_SUMMARY_MARKERS.some((m) => comment.body.includes(m));
+  if (!hasMarker) return false;
+  const login = comment.user?.login;
+  if (typeof login === "string" && login === "github-actions[bot]") return true;
+  // A performed_via_github_app comment is the App's, not the Action's.
+  return false;
+}
+
+/** Extract the absolute `rel="next"` URL from a GitHub Link header. */
+export function nextPageUrl(link, fallbackUrl) {
+  if (!link) return null;
+  for (const part of link.split(",").map((p) => p.trim())) {
+    const m = part.match(/<([^>]+)>\s*;\s*rel="next"/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * Post the comment, or update the first genuine Drift comment in place
+ * (idempotent across `synchronize` deliveries). Only ownership-verified
+ * comments are updated (marker v2 preferred, legacy v1 migrated when owned).
+ * Never posts a duplicate when an owned marker comment exists; spoofed
+ * user-authored markers are left untouched and cannot block the official
+ * summary.
  */
 export async function upsertComment({ token, repo, issueNumber, body, fetchImpl = fetch }) {
   const headers = {
@@ -388,17 +730,32 @@ export async function upsertComment({ token, repo, issueNumber, body, fetchImpl 
     "X-GitHub-Api-Version": "2022-11-28",
     "User-Agent": "drift-action",
   };
-  const list = await fetchImpl(`https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`, { headers });
-  if (!list.ok) throw new Error(`list comments: HTTP ${list.status}`);
-  let comments = [];
-  try {
-    comments = (await list.json()) ?? [];
-  } catch {
-    throw new Error("list comments: malformed API response");
+  // Paginate through the Link header (bounded at 10 pages) so the Drift
+  // marker comment is found even on heavily-commented PRs — never stop at
+  // the first 100 comments.
+  const comments = [];
+  let listUrl = `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`;
+  for (let page = 0; page < 10 && listUrl; page++) {
+    const list = await fetchImpl(listUrl, { headers });
+    if (!list.ok) throw new Error(`list comments: HTTP ${list.status}`);
+    let batch = [];
+    try {
+      batch = (await list.json()) ?? [];
+    } catch {
+      throw new Error("list comments: malformed API response");
+    }
+    if (!Array.isArray(batch)) throw new Error("list comments: malformed API response");
+    comments.push(...batch);
+    listUrl = nextPageUrl(list.headers?.get?.("link") ?? null, listUrl);
   }
-  const existing = Array.isArray(comments)
-    ? comments.find((c) => typeof c?.body === "string" && c.body.includes(SUMMARY_MARKER))
-    : undefined;
+  // Deterministic selection: first owned v2-marker comment, else first owned
+  // legacy v1-marker comment (migration). Duplicate official comments are
+  // collapsed onto the single canonical one.
+  const owned = comments.filter(isDriftOwnedComment);
+  const existing =
+    owned.find((c) => c.body.includes(SUMMARY_MARKER)) ??
+    owned.find((c) => LEGACY_SUMMARY_MARKERS.some((m) => c.body.includes(m))) ??
+    undefined;
   if (existing) {
     const res = await fetchImpl(`https://api.github.com/repos/${repo}/issues/comments/${existing.id}`, {
       method: "PATCH",
@@ -459,13 +816,6 @@ async function main() {
     return;
   }
 
-  const token = process.env.GITHUB_TOKEN ?? "";
-  if (!token) {
-    console.log("pr-comment: GITHUB_TOKEN not set — skipping comment (CI check still ran)");
-    appendStepSummary("_Drift: GITHUB_TOKEN not set — PR comment skipped._");
-    return;
-  }
-
   const failOnError = process.env.FAIL_ON_COMMENT_ERROR === "true";
   const repoRoot = process.env.DRIFT_REPO || process.cwd();
 
@@ -479,39 +829,53 @@ async function main() {
     return;
   }
 
-  // 3. intents from PR commits only.
-  const intents = intentsFromCommits({ repoRoot, commits: range.shas });
-
-  // 3b. Trust-root verification (ADR-009 PR key policy): manifests are
-  // verified against the BASE-branch key — the PR head key is untrusted until
-  // a controlled rotation. A PR that replaces .drift/public/key.pem is never
-  // silently trusted.
+  // 3. Trust-root evaluation FIRST — a key-only PR (no intents at all) must
+  // still surface a blocking trust-root warning instead of exiting through
+  // the "no intents" path.
   const baseKey = getFileAt(repoRoot, event.baseSha, ".drift/public/key.pem");
   const headKey = getFileAt(repoRoot, "HEAD", ".drift/public/key.pem");
-  const keyChanged =
-    Boolean(baseKey) && Boolean(headKey) && baseKey.trim() !== headKey.trim();
+  let keyChange = "none";
+  if (!baseKey && headKey) keyChange = "bootstrap";
+  else if (baseKey && !headKey) keyChange = "removed";
+  else if (baseKey && headKey && baseKey.trim() !== headKey.trim()) keyChange = "replaced";
+  const hasKeyChange = keyChange === "replaced" || keyChange === "removed";
+
+  // 4. intents from PR commits only, with per-intent signature/trust states.
+  const intents = intentsFromCommits({ repoRoot, commits: range.shas });
   for (const intent of intents) {
-    const manifest = readManifest(repoRoot, intent.id);
-    intent.signatureState = signatureStateFor(manifest, { baseKey, headKey });
+    const loaded = readManifest(repoRoot, intent.id);
+    intent.signatureState = signatureStateFor(loaded.manifest, {
+      baseKey,
+      headKey,
+      malformed: Boolean(loaded.errors && loaded.errors.length > 0),
+    });
   }
-  const body = buildSummary(intents);
+
+  // 4b. Provenance integrity: scan the WHOLE `.drift/public/` diff, not just
+  // trailer-derived intents — tampering with existing manifests (modified /
+  // deleted / renamed), orphan additions, replays and ambiguous associations
+  // must be visible even when the PR has zero ordinary intents.
+  const audit = auditPublicProvenance({ repoRoot, baseSha: event.baseSha, headSha: event.headSha, commits: range.shas });
+
+  // 5. The body always carries the trust-root warning for key changes; for a
+  // key-only PR the warning IS the body.
+  const body = buildSummary(intents, { keyChange: hasKeyChange, audit });
   if (!body) {
-    console.log("pr-comment: no Drift intents on this PR — nothing to summarize");
+    console.log("pr-comment: no Drift intents, no trust-root change and no provenance violations on this PR — nothing to summarize");
     appendStepSummary("_Drift: no Drift intents on this PR — nothing to summarize._");
     return;
   }
 
-  // 3c. A PR that modifies the public trust root must be prominent.
-  if (keyChanged) {
-    appendStepSummary(
-      "⚠ **Warning: this pull request changes the Drift public signing key (.drift/public/key.pem).** New provenance on this PR is marked unverified until a controlled key-rotation process is approved.",
-    );
-  }
-
-  // 4. The safe summary always lands in the step summary.
+  // 6. The safe summary ALWAYS lands in the step summary — before any token
+  // check, so a missing/read-only GITHUB_TOKEN never suppresses it.
   appendStepSummary(body);
 
-  // 5. Comment (idempotent), degrading gracefully on fork/read-only tokens.
+  // 7. Comment (idempotent), degrading gracefully on fork/read-only tokens.
+  const token = process.env.GITHUB_TOKEN ?? "";
+  if (!token) {
+    console.log("pr-comment: GITHUB_TOKEN not set — step summary written, comment skipped");
+    return;
+  }
   try {
     const result = await upsertComment({ token, repo: event.repo, issueNumber: event.prNumber, body });
     console.log(`pr-comment: ${result.action} comment #${result.id}`);

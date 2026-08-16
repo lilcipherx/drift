@@ -8,6 +8,7 @@ import {
   buildSummary,
   upsertComment,
   SUMMARY_MARKER,
+  LEGACY_SUMMARY_MARKERS,
   parseEvent,
   prCommitShas,
   extractDriftIntentIds,
@@ -15,6 +16,7 @@ import {
   readManifest,
   sanitizeCommentText,
   parseGitTrailers,
+  auditPublicProvenance,
 } from "../../scripts/pr-comment.mjs";
 
 // ------------------------------------------------------------------- helpers
@@ -200,7 +202,7 @@ test("intentsFromCommits: hydrates public manifests for PR commits only; missing
       commit(repo, `feat A\n\nDrift-Intent: ${ID_A}`),
       commit(repo, `DRIFT_LEGACY_SUBJECT_SECRET_b8e4\n\nDrift-Intent: ${ID_B}\nDrift-Intent: ${ID_B}`),
     ],
-    readManifestImpl: (root, id) => manifests[id] ?? null,
+    readManifestImpl: (root, id) => (manifests[id] ? { manifest: manifests[id], errors: null } : { manifest: null, errors: null }),
   });
   assert.equal(intents.length, 2);
   assert.equal(intents[0].id, ID_A);
@@ -213,18 +215,58 @@ test("intentsFromCommits: hydrates public manifests for PR commits only; missing
   assert.equal(intents[1].files.length, 0);
 });
 
-test("readManifest: returns null for missing or malformed manifests", () => {
+test("readManifest: strictly validates — missing/JSON/type/format errors are reported, never rendered as valid", () => {
   const repo = makeRepo();
-  assert.equal(readManifest(repo, ID_A), null);
-  mkdirSync(join(repo, ".drift", "public", "intents"), { recursive: true });
-  writeFileSync(join(repo, ".drift", "public", "intents", `${ID_A}.json`), "not json");
-  assert.equal(readManifest(repo, ID_A), null);
-  writeFileSync(join(repo, ".drift", "public", "intents", `${ID_A}.json`), '{"summary":"ok"}');
-  assert.deepEqual(readManifest(repo, ID_A), { summary: "ok" });
+  const dir = join(repo, ".drift", "public", "intents");
+  mkdirSync(dir, { recursive: true });
+  const file = (content) => writeFileSync(join(dir, `${ID_A}.json`), content);
+  // missing file → manifest null, no errors (absent ≠ malformed)
+  assert.deepEqual(readManifest(repo, ID_B), { manifest: null, errors: null });
+  // not JSON
+  file("not json");
+  let r = readManifest(repo, ID_A);
+  assert.equal(r.manifest, null);
+  assert.ok(r.errors.some((e) => e.field === "$file"));
+  // valid JSON but not a valid manifest (missing required fields)
+  file('{"summary":"ok"}');
+  r = readManifest(repo, ID_A);
+  assert.equal(r.manifest, null);
+  assert.ok(r.errors.length > 0, "minimal object must fail strict validation");
+  // id must match the filename
+  file(JSON.stringify({ schemaVersion: 2, id: ID_B, summary: "s", timestamp: 1, signingKeyId: "0123456789abcdef" }));
+  r = readManifest(repo, ID_A);
+  assert.equal(r.manifest, null);
+  assert.ok(r.errors.some((e) => e.field === "id"));
+  // files as object → rejected
+  file(JSON.stringify({ schemaVersion: 2, id: ID_A, summary: "s", timestamp: 1, signingKeyId: "0123456789abcdef", files: { path: "x" } }));
+  r = readManifest(repo, ID_A);
+  assert.equal(r.manifest, null);
+  assert.ok(r.errors.some((e) => e.field === "files"));
+  // valid V2 manifest round-trips
+  const valid = { schemaVersion: 2, id: ID_A, summary: "s", timestamp: 1, signingKeyId: "0123456789abcdef" };
+  file(JSON.stringify(valid));
+  r = readManifest(repo, ID_A);
+  assert.deepEqual(r.manifest, valid);
+  assert.equal(r.errors, null);
+  // oversized file → rejected without parsing
+  file(`{"schemaVersion":2,"id":"${ID_A}","summary":"${'x'.repeat(400 * 1024)}","timestamp":1,"signingKeyId":"0123456789abcdef"}`);
+  r = readManifest(repo, ID_A);
+  assert.equal(r.manifest, null);
+  assert.ok(r.errors.some((e) => e.field === "$file"));
 });
 
 // ----------------------------------------------------------------- upsertComment
-test("upsertComment: posts when no Drift comment exists, PATCHes in place when it does", async () => {
+const BOT_COMMENT = (id, body) => ({ id, user: { login: "github-actions[bot]", type: "Bot" }, body, performed_via_github_app: null });
+
+function upsertFetch({ comments, onPatch, onPost }) {
+  return async (url, init = {}) => {
+    if (init.method === "PATCH") { if (onPatch) onPatch(url); return { ok: true, json: async () => ({ id: 1 }) }; }
+    if (init.method === "POST") { if (onPost) onPost(); return { ok: true, json: async () => ({ id: 99 }) }; }
+    return { ok: true, json: async () => comments };
+  };
+}
+
+test("upsertComment: posts when no Drift comment exists, PATCHes the owned comment in place", async () => {
   const calls = [];
   const posted = await upsertComment({
     token: "t",
@@ -245,14 +287,113 @@ test("upsertComment: posts when no Drift comment exists, PATCHes in place when i
     repo: "o/r",
     issueNumber: 3,
     body: "new",
-    fetchImpl: async (url, init = {}) => {
-      if (init.method === "PATCH") return { ok: true, json: async () => ({ id: 7 }) };
-      if (init.method === "POST") throw new Error("must not POST when a marker comment exists");
-      return { ok: true, json: async () => [{ id: 7, body: `other\n${SUMMARY_MARKER}\nold` }] };
-    },
+    fetchImpl: upsertFetch({
+      comments: [BOT_COMMENT(7, `other\n${SUMMARY_MARKER}\nold`)],
+      onPost: () => {
+        throw new Error("must not POST when an owned marker comment exists");
+      },
+    }),
   });
   assert.equal(updated.action, "updated");
   assert.equal(updated.id, 7);
+});
+
+test("upsertComment: a user-authored spoofed marker is NEVER updated — Drift posts its own comment", async () => {
+  let patched = null;
+  const res = await upsertComment({
+    token: "t",
+    repo: "o/r",
+    issueNumber: 3,
+    body: "official",
+    fetchImpl: upsertFetch({
+      comments: [
+        { id: 11, user: { login: "alice", type: "User" }, body: `spoofed ${SUMMARY_MARKER}`, performed_via_github_app: null },
+      ],
+      onPatch: (url) => {
+        patched = url;
+      },
+    }),
+  });
+  assert.equal(patched, null, "spoofed user comment must never be PATCHed");
+  assert.equal(res.action, "commented", "official comment is posted alongside the spoof");
+  assert.equal(res.id, 99);
+});
+
+test("upsertComment: bot-authored legacy markers are migrated; App-authored comments are never touched by the Action", async () => {
+  // legacy v1 marker authored by the composite Action (github-actions[bot]) → migrated
+  const legacy = await upsertComment({
+    token: "t",
+    repo: "o/r",
+    issueNumber: 3,
+    body: "new",
+    fetchImpl: upsertFetch({
+      comments: [BOT_COMMENT(21, `legacy ${LEGACY_SUMMARY_MARKERS[1]}`)],
+      onPost: () => {
+        throw new Error("must not POST when an owned legacy comment exists");
+      },
+    }),
+  });
+  assert.equal(legacy.action, "updated");
+  assert.equal(legacy.id, 21);
+
+  // a genuine App-authored marker comment belongs to the App — the Action must
+  // never edit it; it posts its own comment instead
+  let patched = null;
+  const appOwned = await upsertComment({
+    token: "t",
+    repo: "o/r",
+    issueNumber: 3,
+    body: "new",
+    fetchImpl: upsertFetch({
+      comments: [
+        {
+          id: 22,
+          user: { login: "drift-app[bot]", type: "Bot" },
+          body: `app ${SUMMARY_MARKER}`,
+          performed_via_github_app: { id: 12345, slug: "drift" },
+        },
+      ],
+      onPatch: (url) => {
+        patched = url;
+      },
+    }),
+  });
+  assert.equal(patched, null, "the Action must never PATCH an App-authored comment");
+  assert.equal(appOwned.action, "commented");
+});
+
+test("upsertComment: paginates through the Link header to find the owned comment past page 1", async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => ({
+    id: 1000 + i,
+    user: { login: "someone", type: "User" },
+    body: `human comment ${i}`,
+    performed_via_github_app: null,
+  }));
+  const page2 = [BOT_COMMENT(2000, `${SUMMARY_MARKER} on page 2`)];
+  const page3 = [
+    { id: 3000, user: { login: "alice", type: "User" }, body: `spoof ${SUMMARY_MARKER}`, performed_via_github_app: null },
+  ];
+  const urls = [];
+  const res = await upsertComment({
+    token: "t",
+    repo: "o/r",
+    issueNumber: 3,
+    body: "new",
+    fetchImpl: async (url, init = {}) => {
+      urls.push(url);
+      if (init.method === "PATCH") return { ok: true, json: async () => ({ id: 2000 }) };
+      if (init.method === "POST") throw new Error("must not POST — the owned comment exists on page 2");
+      const page = /page=(\d+)/.exec(url)?.[1];
+      const next = (p) => `https://api.github.com/repos/o/r/issues/3/comments?page=${p}&per_page=100`;
+      if (page === "2") return { ok: true, headers: { get: () => `<${next(3)}>; rel="next"` }, json: async () => page2 };
+      if (page === "3") return { ok: true, headers: { get: () => null }, json: async () => page3 };
+      return { ok: true, headers: { get: () => `<${next(2)}>; rel="next"` }, json: async () => page1 };
+    },
+  });
+  assert.equal(res.action, "updated");
+  assert.equal(res.id, 2000);
+  assert.ok(urls.some((u) => u.includes("page=2")), "must follow the Link header to page 2");
+  assert.ok(urls.some((u) => u.includes("page=3")), "must follow to page 3 (spoofed marker on page 3 is ignored)");
 });
 
 test("upsertComment: multiple matching comments → update only the first, never POST", async () => {
@@ -261,21 +402,20 @@ test("upsertComment: multiple matching comments → update only the first, never
     repo: "o/r",
     issueNumber: 3,
     body: "new",
-    fetchImpl: async (url, init = {}) => {
-      if (init.method === "POST") throw new Error("must never POST when a marker comment already exists");
-      if (init.method === "PATCH") return { ok: true, json: async () => ({ id: 1 }) };
-      return {
-        ok: true,
-        json: async () => [
-          { id: 1, body: `${SUMMARY_MARKER} first` },
-          { id: 2, body: `${SUMMARY_MARKER} duplicate` },
-          { id: 3, body: "human comment" },
-        ],
-      };
-    },
+    fetchImpl: upsertFetch({
+      comments: [
+        BOT_COMMENT(1, `${SUMMARY_MARKER} first`),
+        BOT_COMMENT(2, `${SUMMARY_MARKER} duplicate`),
+        { id: 3, user: { login: "alice", type: "User" }, body: `spoofed ${SUMMARY_MARKER}`, performed_via_github_app: null },
+        { id: 4, user: { login: "someone", type: "User" }, body: "human comment", performed_via_github_app: null },
+      ],
+      onPost: () => {
+        throw new Error("must never POST when an owned marker comment exists");
+      },
+    }),
   });
   assert.equal(updated.action, "updated");
-  assert.equal(updated.id, 1);
+  assert.equal(updated.id, 1, "deterministically update the FIRST owned marker comment");
 });
 
 test("upsertComment: unrelated comments are never modified", async () => {
@@ -358,6 +498,18 @@ test("signatureStateFor: valid against base, untrusted-key when only the head ke
   assert.equal(signatureStateFor(manifest, { baseKey: OTHER_KEY, headKey: OTHER_KEY }), "invalid");
   // bootstrap: base has no Drift key, head key verifies
   assert.equal(signatureStateFor(manifest, { baseKey: null, headKey: KEY }), "bootstrap");
+  // a FAILED head signature with no base key is INVALID, never bootstrap
+  const tampered = { ...manifest, summary: "tampered" };
+  assert.equal(signatureStateFor(tampered, { baseKey: null, headKey: KEY }), "invalid");
+  assert.equal(signatureStateFor(tampered, { baseKey: OTHER_KEY, headKey: OTHER_KEY }), "invalid");
+  // a V2 manifest with a mismatched signingKeyId is not "valid" even when the
+  // signature verifies
+  const v2 = signed({ id: ID_A, summary: "s", timestamp: 1, schemaVersion: 2, signingKeyId: "0123456789abcdef" });
+  assert.equal(signatureStateFor(v2, { baseKey: KEY, headKey: KEY }), "invalid", "signingKeyId mismatch must not report valid");
+  // malformed base key → unverifiable
+  assert.equal(signatureStateFor(manifest, { baseKey: "not a key", headKey: KEY }), "unverifiable");
+  // explicit malformed flag
+  assert.equal(signatureStateFor({ id: ID_A, summary: "s" }, { baseKey: KEY, headKey: KEY, malformed: true }), "malformed");
   // unsigned / missing / unverifiable
   assert.equal(signatureStateFor({ id: ID_A, summary: "s" }, { baseKey: KEY, headKey: KEY }), "unsigned");
   assert.equal(signatureStateFor(null, { baseKey: KEY, headKey: KEY }), "missing");
@@ -372,6 +524,71 @@ test("getFileAt: reads a file at a git ref, null when absent", () => {
   assert.equal(getFileAt(repo, "f".repeat(40), "src/a.ts"), null);
 });
 
+test("buildSummary: trust-root warning is the whole body for a key-only PR", () => {
+  const body = buildSummary([], { keyChange: true });
+  assert.ok(body.includes("trust-root change detected"), body);
+  assert.ok(body.includes(".drift/public/key.pem"), body);
+  assert.ok(body.startsWith(SUMMARY_MARKER));
+  const withIntents = buildSummary([{ id: ID_A, summary: "s", files: [] }], { keyChange: true });
+  assert.ok(withIntents.includes("trust-root change detected"));
+  assert.ok(withIntents.includes("1 intent on this PR"));
+  assert.equal(buildSummary([], { keyChange: false }), null);
+});
+
+// ------------------------------------------------------ Action allowlist (F)
+import { buildCliArgs, tokenizeCommand } from "../../scripts/action-run.mjs";
+
+test("buildCliArgs: allowlisted operations build a safe CLI invocation", () => {
+  assert.deepEqual(buildCliArgs({ operation: "log" }), ["log", "--json"]);
+  assert.deepEqual(buildCliArgs({ operation: "status" }), ["status", "--json"]);
+  assert.deepEqual(buildCliArgs({ operation: "doctor" }), ["doctor", "--json"]);
+  assert.deepEqual(buildCliArgs({ operation: "verify-intent", intentId: ID_A }), ["verify-intent", ID_A, "--json"]);
+  assert.deepEqual(buildCliArgs({ operation: "verify", intentId: ID_A }), ["verify", ID_A, "--json"]);
+});
+
+test("buildCliArgs: legacy command input is tokenized and allowlisted", () => {
+  assert.deepEqual(buildCliArgs({ command: "log" }), ["log", "--json"]);
+  assert.deepEqual(buildCliArgs({ command: `verify-intent "${ID_A}"` }), ["verify-intent", ID_A, "--json"]);
+  assert.deepEqual(buildCliArgs({ command: "doctor" }), ["doctor", "--json"]);
+});
+
+test("tokenizeCommand: quote-aware splitting, never shell semantics", () => {
+  assert.deepEqual(tokenizeCommand('log  status'), ["log", "status"]);
+  assert.deepEqual(tokenizeCommand('verify-intent "did_123"'), ["verify-intent", "did_123"]);
+  assert.deepEqual(tokenizeCommand("verify-intent 'did_abc'"), ["verify-intent", "did_abc"]);
+  assert.throws(() => tokenizeCommand("log 'unbalanced"), /unbalanced quotes/);
+});
+
+test("buildCliArgs: unsafe operations and flags are rejected before any CLI invocation", () => {
+  const bad = [
+    "export",
+    "export --include-private-prompt",
+    "replay did_00000000000000000000000000000000",
+    "realize -p secret",
+    "key import --file /tmp/k",
+    "init",
+    "log --include-private-prompt",
+    "verify did_00000000000000000000000000000000 --run",
+    "verify did_00000000000000000000000000000000 --run --allow-untrusted-command",
+    "verify did_00000000000000000000000000000000 --inherit-env",
+    "doctor --allow-repository-output",
+    "status --anything",
+    "log; rm -rf /",
+    "$(rm -rf /)",
+    "verify-intent",
+    "verify-intent not-an-id",
+    "log extra positional",
+  ];
+  for (const c of bad) {
+    assert.throws(() => buildCliArgs({ command: c }), (err) => {
+      assert.ok(/not allowed|not supported|not permitted|requires exactly|does not accept|invalid intent id/.test(err.message), `unexpected message for "${c}": ${err.message}`);
+      return true;
+    }, `command "${c}" must be rejected`);
+  }
+  assert.throws(() => buildCliArgs({ operation: "realize", intentId: ID_A }), /not allowed/);
+  assert.throws(() => buildCliArgs({ operation: "" }), /no Drift operation/);
+});
+
 test("buildSummary: key-rotation and missing-manifest states are rendered, never the prompt", () => {
   const body = buildSummary([
     { id: ID_A, summary: `Drift intent ${ID_A}`, missingManifest: true, signatureState: "missing", files: [] },
@@ -380,4 +597,125 @@ test("buildSummary: key-rotation and missing-manifest states are rendered, never
   assert.ok(body.includes("manifest missing"), body);
   assert.ok(body.includes("signed with a different key"), body);
   assert.ok(!body.includes("intent.prompt"));
+});
+
+// ------------------------------------------------ provenance integrity audit
+function writePublicProvenance(repo, { key = true, manifests = {} }) {
+  const intentsDir = join(repo, ".drift", "public", "intents");
+  mkdirSync(intentsDir, { recursive: true });
+  if (key) writeFileSync(join(repo, ".drift", "public", "key.pem"), "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n");
+  for (const [id, extra] of Object.entries(manifests)) {
+    writeFileSync(
+      join(intentsDir, `${id}.json`),
+      JSON.stringify({ schemaVersion: 2, id, summary: "s", timestamp: 1, signingKeyId: "0123456789abcdef", ...extra }),
+    );
+  }
+}
+
+function auditOf(repo, { baseSha, headSha, commits }) {
+  return auditPublicProvenance({ repoRoot: repo, baseSha, headSha, commits });
+}
+
+test("auditPublicProvenance: a valid atomic introduction (key + manifest + trailer in one commit) is clean", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `feat\n\nDrift-Intent: ${ID_A}`]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.deepEqual(audit.violations, []);
+  assert.deepEqual(audit.replayIds, []);
+  assert.deepEqual(audit.ambiguousIds, []);
+});
+
+test("auditPublicProvenance: modifying an existing manifest is a violation (append-only)", () => {
+  const repo = makeRepo();
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `base\n\nDrift-Intent: ${ID_A}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // modify the manifest WITHOUT a trailer
+  writePublicProvenance(repo, { manifests: { [ID_A]: { summary: "tampered" } } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "tamper"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.ok(audit.violations.some((v) => v.code === "modified" && v.id === ID_A), JSON.stringify(audit.violations));
+});
+
+test("auditPublicProvenance: deleting and renaming existing manifests are violations", () => {
+  const repo = makeRepo();
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `base\n\nDrift-Intent: ${ID_A}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+
+  // rename ID_A → ID_B (git mv)
+  const intentsDir = join(repo, ".drift", "public", "intents");
+  const mvOld = join(intentsDir, `${ID_A}.json`);
+  const mvNew = join(intentsDir, `${ID_B}.json`);
+  git(repo, ["mv", mvOld, mvNew]);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "rename"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  let audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.ok(audit.violations.some((v) => v.code === "renamed"), JSON.stringify(audit.violations));
+
+  // delete ID_B → deleted
+  const delRepo = makeRepo();
+  writePublicProvenance(delRepo, { manifests: { [ID_A]: {} } });
+  git(delRepo, ["add", "-A"]);
+  git(delRepo, ["commit", "-qm", `base\n\nDrift-Intent: ${ID_A}`]);
+  const base2 = git(delRepo, ["rev-parse", "HEAD"]);
+  const delManifest = join(delRepo, ".drift", "public", "intents", `${ID_A}.json`);
+  git(delRepo, ["rm", "-q", delManifest]);
+  git(delRepo, ["add", "-A"]);
+  git(delRepo, ["commit", "-qm", "delete"]);
+  const head2 = git(delRepo, ["rev-parse", "HEAD"]);
+  audit = auditOf(delRepo, { baseSha: base2, headSha: head2, commits: [head2] });
+  assert.ok(audit.violations.some((v) => v.code === "deleted" && v.id === ID_A), JSON.stringify(audit.violations));
+});
+
+test("auditPublicProvenance: an orphan manifest (added without any trailer) is a violation", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "manifest with no trailer"]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.ok(audit.violations.some((v) => v.code === "orphan" && v.id === ID_A), JSON.stringify(audit.violations));
+  assert.ok(audit.orphanIds.includes(ID_A));
+});
+
+test("auditPublicProvenance: a trailer referencing a manifest that already exists on base is a replay", () => {
+  const repo = makeRepo();
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `base\n\nDrift-Intent: ${ID_A}`]);
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  // a NEW commit re-references the same intent (manifest unchanged at head)
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 2;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `reuse\n\nDrift-Intent: ${ID_A}`]);
+  const headSha = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha, commits: [headSha] });
+  assert.ok(audit.replayIds.includes(ID_A), JSON.stringify(audit));
+});
+
+test("auditPublicProvenance: one id referenced by two commits is ambiguous (never silently first-wins)", () => {
+  const repo = makeRepo();
+  const baseSha = git(repo, ["rev-parse", "HEAD"]);
+  writePublicProvenance(repo, { manifests: { [ID_A]: {} } });
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `one\n\nDrift-Intent: ${ID_A}`]);
+  const c1 = git(repo, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "src", "a.ts"), "export const a = 3;\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", `two\n\nDrift-Intent: ${ID_A}`]);
+  const c2 = git(repo, ["rev-parse", "HEAD"]);
+  const audit = auditOf(repo, { baseSha, headSha: c2, commits: [c1, c2] });
+  assert.ok(audit.ambiguousIds.includes(ID_A), JSON.stringify(audit));
+  assert.ok(!audit.violations.some((v) => v.code === "orphan"), "n>1 is ambiguous, not orphan");
 });
