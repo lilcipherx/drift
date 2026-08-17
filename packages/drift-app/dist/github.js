@@ -6,16 +6,96 @@
  * tests can inject a fake with zero network access.
  */
 import { createAppJwt } from "./jwt.js";
+/** Thrown for GitHub rate-limit responses (429 or secondary 403 with
+ *  Retry-After). The handler treats these as transient (retryable). */
+export class RateLimitError extends Error {
+    retryAfterMs;
+    status;
+    constructor(message, retryAfterMs, status) {
+        super(message);
+        this.retryAfterMs = retryAfterMs;
+        this.status = status;
+        this.name = "RateLimitError";
+    }
+}
+/** Parse X-RateLimit-* headers defensively (untrusted network input). */
+function parseRateLimitHeaders(headers) {
+    const remaining = Number(headers.get("x-ratelimit-remaining"));
+    const limit = Number(headers.get("x-ratelimit-limit"));
+    const reset = Number(headers.get("x-ratelimit-reset"));
+    if (!Number.isFinite(remaining) || !Number.isFinite(limit) || !Number.isFinite(reset))
+        return null;
+    return { remaining, limit, reset };
+}
+function retryAfterMs(headers) {
+    const raw = headers.get("retry-after");
+    if (!raw)
+        return null;
+    const secs = Number(raw);
+    if (Number.isFinite(secs) && secs >= 0)
+        return secs * 1000;
+    const date = Date.parse(raw);
+    if (Number.isFinite(date))
+        return Math.max(0, date - Date.now());
+    return null;
+}
 export class GitHubAppClient {
     opts;
     baseUrl;
     fetchImpl;
     /** Installation-scoped token cache (multi-tenant safe). */
     installationTokens = new Map();
+    requestTimeoutMs;
+    breakerThreshold;
+    breakerResetMs;
+    /** Rate-limit snapshot from the most recent response (per client). */
+    rateLimit = { remaining: -1, limit: -1, resetEpochSec: 0, throttled: 0 };
+    /** Installation-token circuit breaker state. */
+    breakerFailures = 0;
+    breakerOpenUntil = 0;
     constructor(opts) {
         this.opts = opts;
         this.baseUrl = (opts.baseUrl ?? "https://api.github.com").replace(/\/+$/, "");
         this.fetchImpl = opts.fetchImpl ?? fetch;
+        this.requestTimeoutMs =
+            Number.isFinite(opts.requestTimeoutMs) && (opts.requestTimeoutMs ?? 0) > 0
+                ? opts.requestTimeoutMs
+                : 30_000;
+        this.breakerThreshold = Number.isFinite(opts.breakerThreshold) && (opts.breakerThreshold ?? 0) > 0 ? opts.breakerThreshold : 5;
+        this.breakerResetMs = Number.isFinite(opts.breakerResetMs) && (opts.breakerResetMs ?? 0) > 0 ? opts.breakerResetMs : 15_000;
+    }
+    /** Latest observed GitHub rate-limit status for this client. */
+    getRateLimitStatus() {
+        return { ...this.rateLimit };
+    }
+    /** Record rate-limit headers from a response (defensive parsing). */
+    trackRateLimit(headers) {
+        const parsed = parseRateLimitHeaders(headers);
+        if (parsed) {
+            this.rateLimit = {
+                remaining: parsed.remaining,
+                limit: parsed.limit,
+                resetEpochSec: parsed.reset,
+                throttled: this.rateLimit.throttled,
+            };
+        }
+    }
+    /**
+     * Classify rate-limit responses: 429 always; 403 with Retry-After (the
+     * GitHub secondary-rate-limit signal) throws RateLimitError so callers
+     * retry with backoff instead of failing the audit permanently.
+     */
+    checkRateLimit(res, opLabel) {
+        if (res.status === 429) {
+            this.rateLimit.throttled++;
+            const wait = retryAfterMs(res.headers) ?? 60_000;
+            throw new RateLimitError(`${opLabel} failed: 429 rate limited (retry in ${Math.ceil(wait / 1000)}s)`, wait, 429);
+        }
+        if (res.status === 403 && res.headers.get("retry-after")) {
+            this.rateLimit.throttled++;
+            const wait = retryAfterMs(res.headers) ?? 60_000;
+            throw new RateLimitError(`${opLabel} failed: 403 secondary rate limited (retry in ${Math.ceil(wait / 1000)}s)`, wait, 403);
+        }
     }
     appJwt() {
         return createAppJwt(this.opts.appId, this.opts.privateKeyPem);
@@ -25,20 +105,42 @@ export class GitHubAppClient {
         const cached = this.installationTokens.get(installationId);
         if (cached && cached.expiresAt > Date.now() + 30_000)
             return cached.value;
-        const res = await this.fetchImpl(`${this.baseUrl}/app/installations/${installationId}/access_tokens`, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${this.appJwt()}`,
-                Accept: "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                // GitHub rejects requests without a User-Agent (403).
-                "User-Agent": "drift-app/0.1.0",
-            },
-            body: "{}",
-        });
+        // Circuit breaker: repeated token-request failures (e.g. GitHub outage or
+        // a revoked App key) open the circuit briefly so workers stop hammering
+        // the API and fail fast with a retryable error.
+        if (this.breakerOpenUntil > Date.now()) {
+            throw new Error(`installation token request failed: 503 breaker open (retry in ${Math.ceil((this.breakerOpenUntil - Date.now()) / 1000)}s)`);
+        }
+        let res;
+        try {
+            res = await this.fetchImpl(`${this.baseUrl}/app/installations/${installationId}/access_tokens`, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${this.appJwt()}`,
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    // GitHub rejects requests without a User-Agent (403).
+                    "User-Agent": "drift-app/0.1.0",
+                },
+                body: "{}",
+                signal: AbortSignal.timeout(this.requestTimeoutMs),
+            });
+        }
+        catch (err) {
+            // Network/timeout failures are transient — do not open the breaker on
+            // them (a single outage would trip every installation).
+            throw new Error(`installation token request failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         if (!res.ok) {
+            this.checkRateLimit(res, "installation token request");
+            this.breakerFailures++;
+            if (this.breakerFailures >= this.breakerThreshold) {
+                this.breakerOpenUntil = Date.now() + this.breakerResetMs;
+                this.breakerFailures = 0;
+            }
             throw new Error(`installation token request failed: ${res.status} ${await res.text()}`);
         }
+        this.breakerFailures = 0;
         const data = (await res.json());
         this.installationTokens.set(installationId, {
             value: data.token,
@@ -47,7 +149,7 @@ export class GitHubAppClient {
         return data.token;
     }
     async request(path, token, init = {}) {
-        return this.fetchImpl(`${this.baseUrl}${path}`, {
+        const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
             ...init,
             headers: {
                 Authorization: `Bearer ${token}`,
@@ -56,7 +158,13 @@ export class GitHubAppClient {
                 "User-Agent": "drift-app/0.1.0",
                 ...(init.headers ?? {}),
             },
+            // Bounded per-request timeout: a stalled GitHub connection must never
+            // hold a worker slot or webhook connection indefinitely.
+            ...(init.signal ? {} : { signal: AbortSignal.timeout(this.requestTimeoutMs) }),
         });
+        this.trackRateLimit(res.headers);
+        this.checkRateLimit(res, path.split("?")[0] ?? path);
+        return res;
     }
     // ------------------------------------------------------------ reads
     async getPullRequest(owner, repo, number) {

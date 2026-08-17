@@ -206,12 +206,26 @@ class FakeGitHub {
     this.compareShas = opts.compareShas ?? null;
     this.postCommentResult = opts.postCommentResult ?? null; // { throw: Error } | { id: n }
     this.checkRunResult = opts.checkRunResult ?? null; // { throw: Error } | { id: n }
+    // Defaults mirror the fixed mock head; tests exercising a stale delivery
+    // pass a different `headSha` than the payload carries.
+    this.headSha = opts.headSha ?? "abc123def";
+    this.baseSha = opts.baseSha ?? "base123";
+    this.changedFiles = opts.changedFiles ?? 0;
   }
   setInstallation(id) { this.installation = id; }
   getAppId() { return this.appId; }
   async getPullRequest() {
     if (this.prInfo) return this.prInfo;
-    return { headSha: "abc123def", baseSha: "base123", commits: this.commits.length, changedFiles: 0, title: "" };
+    // Faithful to GitHub: the API's current PR head equals the head the
+    // webhook payload carried (a fresh delivery). Tests that exercise a
+    // stale delivery pass an explicit `headSha` that differs.
+    return {
+      headSha: this.headSha,
+      baseSha: this.baseSha,
+      commits: this.commits.length,
+      changedFiles: this.changedFiles,
+      title: "",
+    };
   }
   async getPullCommits() {
     if (this.commitCollection) return this.commitCollection;
@@ -572,10 +586,29 @@ test("evaluateKeyChange: strict states — bootstrap, removal, replacement AND m
 const OTHER = generateKeyPairSync("ed25519");
 const OTHER_PUBLIC_KEY_PEM = OTHER.publicKey.export({ type: "spki", format: "pem" }).toString();
 
+test("handler: a stale delivery (payload head ≠ current API head) is skipped, never audited mixed", async () => {
+  // The payload claims head "oldhead" but the API now reports "newhead" (a
+  // newer push landed while this delivery was queued). The audit must NOT mix
+  // the stale payload head with fresh commit/file listings — it fails closed
+  // with action "stale" and writes NOTHING.
+  const github = makeGitHub({ headSha: "newhead" });
+  const payload = {
+    ...PAYLOAD,
+    pull_request: { ...PAYLOAD.pull_request, base: { sha: "base123" }, head: { sha: "oldhead" } },
+  };
+  const result = await handleWebhook(eventFor(payload), devDeps(github));
+  assert.equal(result.action, "stale");
+  assert.equal(result.retryable, false, "a stale delivery must not be retried");
+  assert.equal(github.calls.comments.length, 0, "no comment may be written for a stale delivery");
+  assert.equal(github.calls.checks.length, 0, "no check run may be created for a stale delivery");
+  assert.equal(github.calls.checks.length, 0);
+});
+
 test("handler: key-only PR (replaced key, zero intents) → warning comment + failing check run", async () => {
   const github = new FakeGitHub([{ sha: "s", message: "rotate key only" }], {}, [], {
     publicKeyPem: OTHER_PUBLIC_KEY_PEM, // head key
     basePublicKeyPem: PUBLIC_KEY_PEM, // base trust root — differs → replaced
+    headSha: "head456", // payload head == current API head (fresh delivery)
   });
   const payload = {
     ...PAYLOAD,
@@ -594,6 +627,7 @@ test("handler: key-only PR (replaced key, zero intents) → warning comment + fa
 test("handler: initial bootstrap (no base key, zero intents) → visible neutral check run", async () => {
   const github = new FakeGitHub([{ sha: "s", message: "add drift" }], {}, [], {
     publicKeyPem: PUBLIC_KEY_PEM, // head introduces the first key
+    headSha: "head456", // payload head == current API head (fresh delivery)
   });
   const payload = {
     ...PAYLOAD,
@@ -623,7 +657,7 @@ test("signatureStateFor: a failed head signature with no base key is INVALID, ne
 });
 
 test("handler: invalid bootstrap signature fails the check run (never labeled bootstrap)", async () => {
-  const github = makeGitHub({}, JSON.stringify({ ...MANIFEST, summary: "tampered-after-signing" }));
+  const github = makeGitHub({ headSha: "head456" }, JSON.stringify({ ...MANIFEST, summary: "tampered-after-signing" }));
   const payload = {
     ...PAYLOAD,
     pull_request: { ...PAYLOAD.pull_request, base: { sha: "base123" }, head: { sha: "head456" } },
@@ -1018,6 +1052,7 @@ test("handler: ordinary PR with an unchanged historical manifest is NOT flagged 
     basePublicKeyPem: PUBLIC_KEY_PEM,
     baseManifests: { [MANIFEST_PATH]: baseContent },
     perCommit: { c1: {}, c2: { [MANIFEST_B]: bContent } },
+    headSha: "head123", // payload head == current API head (fresh delivery)
   });
   const payload = {
     ...PAYLOAD,

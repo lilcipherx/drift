@@ -91,6 +91,27 @@ export interface GitHubAppClientOptions {
     /** Override for tests (e.g. a local mock server). */
     baseUrl?: string;
     fetchImpl?: typeof fetch;
+    /** Per-request timeout (ms). Default 30 s. */
+    requestTimeoutMs?: number;
+    /** Circuit-breaker: consecutive token-request failures that open the
+     *  breaker (0 disables). Default 5. */
+    breakerThreshold?: number;
+    /** Circuit open window (ms). Default 15 s. */
+    breakerResetMs?: number;
+}
+/** Thrown for GitHub rate-limit responses (429 or secondary 403 with
+ *  Retry-After). The handler treats these as transient (retryable). */
+export declare class RateLimitError extends Error {
+    readonly retryAfterMs: number;
+    readonly status: number;
+    constructor(message: string, retryAfterMs: number, status: number);
+}
+export interface RateLimitStatus {
+    remaining: number;
+    limit: number;
+    resetEpochSec: number;
+    /** Count of 429/403-secondary responses observed. */
+    throttled: number;
 }
 export declare class GitHubAppClient implements GitHubClientLike {
     private readonly opts;
@@ -98,7 +119,25 @@ export declare class GitHubAppClient implements GitHubClientLike {
     private readonly fetchImpl;
     /** Installation-scoped token cache (multi-tenant safe). */
     private installationTokens;
+    private readonly requestTimeoutMs;
+    private readonly breakerThreshold;
+    private readonly breakerResetMs;
+    /** Rate-limit snapshot from the most recent response (per client). */
+    private rateLimit;
+    /** Installation-token circuit breaker state. */
+    private breakerFailures;
+    private breakerOpenUntil;
     constructor(opts: GitHubAppClientOptions);
+    /** Latest observed GitHub rate-limit status for this client. */
+    getRateLimitStatus(): RateLimitStatus;
+    /** Record rate-limit headers from a response (defensive parsing). */
+    private trackRateLimit;
+    /**
+     * Classify rate-limit responses: 429 always; 403 with Retry-After (the
+     * GitHub secondary-rate-limit signal) throws RateLimitError so callers
+     * retry with backoff instead of failing the audit permanently.
+     */
+    private checkRateLimit;
     private appJwt;
     /** Exchange the app JWT for a short-lived installation access token (cached per installation). */
     getInstallationToken(installationId: number): Promise<string>;

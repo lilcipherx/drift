@@ -37,7 +37,7 @@ export interface WebhookDeps {
 }
 export interface WebhookResult {
     handled: boolean;
-    action: "commented" | "updated" | "no-intents" | "key-change" | "skipped" | "error" | "dry-run";
+    action: "commented" | "updated" | "no-intents" | "key-change" | "skipped" | "stale" | "error" | "dry-run";
     commentBody?: string;
     intentsFound: number;
     conclusion?: "success" | "neutral" | "failure";

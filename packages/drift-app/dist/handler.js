@@ -85,6 +85,25 @@ export async function handleWebhook(event, deps) {
         // the SHARED strict parser: malformed bootstrap/replacement/base roots
         // are explicit failure states, never a fallback identity.
         const prInfo = await github.getPullRequest(owner, repoName, prNumber);
+        // --- Snapshot consistency (stale-delivery guard) ------------------------
+        // One audit must use one immutable PR snapshot. The payload carries the
+        // head SHA as it was WHEN GITHUB DELIVERED the event; if the PR has moved
+        // on (a newer push/synchronize arrived while this delivery was queued),
+        // the fetched metadata and the payload head would disagree and mixing
+        // them could produce a trust conclusion for a snapshot that never
+        // existed. Fail closed: skip the stale delivery WITHOUT retrying — the
+        // superseding synchronize delivery audits the current head. `getPullCommits`
+        // and every content read below use the API's current view, so the guard
+        // must pass BEFORE any of them run.
+        if (prInfo.headSha && headSha && prInfo.headSha !== headSha) {
+            return {
+                handled: true,
+                action: "stale",
+                intentsFound: 0,
+                error: `stale delivery: payload head ${headSha.slice(0, 7)} differs from the current PR head ${prInfo.headSha.slice(0, 7)} — a newer synchronize delivery will audit the current snapshot`,
+                retryable: false,
+            };
+        }
         const effectiveBaseSha = baseSha || prInfo.baseSha || headSha;
         const effectiveHeadSha = headSha || prInfo.headSha;
         const baseKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", effectiveBaseSha);

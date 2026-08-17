@@ -98,8 +98,15 @@ function sign(raw) {
   return `sha256=${createHmac("sha256", SECRET).update(raw, "utf8").digest("hex")}`;
 }
 
+// Current head per PR number — faithfully advances when a synchronize/
+// reopened delivery lands (the API then reports the NEW head).
+const prHead = { 7: HEAD1, 8: HEAD3, 9: HEAD4 };
+
 async function sendWebhook(eventName, payload, opts = {}) {
   const raw = JSON.stringify(payload);
+  // Model GitHub: the payload head IS the current head at delivery time.
+  const n = payload.pull_request?.number;
+  if (n && payload.pull_request?.head?.sha) prHead[n] = payload.pull_request.head.sha;
   const res = await fetch(`http://127.0.0.1:${hookPort}/webhook`, {
     method: "POST",
     headers: {
@@ -135,7 +142,7 @@ before(async () => {
       // pull request head by number (with metadata for completeness proof)
       if (req.method === "GET" && /\/pulls\/\d+$/.test(path)) {
         const n = Number(path.split("/").pop());
-        const sha = { 7: HEAD1, 8: HEAD3, 9: HEAD4 }[n] ?? HEAD1;
+        const sha = prHead[n] ?? HEAD1;
         const count = n === 7 ? 150 : n === 8 ? commitsPr8.length : n === 9 ? commitsPr9.length : 150;
         return json(res, 200, {
           head: { sha },
