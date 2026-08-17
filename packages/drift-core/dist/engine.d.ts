@@ -220,6 +220,7 @@ export declare class Drift {
      */
     private store;
     private publicStore;
+    private trustSet;
     private privateKeyPem;
     private publicKeyPem;
     private signerState;
@@ -268,11 +269,49 @@ export declare class Drift {
         publicKeyFingerprint: string | null;
     };
     /**
-     * Refuse to create NEW signed provenance unless the local private key
-     * matches the committed trust root (States A/B/D). Read-only clones (C) and
-     * mismatches (E) get an actionable message and exit E_KEY.
+     * Refuse to create NEW signed provenance unless the local private key is an
+     * active member of the committed trust set (States A/B/D / active keyring
+     * key). Read-only clones (C) and mismatches (E) get an actionable message
+     * and exit E_KEY.
      */
     private assertSignerReady;
+    /** The committed keyring, or a clear error (malformed vs not-yet-created). */
+    private requireKeyring;
+    /**
+     * Bootstrap the multi-signer keyring from the anchor key. Requires the
+     * anchor's private key (the bootstrap entry is self-signed). Idempotent:
+     * an existing, valid keyring is left untouched.
+     */
+    keyringInit(): {
+        status: "created" | "exists";
+        keyringPath: string;
+        active: number;
+    };
+    /** Add a new trusted signer (signed by an ACTIVE keyring key). */
+    keyringAdd(publicKeyFilePath: string, reason?: string | null): {
+        fingerprint: string;
+        active: number;
+        seq: number;
+    };
+    /** Revoke a signer immediately (compromise / lost key). */
+    keyringRevoke(fingerprint: string, reason?: string | null): {
+        fingerprint: string;
+        active: number;
+        seq: number;
+    };
+    /** Remove a signer after a rotation grace period (signed by another key). */
+    keyringRemove(fingerprint: string, reason?: string | null): {
+        fingerprint: string;
+        active: number;
+        seq: number;
+    };
+    /** Current keyring state (entries + full audit log). */
+    keyringList(): {
+        present: boolean;
+        malformed: string | null;
+        entries: import("./keyring.js").KeyringEntry[];
+        audit: import("./keyring.js").KeyringAuditEntry[];
+    };
     close(): void;
     /** The private store, or a clear error naming the command that needs it. */
     private requireStore;
@@ -461,9 +500,16 @@ export declare class Drift {
         state: SignatureState;
     };
     /**
+     * Verify a public manifest against the FULL trust set (anchor key + any
+     * committed keyring). The manifest's `signingKeyId` selects the exact key
+     * to verify against; a revoked or unknown key never yields `valid`, and a
+     * malformed trust set fails closed to `unverifiable`.
+     */
+    private verifyViewTrust;
+    /**
      * Shared signature/trust-state resolver used by verify, verify-intent and
      * blame. The committed public manifest is verified against the COMMITTED
-     * public key — a newly generated local key (e.g. after `drift init` in a
+     * trust set — a newly generated local key (e.g. after `drift init` in a
      * clone) is never used to judge an old record, so the states distinguish
      * valid / invalid / unsigned / unverifiable / untrusted-key honestly.
      */

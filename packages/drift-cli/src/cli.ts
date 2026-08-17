@@ -639,6 +639,95 @@ function run(argv: string[]): number {
         return EXIT.OK;
       }
 
+      case "keyring": {
+        const sub = positional[0];
+        const drift = Drift.fromCwd(process.cwd());
+        const reason = stringFlag(flags, "reason") ?? null;
+        if (sub === "init") {
+          const result = drift.keyringInit();
+          if (json) {
+            console.log(JSON.stringify({ ...result, ok: true }));
+          } else if (result.status === "created") {
+            console.log(colorize(!noColor, "green", "✓ multi-signer keyring created"));
+            console.log(`  keyring:   ${result.keyringPath}`);
+            console.log("  Add a maintainer key with:  drift keyring add --file <public-key.pem>");
+          } else {
+            console.log(`Keyring already exists at ${result.keyringPath} (${result.active} active key${result.active === 1 ? "" : "s"}).`);
+          }
+          return EXIT.OK;
+        }
+        if (sub === "add") {
+          const file = stringFlag(flags, "file");
+          if (!file) {
+            return usageError("usage: drift keyring add --file <path-to-public-key.pem> [--reason <text>]");
+          }
+          const result = drift.keyringAdd(file, reason);
+          if (json) {
+            console.log(JSON.stringify({ status: "ok", ...result }));
+          } else {
+            console.log(colorize(!noColor, "green", `✓ key ${result.fingerprint} added (seq ${result.seq})`));
+            console.log(`  active keys: ${result.active}`);
+          }
+          return EXIT.OK;
+        }
+        if (sub === "revoke") {
+          const fp = positional[1];
+          if (!fp) {
+            return usageError("usage: drift keyring revoke <fingerprint> [--reason <text>]");
+          }
+          const result = drift.keyringRevoke(fp, reason);
+          if (json) {
+            console.log(JSON.stringify({ status: "ok", ...result }));
+          } else {
+            console.log(colorize(!noColor, "green", `✓ key ${result.fingerprint} revoked (seq ${result.seq})`));
+            console.log(`  active keys: ${result.active}`);
+            console.log("  The revoked key can no longer sign or authorize keyring changes.");
+          }
+          return EXIT.OK;
+        }
+        if (sub === "remove") {
+          const fp = positional[1];
+          if (!fp) {
+            return usageError("usage: drift keyring remove <fingerprint> [--reason <text>]");
+          }
+          const result = drift.keyringRemove(fp, reason);
+          if (json) {
+            console.log(JSON.stringify({ status: "ok", ...result }));
+          } else {
+            console.log(colorize(!noColor, "green", `✓ key ${result.fingerprint} removed (seq ${result.seq})`));
+            console.log(`  active keys: ${result.active}`);
+          }
+          return EXIT.OK;
+        }
+        if (sub === "list") {
+          const result = drift.keyringList();
+          if (json) {
+            console.log(JSON.stringify({ status: "ok", ...result }));
+          } else if (result.malformed) {
+            console.log(colorize(!noColor, "red", `✗ keyring is malformed: ${result.malformed}`));
+            return EXIT.KEY;
+          } else if (!result.present) {
+            console.log("No keyring in this repository (single-signer trust root only).");
+            console.log("  Initialize one with:  drift keyring init");
+          } else {
+            console.log("Trusted signing keys:");
+            for (const e of result.entries) {
+              const tag =
+                e.status === "active"
+                  ? colorize(!noColor, "green", "active")
+                  : colorize(!noColor, "red", e.status);
+              console.log(`  ${e.fingerprint}  ${tag}  addedBy ${e.addedBy}  ${e.reason ?? ""}`);
+            }
+            console.log("Audit log:");
+            for (const a of result.audit) {
+              console.log(`  #${a.seq} ${a.action} ${a.fingerprint} by ${a.by} (${a.reason ?? ""})`);
+            }
+          }
+          return EXIT.OK;
+        }
+        return usageError("usage: drift keyring <init|add|revoke|remove|list>");
+      }
+
       case "version": {
         console.log(`drift ${VERSION}`);
         return EXIT.OK;

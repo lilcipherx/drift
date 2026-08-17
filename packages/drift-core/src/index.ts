@@ -52,6 +52,29 @@ export {
   tryParseTrustRoot,
 } from "./trust-root.js";
 export type { ParsedTrustRoot, TrustRootChange, TrustRootMalformedCode } from "./trust-root.js";
+export {
+  KEYRING_MAX_BYTES,
+  KEYRING_PATH,
+  applyKeyringChange,
+  createKeyring,
+  findKeyringEntry,
+  keyringFingerprint,
+  keyringPath,
+  keyringPayload,
+  loadTrustSet,
+  parseKeyringKey,
+  validateKeyring,
+  writeKeyringFile,
+} from "./keyring.js";
+export type {
+  KeyringAction,
+  KeyringAuditEntry,
+  KeyringChangeAction,
+  KeyringChangeResult,
+  KeyringEntry,
+  KeyringFile,
+  TrustSet,
+} from "./keyring.js";
 export type { GitTrailer } from "./trailers.js";
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export type { ExitCode } from "./errors.js";

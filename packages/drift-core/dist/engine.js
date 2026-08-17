@@ -15,7 +15,8 @@ import { IntentStore, PUBLIC_MANIFEST_INDEX_VERSION, } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
 import { buildPublicSummary, genericPublicSummary, MANIFEST_MAX_BYTES, PUBLIC_FILES_MAX, PUBLIC_INTENTS_DIR, PublicStore, signingKeyIdFor, } from "./public.js";
 import { DRIFT_INTENT_ID_RE, extractDriftIntentIds, extractDriftIntentIdsRaw } from "./trailers.js";
-import { parseTrustRoot, tryParseTrustRoot } from "./trust-root.js";
+import { tryParseTrustRoot } from "./trust-root.js";
+import { applyKeyringChange, createKeyring, keyringPath, loadTrustSet, writeKeyringFile, } from "./keyring.js";
 /** Default timeout for a `drift verify --run` verification command (ms). */
 const VERIFY_TIMEOUT_MS = 120_000;
 /**
@@ -103,6 +104,7 @@ export class Drift {
      */
     store;
     publicStore;
+    trustSet;
     privateKeyPem = "";
     publicKeyPem = "";
     signerState = "missing";
@@ -118,13 +120,12 @@ export class Drift {
         this.config = loadConfig(this.driftDir);
         this.redactionPatterns = compilePatterns(this.config.redaction.patterns);
         this.publicStore = new PublicStore(this.driftDir);
+        this.trustSet = loadTrustSet(this.driftDir);
         const dbPath = join(this.driftDir, "drift.db");
         this.publicOnly = !opts.forceStore && !existsSync(dbPath);
         if (this.publicOnly) {
             this.store = null;
-            this.privateKeyPem = "";
-            this.publicKeyPem = this.publicStore.publicKey() ?? "";
-            this.signerState = this.publicKeyPem ? "read-only" : "missing";
+            this.deriveKeyState();
         }
         else {
             try {
@@ -150,22 +151,20 @@ export class Drift {
      * State E: both, not matching     → mismatch (signing refused).
      */
     deriveKeyState() {
-        const committedPub = this.publicStore.publicKey();
+        const trust = this.trustSet;
         const keyPath = join(this.driftDir, "keys", "ed25519.pem");
-        // A strict parse is the ONLY key-identity source: a malformed committed
-        // trust root must never be treated as a usable (read-only) key with a
-        // fallback fingerprint.
-        const rootState = committedPub ? parseTrustRoot(committedPub) : { state: "absent" };
-        if (rootState.state === "malformed") {
+        // A malformed trust root / keyring is a security state: never sign and
+        // never treat the checkout as read-only against an unusable trust set.
+        if (trust.malformed) {
             this.privateKeyPem = "";
-            this.publicKeyPem = committedPub ?? "";
+            this.publicKeyPem = trust.anchorPem ?? this.publicStore.publicKey() ?? "";
             this.signerState = "malformed";
             return;
         }
         if (!existsSync(keyPath)) {
             this.privateKeyPem = "";
-            this.publicKeyPem = committedPub ?? "";
-            this.signerState = committedPub ? "read-only" : "missing";
+            this.publicKeyPem = trust.anchorPem ?? "";
+            this.signerState = trust.active.length > 0 ? "read-only" : "missing";
             return;
         }
         const privateKeyPem = readFileSync(keyPath, "utf8");
@@ -176,11 +175,20 @@ export class Drift {
         catch {
             throw new DriftError(`The Drift signing key (${keyPath}) is unreadable or corrupt. Restore it or import the repository key with \`drift key import --file <path>\`.`, EXIT.KEY);
         }
-        if (committedPub && derived !== committedPub) {
-            // State E: do not sign with a key that is not the trust root, and never
-            // overwrite either key automatically.
+        const fingerprint = signingKeyIdFor(derived);
+        const isActive = trust.active.some((k) => k.fingerprint === fingerprint);
+        if (!isActive) {
+            if (trust.active.length === 0 && !trust.keyringPresent) {
+                // State D (legacy): private-only checkout — derive the public key.
+                this.privateKeyPem = privateKeyPem;
+                this.publicKeyPem = derived;
+                this.signerState = "ready";
+                return;
+            }
+            // The local key is not an active trust-set key (revoked, removed, or
+            // never added): never sign with it, never overwrite the keyring.
             this.privateKeyPem = "";
-            this.publicKeyPem = committedPub;
+            this.publicKeyPem = trust.anchorPem ?? "";
             this.signerState = "mismatch";
             return;
         }
@@ -259,23 +267,29 @@ export class Drift {
         // keypair; a private-only checkout (State D) derives the public key; a
         // mismatch (State E) fails safely.
         const keyPath = join(driftDir, "keys", "ed25519.pem");
-        const committedPub = new PublicStore(driftDir).publicKey();
+        const trust = loadTrustSet(driftDir);
+        const committedPub = trust.anchorPem;
         const privateExists = existsSync(keyPath);
         let publicKeyPem;
         let signerState;
-        // A malformed committed trust root is a security state, not a cosmetic
-        // one: refuse to bootstrap a signer against it (no fallback identity).
-        if (committedPub && parseTrustRoot(committedPub).state === "malformed") {
-            throw new DriftError(`.drift/public/key.pem exists but is not a valid Drift public key — the repository trust root is malformed. Fix or remove it (e.g. re-import the correct key with \`drift key import --file <path>\`) before running drift init.`, EXIT.KEY);
+        // A malformed committed trust root OR keyring is a security state, not a
+        // cosmetic one: refuse to bootstrap a signer against it (no fallback
+        // identity).
+        if (trust.malformed) {
+            throw new DriftError(`The repository trust material is malformed (${trust.malformed}). Fix or remove it before running drift init.`, EXIT.KEY);
         }
         if (committedPub && privateExists) {
             const privateKeyPem = readFileSync(keyPath, "utf8");
             const derived = publicKeyFromPrivate(privateKeyPem).trim();
-            if (derived !== committedPub) {
-                throw new DriftError("Signing-key mismatch detected: .drift/keys/ed25519.pem does not match the committed trust root (.drift/public/key.pem).\nNothing was overwritten. Import the correct repository key with:\n  drift key import --file /secure/path/repository-private-key.pem", EXIT.KEY);
+            const fingerprint = signingKeyIdFor(derived);
+            const active = trust.active.some((k) => k.fingerprint === fingerprint);
+            if (!active) {
+                throw new DriftError(trust.keyringPresent
+                    ? "Signing-key mismatch detected: the local private key (.drift/keys/ed25519.pem) is not an active key in the committed keyring (.drift/public/keyring.json).\nNothing was overwritten. Import a private key that matches an active keyring key with:\n  drift key import --file /secure/path/repository-private-key.pem"
+                    : "Signing-key mismatch detected: .drift/keys/ed25519.pem does not match the committed trust root (.drift/public/key.pem).\nNothing was overwritten. Import the correct repository key with:\n  drift key import --file /secure/path/repository-private-key.pem", EXIT.KEY);
             }
             publicKeyPem = committedPub;
-            signerState = "ready"; // State B
+            signerState = "ready"; // State B / active keyring signer
         }
         else if (committedPub && !privateExists) {
             // State C — fresh clone: preserve the trust root, enter read-only
@@ -322,12 +336,12 @@ export class Drift {
      * permissions, and never prints key material or stages it in git.
      */
     keyImport(privateKeyFilePath) {
-        const committedPub = this.publicStore.publicKey();
-        if (!committedPub) {
-            throw new DriftError("No committed public trust root (.drift/public/key.pem) in this repository. Run `drift init` in a new repository first — there is nothing for this key to match.", EXIT.KEY);
+        const trust = this.trustSet;
+        if (trust.malformed) {
+            throw new DriftError(`The repository trust material is malformed (${trust.malformed}). Fix or remove it before importing a signing key.`, EXIT.KEY);
         }
-        if (parseTrustRoot(committedPub).state === "malformed") {
-            throw new DriftError(`.drift/public/key.pem is not a valid Drift public key — the repository trust root is malformed. Fix or remove it before importing a signing key.`, EXIT.KEY);
+        if (!trust.anchorPem && !trust.keyringPresent) {
+            throw new DriftError("No committed public trust root (.drift/public/key.pem) in this repository. Run `drift init` in a new repository first — there is nothing for this key to match.", EXIT.KEY);
         }
         const pem = readFileSync(resolve(privateKeyFilePath), "utf8");
         let derived;
@@ -337,8 +351,12 @@ export class Drift {
         catch {
             throw new DriftError(`The file at ${privateKeyFilePath} is not a readable Ed25519 private key.`, EXIT.KEY);
         }
-        if (derived !== committedPub) {
-            throw new DriftError("The private key does not match the committed trust root (.drift/public/key.pem). Refusing to import — nothing was written.", EXIT.KEY);
+        const fingerprint = signingKeyIdFor(derived);
+        const active = trust.active.some((k) => k.fingerprint === fingerprint);
+        if (!active) {
+            throw new DriftError(trust.keyringPresent
+                ? "The private key does not match any ACTIVE key in the committed keyring (.drift/public/keyring.json). Refusing to import — nothing was written."
+                : "The private key does not match the committed trust root (.drift/public/key.pem). Refusing to import — nothing was written.", EXIT.KEY);
         }
         const keysDir = join(this.driftDir, "keys");
         mkdirSync(keysDir, { recursive: true });
@@ -346,23 +364,104 @@ export class Drift {
         const tmp = `${target}.tmp-${process.pid}`;
         writeFileSync(tmp, pem, { mode: 0o600 });
         renameSync(tmp, target);
-        return { signerState: "ready", publicKeyFingerprint: signingKeyIdFor(committedPub) };
+        return { signerState: "ready", publicKeyFingerprint: fingerprint };
     }
     /**
-     * Refuse to create NEW signed provenance unless the local private key
-     * matches the committed trust root (States A/B/D). Read-only clones (C) and
-     * mismatches (E) get an actionable message and exit E_KEY.
+     * Refuse to create NEW signed provenance unless the local private key is an
+     * active member of the committed trust set (States A/B/D / active keyring
+     * key). Read-only clones (C) and mismatches (E) get an actionable message
+     * and exit E_KEY.
      */
     assertSignerReady(command) {
         if (this.signerState === "ready")
             return;
         if (this.signerState === "read-only") {
-            throw new DriftError(`Public provenance exists, but the matching private signing key is unavailable (\`${command}\` needs it).\n\nRead operations remain available.\nImport the repository signing key before creating new signed intents:\n  drift key import --file /secure/path/repository-private-key.pem`, EXIT.KEY);
+            throw new DriftError(`Public provenance exists, but a matching private signing key is unavailable (\`${command}\` needs it).\n\nRead operations remain available.\nImport a private key that matches an active key${this.trustSet.keyringPresent ? " in the committed keyring" : " (the committed trust root)"} before creating new signed intents:\n  drift key import --file /secure/path/repository-private-key.pem`, EXIT.KEY);
         }
         if (this.signerState === "mismatch") {
-            throw new DriftError("Signing-key mismatch detected: .drift/keys/ed25519.pem does not match the committed trust root (.drift/public/key.pem).\nImport the correct key with `drift key import --file <path>` — nothing was overwritten.", EXIT.KEY);
+            throw new DriftError(this.trustSet.keyringPresent
+                ? "Signing-key mismatch detected: .drift/keys/ed25519.pem is not an ACTIVE key in the committed keyring (.drift/public/keyring.json).\nImport a private key that matches an active keyring key with `drift key import --file <path>` — nothing was overwritten."
+                : "Signing-key mismatch detected: .drift/keys/ed25519.pem does not match the committed trust root (.drift/public/key.pem).\nImport the correct key with `drift key import --file <path>` — nothing was overwritten.", EXIT.KEY);
         }
         throw new DriftError(`No Drift signing key in this checkout — run \`drift init\` first.`, EXIT.KEY);
+    }
+    // ---------------------------------------------------------- multi-signer
+    /** The committed keyring, or a clear error (malformed vs not-yet-created). */
+    requireKeyring() {
+        if (!this.trustSet.keyring) {
+            throw new DriftError(this.trustSet.malformed
+                ? `The committed keyring is malformed (${this.trustSet.malformed}). Fix or remove it before continuing.`
+                : "No keyring in this repository yet — run `drift keyring init` first (requires the anchor key holder).", EXIT.KEY);
+        }
+        return this.trustSet.keyring;
+    }
+    /**
+     * Bootstrap the multi-signer keyring from the anchor key. Requires the
+     * anchor's private key (the bootstrap entry is self-signed). Idempotent:
+     * an existing, valid keyring is left untouched.
+     */
+    keyringInit() {
+        if (this.trustSet.keyringPresent) {
+            if (this.trustSet.malformed) {
+                throw new DriftError(`The committed keyring is malformed (${this.trustSet.malformed}). Fix it before continuing.`, EXIT.KEY);
+            }
+            return { status: "exists", keyringPath: keyringPath(this.driftDir), active: this.trustSet.active.length };
+        }
+        this.assertSignerReady("drift keyring init");
+        const anchor = this.publicStore.publicKey();
+        if (!anchor) {
+            throw new DriftError("No committed anchor key (.drift/public/key.pem) — run `drift init` in a new repository first.", EXIT.KEY);
+        }
+        const result = createKeyring(anchor, this.privateKeyPem);
+        if (!result.ok)
+            throw new DriftError(result.error, EXIT.KEY);
+        writeKeyringFile(this.driftDir, result.keyring);
+        this.trustSet = loadTrustSet(this.driftDir);
+        return { status: "created", keyringPath: keyringPath(this.driftDir), active: this.trustSet.active.length };
+    }
+    /** Add a new trusted signer (signed by an ACTIVE keyring key). */
+    keyringAdd(publicKeyFilePath, reason = null) {
+        this.assertSignerReady("drift keyring add");
+        const keyring = this.requireKeyring();
+        const pem = readFileSync(resolve(publicKeyFilePath), "utf8");
+        const result = applyKeyringChange(keyring, this.privateKeyPem, "add", { pem }, reason);
+        if (!result.ok)
+            throw new DriftError(result.error, EXIT.KEY);
+        writeKeyringFile(this.driftDir, result.keyring);
+        this.trustSet = loadTrustSet(this.driftDir);
+        return { fingerprint: result.entry.fingerprint, active: this.trustSet.active.length, seq: result.entry.seq };
+    }
+    /** Revoke a signer immediately (compromise / lost key). */
+    keyringRevoke(fingerprint, reason = null) {
+        this.assertSignerReady("drift keyring revoke");
+        const keyring = this.requireKeyring();
+        const result = applyKeyringChange(keyring, this.privateKeyPem, "revoke", { fingerprint }, reason);
+        if (!result.ok)
+            throw new DriftError(result.error, EXIT.KEY);
+        writeKeyringFile(this.driftDir, result.keyring);
+        this.trustSet = loadTrustSet(this.driftDir);
+        return { fingerprint: result.entry.fingerprint, active: this.trustSet.active.length, seq: result.entry.seq };
+    }
+    /** Remove a signer after a rotation grace period (signed by another key). */
+    keyringRemove(fingerprint, reason = null) {
+        this.assertSignerReady("drift keyring remove");
+        const keyring = this.requireKeyring();
+        const result = applyKeyringChange(keyring, this.privateKeyPem, "remove", { fingerprint }, reason);
+        if (!result.ok)
+            throw new DriftError(result.error, EXIT.KEY);
+        writeKeyringFile(this.driftDir, result.keyring);
+        this.trustSet = loadTrustSet(this.driftDir);
+        return { fingerprint: result.entry.fingerprint, active: this.trustSet.active.length, seq: result.entry.seq };
+    }
+    /** Current keyring state (entries + full audit log). */
+    keyringList() {
+        const kr = this.trustSet.keyring;
+        return {
+            present: this.trustSet.keyringPresent,
+            malformed: this.trustSet.malformed,
+            entries: kr ? kr.keys : [],
+            audit: kr ? kr.audit : [],
+        };
     }
     close() {
         this.store?.close();
@@ -904,10 +1003,18 @@ export class Drift {
         if (tracked(keyAbs) && changedVsHead(keyAbs)) {
             throw new DriftError(`.drift/public/key.pem is tracked but its working-tree content differs from HEAD — refusing to stage an unapproved trust-root change. Revert or commit the key change deliberately before running drift realize.`);
         }
+        // The committed keyring (multi-signer trust set) is security material
+        // with the same rule: a tracked keyring.json with working-tree changes
+        // must be committed deliberately, never swept into a realize commit.
+        const keyringAbs = keyringPath(this.driftDir);
+        if (tracked(keyringAbs) && changedVsHead(keyringAbs)) {
+            throw new DriftError(`.drift/public/keyring.json is tracked but its working-tree content differs from HEAD — refusing to stage an unapproved trust-set change. Commit the keyring change deliberately (e.g. \`git add .drift/public/keyring.json && git commit\`) before running drift realize.`);
+        }
         const gitignoreAbs = join(this.driftDir, ".gitignore");
         const candidates = [
             { abs: gitignoreAbs, always: true }, // staged when new or unchanged (see filter below)
             { abs: keyAbs, always: true },
+            { abs: keyringAbs, always: true },
             { abs: this.publicStore.manifestPath(intentId), always: true },
             { abs: configAbs, always: configCreatedByOperation },
         ];
@@ -1404,7 +1511,7 @@ export class Drift {
             const localRecord = this.store?.findByGitSha(sha) ?? null;
             if (view) {
                 record = publicViewToIntentRecord(view, sha);
-                signatureValid = this.publicStore.verifySignature(view);
+                signatureValid = this.verifyViewTrust(view).state === "valid";
                 // Enrich with the LOCAL private prompt/state when present (surfaced
                 // only through the CLI's explicit --include-private-prompt flag).
                 if (localRecord) {
@@ -1925,33 +2032,70 @@ export class Drift {
         return { ok: sig.state === "valid", detail: sig.detail, state: sig.state };
     }
     /**
+     * Verify a public manifest against the FULL trust set (anchor key + any
+     * committed keyring). The manifest's `signingKeyId` selects the exact key
+     * to verify against; a revoked or unknown key never yields `valid`, and a
+     * malformed trust set fails closed to `unverifiable`.
+     */
+    verifyViewTrust(view) {
+        const trust = this.trustSet;
+        if (trust.malformed) {
+            return { state: "unverifiable", detail: `trust set is unusable: ${trust.malformed}` };
+        }
+        if (!view.signature)
+            return { state: "unsigned", detail: "manifest has no signature" };
+        const { signature, ...unsigned } = view;
+        const canonical = canonicalJson(unsigned);
+        if (view.schemaVersion === 2 && view.signingKeyId) {
+            const fid = view.signingKeyId;
+            // With a keyring the entry is authoritative (active or revoked).
+            // Without one the single anchor key is the only trusted identity.
+            const entry = trust.keyring
+                ? trust.keyring.keys.find((k) => k.fingerprint === fid)
+                : trust.active.length === 1 && fid === trust.active[0].fingerprint
+                    ? { fingerprint: fid, pem: trust.active[0].pem, status: "active" }
+                    : undefined;
+            if (entry && entry.status !== "active") {
+                return {
+                    state: "untrusted-key",
+                    detail: entry.status === "revoked"
+                        ? `signing key ${fid} was revoked and is no longer trusted`
+                        : `signing key ${fid} was removed from the keyring and is no longer trusted`,
+                };
+            }
+            if (!entry) {
+                // No verification material at all is "unverifiable", not "invalid" —
+                // an unknown key id with nothing to verify against can't be judged.
+                if (trust.active.length === 0) {
+                    return { state: "unverifiable", detail: "no trusted key available in this checkout" };
+                }
+                return { state: "invalid", detail: "manifest signingKeyId is not a trusted repository key" };
+            }
+            const valid = verifyPayload(canonical, entry.pem, signature);
+            return valid
+                ? { state: "valid", detail: `signature verifies against trusted key ${fid}` }
+                : { state: "invalid", detail: "signature does not verify against the manifest's declared signing key" };
+        }
+        // V1 manifest (no signingKeyId): the anchor key is the only key that
+        // could have signed it.
+        const anchor = trust.anchorPem;
+        if (!anchor)
+            return { state: "unverifiable", detail: "no committed public key in this checkout" };
+        const valid = verifyPayload(canonical, anchor, signature);
+        return valid
+            ? { state: "valid", detail: "signature verifies against the committed public key" }
+            : { state: "invalid", detail: "signature does not verify against the committed public key" };
+    }
+    /**
      * Shared signature/trust-state resolver used by verify, verify-intent and
      * blame. The committed public manifest is verified against the COMMITTED
-     * public key — a newly generated local key (e.g. after `drift init` in a
+     * trust set — a newly generated local key (e.g. after `drift init` in a
      * clone) is never used to judge an old record, so the states distinguish
      * valid / invalid / unsigned / unverifiable / untrusted-key honestly.
      */
     signatureState(intentId, view, record) {
         if (view) {
-            const pub = this.publicStore.publicKey();
-            if (!pub)
-                return { state: "unverifiable", detail: "no committed public key in this checkout" };
-            if (!view.signature)
-                return { state: "unsigned", detail: "manifest has no signature" };
-            const valid = this.publicStore.verifySignature(view);
-            if (!valid) {
-                return { state: "invalid", detail: "signature does not verify against the committed public key" };
-            }
-            // A cryptographically valid signature with a mismatched `signingKeyId`
-            // must not be reported as `valid`: the manifest's declared key id does
-            // not match the fingerprint of the trust root that actually verified.
-            if (view.schemaVersion === 2 && view.signingKeyId !== signingKeyIdFor(pub)) {
-                return {
-                    state: "invalid",
-                    detail: "signature verifies but manifest signingKeyId does not match the committed key fingerprint",
-                };
-            }
-            return { state: "valid", detail: "signature verifies against the committed public key" };
+            return this.verifyViewTrust(view);
         }
         // A manifest file exists but fails strict schema validation — never fall
         // back to the local record (which could mask the corruption), never
