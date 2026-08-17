@@ -268,9 +268,12 @@ jobs:
   # that docs/PERFORMANCE_REPORT.md and docs/SLOS.md reference; the job fails
   # if a benchmark regresses past the documented SLOs.
   benchmark:
-    name: benchmark (large-repo + app intake + soak)
+    name: benchmark (large-repo + app intake + e2e + soak)
     runs-on: [self-hosted, Linux, ARM64]
-    if: github.event_name == 'push'
+    # Protected-branch pushes run automatically; workflow_dispatch lets a
+    # maintainer re-run the full benchmark suite on any SHA (the trust gate
+    # for dispatch is write access, the same level as a protected push).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
