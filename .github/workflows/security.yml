@@ -100,10 +100,52 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Every job must declare `contents: read` (or tighter) as its base.
-          if grep -rn "permissions:" .github/workflows/*.yml | grep -v "contents: read" | grep -v "security-events: write" > /dev/null; then
-            echo "::error::unexpected permissions block found — expected only 'contents: read' (+ security-events: write in CodeQL)"
-            grep -rn "permissions:" .github/workflows/*.yml
-            exit 1
-          fi
-          echo "Permissions review passed: contents: read everywhere, security-events: write only in CodeQL."
+          # Structural scan: every workflow/job permissions block may contain
+          # only `contents: read`; CodeQL may additionally hold
+          # `security-events: write` to upload SARIF. No write/package/release/
+          # token scopes may ever appear.
+          node <<'NODE'
+          const fs = require("node:fs");
+          const files = fs
+            .readdirSync(".github/workflows")
+            .filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
+          const bad = [];
+          for (const f of files) {
+            const lines = fs.readFileSync(`.github/workflows/${f}`, "utf8").split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+              const m = /^(\s*)permissions:\s*(.*)$/.exec(lines[i]);
+              if (!m) continue;
+              const indent = m[1].length;
+              const keys = new Set();
+              if (m[2].trim()) {
+                const inline = /^(\s*)([\w-]+):\s*/.exec(m[2]);
+                if (inline) keys.add(inline[2]);
+              }
+              for (let j = i + 1; j < lines.length; j++) {
+                const t = lines[j];
+                if (!t.trim() || /^\s*#/.test(t)) continue;
+                const lead = /^\s*/.exec(t)[0].length;
+                if (lead <= indent) break;
+                const km = /^(\s*)([\w-]+):/.exec(t);
+                if (km && km[1].length === indent + 2) keys.add(km[2]);
+              }
+              // The CodeQL job may add security-events: write for SARIF.
+              let isCodeql = false;
+              for (let j = i - 1; j >= 0; j--) {
+                const jm = /^  ([\w-]+):\s*$/.exec(lines[j]);
+                if (jm) { isCodeql = jm[1] === "codeql"; break; }
+              }
+              const allowed = isCodeql
+                ? new Set(["contents", "security-events"])
+                : new Set(["contents"]);
+              for (const k of keys) {
+                if (!allowed.has(k)) bad.push(`${f}: unexpected permission scope '${k}'`);
+              }
+            }
+          }
+          if (bad.length) {
+            for (const b of bad) console.error("::error::" + b);
+            process.exit(1);
+          }
+          console.log("Permissions review passed: contents: read everywhere; security-events: write only in CodeQL.");
+          NODE
