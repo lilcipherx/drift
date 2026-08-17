@@ -10,7 +10,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI_JS="$ROOT/packages/drift-cli/dist/cli.js"
-DEMO="$ROOT/examples/demo-repo"
+# Optional target dir (docs-commands-test seeds into a temp dir so the
+# committed demo snapshot is never rewritten); default: the committed demo.
+DEMO="${1:-$ROOT/examples/demo-repo}"
 cli() { node "$CLI_JS" "$@"; }
 
 # 1. build the CLI first if missing

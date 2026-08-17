@@ -99,6 +99,10 @@ jobs:
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
 
+      - name: Docs-command test (every documented command runs)
+        shell: bash
+        run: node scripts/docs-commands-test.mjs
+
   # Untrusted-PR fallback: identical validation on an ephemeral GitHub-hosted
   # runner so external forks, Dependabot and other bot PRs, and untrusted
   # same-repo author associations still get full CI. Never runs on the
@@ -163,6 +167,10 @@ jobs:
           test -x node_modules/.bin/drift
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
+
+      - name: Docs-command test (every documented command runs)
+        shell: bash
+        run: node scripts/docs-commands-test.mjs
 
   # Stable aggregate gate for branch protection: exactly ONE of the two Linux
   # routing jobs must have run (the other must have been skipped), proving the
@@ -249,6 +257,10 @@ jobs:
           test -x node_modules/.bin/drift
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
+
+      - name: Docs-command test (every documented command runs)
+        shell: bash
+        run: node scripts/docs-commands-test.mjs
 
   # Performance evidence (PRD §6/§7): large-repo CLI benchmark + App intake
   # load + worker soak. Runs ONLY on trusted protected-branch pushes to the

@@ -29,7 +29,26 @@ We consider coordinated, good-faith security research to be authorized. Please
 include a description of the issue, reproduction steps, and impact. Do not
 test against production or third-party systems.
 
+## Supply chain and dependencies
+
+- Production dependency surface is deliberately tiny: `@modelcontextprotocol/sdk`
+  and `zod` (MCP only), `typescript` (drift-ast), and internal `@drift/*`
+  workspace packages; the rest is Node built-ins (`node:sqlite`, `node:crypto`,
+  `node:http`, …). There is no native-module dependency.
+- `npm audit` reports **0 vulnerabilities** (prod and dev) and runs in CI.
+- CI installs from the committed lockfile with `--no-audit --no-fund`;
+  `persist-credentials: false`; minimal permissions; pinned reviewed action
+  versions.
+- Releases must follow [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md)
+  (provenance attestation, SBOM, checksums, canary/stable channels, rollback).
+
 ## Threat model (summary)
+
+The full adversary analysis (malicious repo, contributor, tokens,
+installations, manifests, key replacement, stale/replayed webhooks, poisoned
+cache, runner compromise, verification-command execution, prompt theft,
+supply-chain) with per-threat mitigations, evidence, and accepted residuals
+is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 | Threat | Mitigation |
 | :--- | :--- |
