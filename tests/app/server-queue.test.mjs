@@ -105,6 +105,82 @@ async function post(port, raw, headers = {}) {
   return { status: res.status, data };
 }
 
+test("full queued path: server HMAC → durable enqueue → worker re-verifies → audit completes", async () => {
+  // Regression: the queued production flow must complete end-to-end WITH a
+  // webhook secret. The server verifies the HMAC and persists the signature
+  // on the job; the worker re-verifies it before auditing. Without the
+  // persisted signature every authenticated delivery was permanently rejected
+  // as "invalid webhook signature" and never audited.
+  const { srv, queue } = await startServer({ kind: "sqlite" });
+  const { Worker } = await mod("worker.js");
+
+  const did = "did_" + "2".repeat(32);
+  const sha = "b".repeat(40);
+  const manifest = JSON.stringify({
+    schemaVersion: 2,
+    id: did,
+    summary: "queued e2e",
+    timestamp: 1_700_000_000_000,
+    agent: { type: "AGENT", identifier: "bench" },
+    signingKeyId: "0123456789abcdef",
+    signature: "QUJDREVGR0g=",
+    files: [{ path: "src/a.ts", mutationType: "ADDED", summary: "a" }],
+  });
+  let checkRuns = 0;
+  const github = {
+    setInstallation() {},
+    getAppId: () => "12345",
+    getPullRequest: async () => ({ headSha: sha, baseSha: "0".repeat(40), commits: 1, changedFiles: 1, title: "t" }),
+    getPullCommits: async () => ({
+      commits: [{ sha, message: `feat: x\n\nDrift-Intent: ${did}` }],
+      expectedCount: 1,
+      complete: true,
+    }),
+    getCompareCommits: async () => [sha],
+    getPullFiles: async () => ({
+      files: [{ filename: `.drift/public/intents/${did}.json`, status: "added" }],
+      truncated: false,
+    }),
+    getFileContent: async (_o, _r, path) => (path.endsWith(`${did}.json`) ? manifest : null),
+    listDirectory: async () => [],
+    listIssueComments: async () => [],
+    postComment: async () => 1,
+    updateComment: async () => {},
+    createCheckRun: async () => {
+      checkRuns++;
+      return checkRuns;
+    },
+  };
+  const worker = new Worker({
+    queue,
+    deps: { github, webhookSecret: SECRET, appId: "12345" },
+    pollIntervalMs: 20,
+  });
+  worker.start();
+
+  const payload = { ...basePayload, pull_request: { ...basePayload.pull_request, head: { sha } } };
+  const raw = JSON.stringify(payload);
+  const res = await fetch(`http://127.0.0.1:${srv.port}/webhook`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": sign(raw),
+      "x-github-delivery": "delivery-e2e-1",
+    },
+    body: raw,
+  });
+  assert.equal(res.status, 202);
+
+  const deadline = Date.now() + 10_000;
+  while (queue.stats().done < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  assert.equal(queue.stats().done, 1, "job completed");
+  assert.equal(checkRuns, 1, "audit completed and the Check Run was created");
+  assert.equal(queue.stats().dead, 0, "no dead letters");
+  await worker.stop();
+  queue.close();
+});
+
 test("queued server: enqueues and answers 202 fast (no inline audit)", async () => {
   const { srv } = await startServer();
   const raw = JSON.stringify(basePayload);

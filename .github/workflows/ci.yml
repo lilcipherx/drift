@@ -52,11 +52,11 @@ jobs:
     steps:
       # checkout/setup-node v7 run on the Node 24 action runtime (Node 20 was
       # deprecated on GitHub Actions in 2026) and support linux-arm64.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
           # No `cache: npm` here on purpose: the npm cache key does not include
@@ -123,11 +123,11 @@ jobs:
        github.event.pull_request.user.login == 'github-actions[bot]')
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
           cache: npm
@@ -213,11 +213,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
           cache: npm
@@ -273,11 +273,11 @@ jobs:
     if: github.event_name == 'push'
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
 
@@ -304,10 +304,30 @@ jobs:
             if (verify > 200) { console.error("SLO regression: verify-intent = " + verify + " ms"); process.exit(1); }
           '
 
+      - name: Large-repo CLI benchmark (100k manifests, cold path must not blow up)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/bench-large-repo.mjs --commits 2000 --manifests 100000 --json > /tmp/bench-large-100k.json
+          node -e '
+            const j = require("/tmp/bench-large-100k.json");
+            const m = Object.fromEntries(j.engineMeasurements.map((x) => [x.label, x.wallMsMs]));
+            const idx = j.indexStats;
+            console.log(JSON.stringify({ manifests: j.scenario.manifests, warmLogMs: m["log --limit 20 (warm)"], coldLogMs: m["log --limit 20 (cold, index build)"], indexRows: idx.rows, validRows: idx.validRows }, null, 1));
+            if (idx.rows !== 100000) { console.error("index did not reach 100000 rows: " + idx.rows); process.exit(1); }
+            const warm = m["log --limit 20 (warm)"] ?? Infinity;
+            if (warm > 5000) { console.error("SLO regression: 100k warm log --limit 20 = " + warm + " ms"); process.exit(1); }
+          '
+
       - name: App webhook intake load benchmark
         shell: bash
         run: |
           node scripts/bench-app-intake.mjs --deliveries 2000 --json
+
+      - name: App end-to-end benchmark (fault injection, exactly-once, crash recovery)
+        shell: bash
+        run: |
+          node scripts/bench-app-e2e.mjs --json
 
       - name: Worker soak (2% transient failures, duplicates, 0 data loss)
         shell: bash

@@ -30,6 +30,12 @@ export interface QueueJob {
     event: string;
     /** Bounded raw body (the server already enforced the size cap). */
     rawBody: string;
+    /**
+     * Verified X-Hub-Signature-256 over the raw body, persisted so the worker
+     * RE-verifies the HMAC before auditing (defense in depth: a forged job
+     * injected into the queue DB is rejected exactly like a forged webhook).
+     */
+    signature: string;
     /** Parsed JSON payload (bounded by the raw-body cap). */
     payload: unknown;
     status: JobStatus;
@@ -67,7 +73,7 @@ export interface QueueStats {
 }
 export interface QueueAdapter {
     /** Idempotent enqueue keyed on the GitHub delivery id. */
-    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown): EnqueueResult;
+    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
     /** Claim up to `batchSize` due jobs (pending past next_attempt_at, or
      *  in_progress jobs whose lease expired) for `leaseMs`. */
     claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
@@ -104,7 +110,7 @@ export declare class SqliteQueue implements QueueAdapter {
     private db;
     private readonly defaultMaxAttempts;
     constructor(opts: SqliteQueueOptions);
-    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown): EnqueueResult;
+    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
     claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
     ack(id: number, result?: string): void;
     nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead";
@@ -123,7 +129,7 @@ export declare class MemoryQueue implements QueueAdapter {
     private nextId;
     private readonly defaultMaxAttempts;
     constructor(opts?: MemoryQueueOptions);
-    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown): EnqueueResult;
+    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
     claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
     ack(id: number, result?: string): void;
     nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead";

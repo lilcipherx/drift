@@ -16,7 +16,7 @@
  *
  * Private data (prompts, `objects/`, `drift.db`) is never read or rendered.
  */
-import type { GitHubClientLike } from "./github.js";
+import { type GitHubClientLike } from "./github.js";
 export interface WebhookDeps {
     github: GitHubClientLike;
     /** HMAC webhook secret (X-Hub-Signature-256). Required in production. */
@@ -44,6 +44,8 @@ export interface WebhookResult {
     error?: string;
     /** False for client-side errors (GitHub must not retry). */
     retryable?: boolean;
+    /** Client-provided retry hint (GitHub Retry-After for rate limits, ms). */
+    retryAfterMs?: number;
     /** Structured Check Run + comment write outcomes for this delivery. */
     writeResult?: GitHubWriteResult;
 }

@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS webhook_jobs (
   delivery_id   TEXT NOT NULL UNIQUE,
   event         TEXT NOT NULL,
   raw_body      TEXT NOT NULL,
+  signature     TEXT NOT NULL DEFAULT '',
   payload_json  TEXT NOT NULL,
   status        TEXT NOT NULL DEFAULT 'pending',
   attempts      INTEGER NOT NULL DEFAULT 0,
@@ -65,6 +66,7 @@ function rowToJob(row) {
         deliveryId: String(row.delivery_id ?? ""),
         event: String(row.event ?? ""),
         rawBody: String(row.raw_body ?? ""),
+        signature: String(row.signature ?? ""),
         payload: safeParseJson(String(row.payload_json ?? "{}"), {}),
         status: VALID_STATUS.includes(status) ? status : "pending",
         attempts: Number(row.attempts ?? 0),
@@ -105,9 +107,16 @@ export class SqliteQueue {
         this.db.exec("PRAGMA busy_timeout = 5000;");
         this.db.exec("PRAGMA synchronous = NORMAL;");
         this.db.exec(SCHEMA);
+        // Migration for DBs created before the `signature` column existed: the
+        // worker must re-verify the HMAC, so a pre-migration job without a stored
+        // signature is treated as unauthenticated (fail closed) by the worker.
+        const cols = this.db.prepare("PRAGMA table_info(webhook_jobs)").all();
+        if (!cols.some((c) => c.name === "signature")) {
+            this.db.exec("ALTER TABLE webhook_jobs ADD COLUMN signature TEXT NOT NULL DEFAULT ''");
+        }
         this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
     }
-    enqueue(deliveryId, event, rawBody, payload) {
+    enqueue(deliveryId, event, rawBody, payload, signature) {
         if (!deliveryId || deliveryId.length > 200) {
             throw new Error("delivery id is required and must be <= 200 chars");
         }
@@ -117,10 +126,10 @@ export class SqliteQueue {
         // fan-out) collapse into one durable job.
         const info = this.db
             .prepare(`INSERT OR IGNORE INTO webhook_jobs
-           (delivery_id, event, raw_body, payload_json, status, max_attempts,
+           (delivery_id, event, raw_body, signature, payload_json, status, max_attempts,
             next_attempt_at, lease_until, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, 0, 0, ?, ?)`)
-            .run(deliveryId, event, rawBody, JSON.stringify(payload), this.defaultMaxAttempts, now, now);
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, 0, 0, ?, ?)`)
+            .run(deliveryId, event, rawBody, signature ?? "", JSON.stringify(payload), this.defaultMaxAttempts, now, now);
         if (info.changes > 0)
             return { accepted: true, duplicate: false, alreadyProcessed: false };
         const existing = this.db.prepare("SELECT status FROM webhook_jobs WHERE delivery_id = ?").get(deliveryId);
@@ -257,7 +266,7 @@ export class MemoryQueue {
     constructor(opts = {}) {
         this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
     }
-    enqueue(deliveryId, event, rawBody, payload) {
+    enqueue(deliveryId, event, rawBody, payload, signature) {
         if (!deliveryId || deliveryId.length > 200) {
             throw new Error("delivery id is required and must be <= 200 chars");
         }
@@ -277,6 +286,7 @@ export class MemoryQueue {
             deliveryId,
             event,
             rawBody,
+            signature: signature ?? "",
             payload,
             status: "pending",
             attempts: 0,

@@ -17,6 +17,7 @@
  * Private data (prompts, `objects/`, `drift.db`) is never read or rendered.
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { RateLimitError } from "./github.js";
 import { auditProvenanceIntegrity, extractIntentIds, fetchIntents } from "./intents.js";
 import { summarizeIntents } from "./summarize.js";
 import { deriveProvenanceConclusion, evaluateKeyChange, findOwnedDriftComment, } from "./trust.js";
@@ -211,6 +212,21 @@ export async function handleWebhook(event, deps) {
     }
     catch (err) {
         const error = err instanceof Error ? err.message : String(err);
+        // RateLimitError is the client's explicit transient signal: BOTH 429 and
+        // GitHub's secondary rate limit (403 WITH Retry-After). A bare 403 without
+        // Retry-After is a permanent permission error. Distinguishing the two is
+        // critical: misclassifying a secondary rate limit as permanent drops a
+        // delivery that GitHub would otherwise accept on retry.
+        if (err instanceof RateLimitError) {
+            return {
+                handled: true,
+                action: "error",
+                intentsFound: 0,
+                error,
+                retryable: true,
+                retryAfterMs: err.retryAfterMs,
+            };
+        }
         // Permanent GitHub API errors (4xx: repo deleted, bad permissions, invalid
         // installation) will never succeed on retry — ack with 200 so GitHub stops
         // redelivering. Only transient failures (network, 5xx) should be retried.

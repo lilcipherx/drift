@@ -226,7 +226,7 @@ export async function createWebhookServer(opts: ServerOptions) {
         }
         let enqueued;
         try {
-          enqueued = queue.enqueue(deliveryId, req.headers["x-github-event"] as string ?? "", rawBody, payload);
+          enqueued = queue.enqueue(deliveryId, req.headers["x-github-event"] as string ?? "", rawBody, payload, signature);
         } catch (err) {
           logger.error({
             deliveryId,

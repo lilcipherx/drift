@@ -16,7 +16,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -303,5 +303,165 @@ test("git checkout rewrites stat data and the index refreshes (head switch)", ()
 
   git(repo, ["checkout", "-q", head]);
   assert.equal(drift.log({ limit: 100 }).length, 6, "back to head: 6 manifests again");
+  drift.close();
+});
+
+test("git rebase/amend: associations are re-derived from Git, never cached", () => {
+  const repo = makeRepo(6);
+  Drift.init(repo, { author: "test" });
+  const drift = Drift.fromCwd(repo);
+
+  const entry = drift.log({ limit: 100 }).find((e) => e.id === did(6));
+  assert.equal(entry.association.state, "unique");
+  const oldSha = entry.gitSha;
+  assert.ok(oldSha.length === 40, "introducing commit recorded");
+
+  // Rewrite HEAD (amend) — the introducing commit SHA must change and the
+  // trailer association must be re-derived from the NEW commit.
+  git(repo, ["commit", "--amend", "-m", `commit 6 amended\n\nDrift-Intent: ${did(6)}`]);
+  const newSha = git(repo, ["rev-parse", "HEAD"]);
+  assert.notEqual(newSha, oldSha, "amend changed the commit");
+
+  const after = drift.log({ limit: 100 }).find((e) => e.id === did(6));
+  assert.equal(after.gitSha, newSha, "association follows the rewritten commit");
+  assert.equal(after.association.state, "unique", "still a single introduction");
+  assert.equal(after.association.commit, newSha);
+  drift.close();
+});
+
+test("same-size + same-mtime tamper: displayed entries are re-read from disk, not the cache", () => {
+  const repo = makeRepo(8);
+  Drift.init(repo, { author: "test" });
+  const drift = Drift.fromCwd(repo);
+  const target = did(8);
+  const file = join(repo, ".drift", "public", "intents", `${target}.json`);
+
+  // Rewrite the file with a DIFFERENT summary of the SAME byte length, then
+  // restore mtime. ctime is simulated by syncing the DB row's cached ctime to
+  // the file (a ctime-preserving attacker). The refresh sees identical stats
+  // and keeps the row — yet the selected entry MUST reflect the new content.
+  const orig = JSON.parse(readFileSync(file, "utf8"));
+  const newSummary = orig.summary.replace(/8$/, "!"); // same length, different content
+  assert.equal(newSummary.length, orig.summary.length, "same byte length");
+  writeFileSync(file, JSON.stringify({ ...orig, summary: newSummary }));
+  const st = statSync(file);
+  const now = new Date();
+  const sameMtime = new Date(Math.trunc(st.mtimeMs));
+  // utimesSync on Windows also bumps ctime — undo that in the cached row to
+  // simulate an attacker who preserves both timestamps.
+  const db = new DatabaseSync(join(repo, ".drift", "drift.db"));
+  db.exec("PRAGMA journal_mode = WAL");
+  db.prepare(
+    "UPDATE public_manifest_index SET mtime_ms = ?, size = ?, ctime_ms = ? WHERE id = ?",
+  ).run(Math.trunc(st.mtimeMs), st.size, Math.trunc(st.ctimeMs), target);
+  db.close();
+
+  const top = drift.log({ limit: 100 });
+  const entry = top.find((e) => e.id === target);
+  assert.equal(entry.summary, newSummary, "displayed entry re-read from the file");
+  drift.close();
+});
+
+test("parallel Drift processes refresh the index concurrently without corruption", async () => {
+  const repo = makeRepo(40);
+  Drift.init(repo, { author: "test" });
+  const cli = resolve(ROOT, "packages", "drift-cli", "dist", "cli.js");
+  const run = (args) =>
+    new Promise((res) => {
+      const c = spawn(process.execPath, [cli, ...args], { cwd: repo, encoding: "utf8" });
+      let out = "";
+      c.stdout.on("data", (d) => (out += d));
+      c.stderr.on("data", () => {});
+      c.on("close", (code) => res({ code, out }));
+    });
+
+  const results = await Promise.all([
+    run(["log", "--limit", "100"]),
+    run(["log", "--limit", "100"]),
+    run(["status"]),
+    run(["log", "--limit", "100"]),
+  ]);
+  for (const r of results) {
+    assert.equal(r.code, 0, `child exited 0 (got ${r.code})`);
+  }
+  const first = results[0].out;
+  assert.equal(results[1].out, first, "concurrent logs agree");
+  assert.equal(results[3].out, first, "three concurrent logs agree");
+
+  // No corruption: a fresh process sees the full tree and a sane index.
+  const drift = Drift.fromCwd(repo);
+  assert.equal(drift.log({ limit: 100 }).length, 40);
+  const db = new DatabaseSync(join(repo, ".drift", "drift.db"));
+  const rows = db.prepare("SELECT COUNT(*) AS c FROM public_manifest_index").get();
+  db.close();
+  assert.equal(rows.c, 40, "index intact after parallel writers");
+  drift.close();
+});
+
+test("crash mid-refresh: next run recovers and serves the full tree", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "drift-bidx-"));
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.name", "Test Dev"]);
+  git(repo, ["config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "README.md"), "# t\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-m", "init"]);
+  // A few thousand uncommitted working-tree manifests (legal input): the cold
+  // index build is the slow window we crash inside.
+  const dir = join(repo, ".drift", "public", "intents");
+  mkdirSync(dir, { recursive: true });
+  const N = 3000;
+  for (let i = 1; i <= N; i++) {
+    writeFileSync(join(dir, `${did(i)}.json`), manifest(i));
+  }
+  Drift.init(repo, { author: "test" });
+
+  const coreDistUrl = pathToFileURL(coreDist).href;
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      `(async () => {
+         const { Drift } = await import(${JSON.stringify(coreDistUrl)});
+         const d = Drift.fromCwd(${JSON.stringify(repo)});
+         console.error("STARTED");
+         const r = d.log({ limit: 100 });
+         d.close();
+         console.error("DONE " + r.length);
+       })().catch((e) => { console.error("ERR " + e.message); process.exit(2); });`,
+    ],
+    { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let started = false;
+  await new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("child never started")), 30_000);
+    child.stderr.on("data", (d) => {
+      if (!started && d.toString().includes("STARTED")) {
+        started = true;
+        clearTimeout(timer);
+        // Kill while the cold index build is in flight.
+        setTimeout(() => {
+          try {
+            child.kill();
+          } catch {
+            /* already gone */
+          }
+          res();
+        }, 150);
+      }
+    });
+  });
+  if (!started) throw new Error("child did not reach the refresh window");
+
+  // Next run must recover (WAL rollback of the torn transaction).
+  const drift = Drift.fromCwd(repo);
+  const after = drift.log({ limit: 100 });
+  assert.equal(after.length, 100, "bounded log works after a killed refresh");
+  const status = Drift.status(repo);
+  assert.equal((status.malformedManifests ?? []).length, 0);
+  const db = new DatabaseSync(join(repo, ".drift", "drift.db"));
+  const rows = db.prepare("SELECT COUNT(*) AS c FROM public_manifest_index").get();
+  db.close();
+  assert.equal(rows.c, N, "index fully rebuilt after the crash");
   drift.close();
 });

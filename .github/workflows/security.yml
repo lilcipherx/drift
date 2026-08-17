@@ -1,0 +1,109 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: every job starts with contents: read only. CodeQL
+# additionally requests security-events: write to upload SARIF results.
+# No job has write access to the repository or a GITHUB_TOKEN with package/
+# release scopes. All actions are pinned to immutable commit SHAs (resolved
+# from the official action release tags on 2026-08-13) — the SHA-pinning
+# self-audit below fails the workflow if a mutable tag ever sneaks back in.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL (JavaScript/TypeScript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f3712979fa5f215279b101dd0a2e3bdfb4353324
+        with:
+          languages: javascript-typescript
+      - name: Build (tsc -b) so CodeQL sees the full source graph
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@f3712979fa5f215279b101dd0a2e3bdfb4353324
+
+  dependency-review:
+    name: Dependency review (PRs)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # Fails the PR when a dependency with a known vulnerability (high+) or
+      # a non-permissive license is added/changed.
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          fail-on-severity: high
+          license-check: true
+
+  supply-chain:
+    name: Supply-chain gates (audit, secrets, licenses, tarballs, SBOM, pinning)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: npm audit (fail on high or critical)
+        run: npm audit --audit-level=high
+
+      - name: Secret scan + license review + package-content scan
+        run: node scripts/security-checks.mjs --secrets --licenses --packages
+
+      - name: SPDX SBOM generation + validation
+        run: node scripts/security-checks.mjs --sbom benchmarks/results/drift.spdx.json
+
+      - name: GitHub Actions SHA-pinning self-audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad="$(grep -rnE 'uses: [^@]+@[a-zA-Z0-9._-]+' .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}$' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::every actions/* step must be pinned to a full commit SHA:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "All GitHub Actions references are pinned to immutable commit SHAs."
+
+      - name: Actions permission review (no write tokens outside CodeQL)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Every job must declare `contents: read` (or tighter) as its base.
+          if grep -rn "permissions:" .github/workflows/*.yml | grep -v "contents: read" | grep -v "security-events: write" > /dev/null; then
+            echo "::error::unexpected permissions block found — expected only 'contents: read' (+ security-events: write in CodeQL)"
+            grep -rn "permissions:" .github/workflows/*.yml
+            exit 1
+          fi
+          echo "Permissions review passed: contents: read everywhere, security-events: write only in CodeQL."

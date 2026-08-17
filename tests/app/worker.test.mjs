@@ -175,6 +175,99 @@ test("lease expiry: crashed worker's job is re-claimed and processed", async () 
   queue.close();
 });
 
+test("secondary rate limit (403 + Retry-After) is retried, never dropped permanently", async () => {
+  const { MemoryQueue } = await mod("queue.js");
+  const { Worker, processDelivery } = await mod("worker.js");
+  const { RateLimitError } = await mod("github.js");
+  const queue = new MemoryQueue({ maxAttempts: 5 });
+
+  const did = "did_" + "1".repeat(32);
+  const sha = "a".repeat(40);
+  const manifest = JSON.stringify({
+    schemaVersion: 2,
+    id: did,
+    summary: "e2e summary",
+    timestamp: 1_700_000_000_000,
+    agent: { type: "AGENT", identifier: "bench" },
+    signingKeyId: "0123456789abcdef",
+    signature: "QUJDREVGR0g=",
+    files: [{ path: "src/a.ts", mutationType: "ADDED", summary: "a" }],
+  });
+  let prCalls = 0;
+  let checkRuns = 0;
+  const github = {
+    setInstallation() {},
+    getAppId: () => "12345",
+    async getPullRequest() {
+      prCalls++;
+      // First call: GitHub secondary rate limit (403 WITH Retry-After) — the
+      // client classifies it as transient, and the worker MUST retry rather
+      // than acking the delivery as permanently failed.
+      if (prCalls === 1) {
+        throw new RateLimitError("getPullRequest failed: 403 secondary rate limited (retry in 1s)", 50, 403);
+      }
+      return { headSha: sha, baseSha: "0".repeat(40), commits: 1, changedFiles: 1, title: "t" };
+    },
+    getPullCommits: async () => ({
+      commits: [{ sha, message: `feat: x\n\nDrift-Intent: ${did}` }],
+      expectedCount: 1,
+      complete: true,
+    }),
+    getCompareCommits: async () => [sha],
+    getPullFiles: async () => ({
+      files: [{ filename: `.drift/public/intents/${did}.json`, status: "added" }],
+      truncated: false,
+    }),
+    getFileContent: async (_o, _r, path) => (path.endsWith(`${did}.json`) ? manifest : null),
+    listDirectory: async () => [],
+    listIssueComments: async () => [],
+    postComment: async () => 1,
+    updateComment: async () => {},
+    createCheckRun: async () => {
+      checkRuns++;
+      return checkRuns;
+    },
+  };
+
+  const payload = {
+    action: "opened",
+    installation: { id: 1 },
+    repository: { name: "repo", owner: { login: "owner" } },
+    pull_request: { number: 1, title: "t", head: { sha }, base: { sha: "0".repeat(40) } },
+  };
+  const rawBody = JSON.stringify(payload);
+  const { createHmac } = await import("node:crypto");
+  const sig = `sha256=${createHmac("sha256", "s").update(rawBody, "utf8").digest("hex")}`;
+
+  // Direct: processDelivery must classify the RateLimitError as retryable
+  // and surface the client's Retry-After hint.
+  const outcome = await processDelivery(
+    { github, webhookSecret: "s" },
+    { id: 1, deliveryId: "d-403", event: "pull_request", rawBody, signature: sig, payload, attempts: 0, status: "pending" },
+  );
+  assert.equal(outcome.terminal, false, "secondary rate limit must be retried");
+  assert.equal(outcome.retryAfterMs, 50, "Retry-After hint surfaced for the worker backoff");
+
+  // Worker-level: the delivery must be retried and COMPLETE (check run
+  // created) — a permanent ack would leave checkRuns === 0.
+  const worker = new Worker({
+    queue,
+    deps: { github, webhookSecret: "s" },
+    pollIntervalMs: 10,
+    baseBackoffMs: 0,
+    maxBackoffMs: 100,
+  });
+  worker.start();
+  queue.enqueue("d-403", "pull_request", rawBody, payload, sig);
+  const deadline = Date.now() + 5000;
+  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal(queue.stats().done, 1, "job eventually done");
+  assert.equal(checkRuns, 1, "delivery completed after the secondary-rate-limit retry");
+  assert.ok(prCalls >= 2, "getPullRequest retried");
+  await worker.stop();
+  queue.close();
+});
+
 test("worker never processes the same delivery id twice", async () => {
   const { queue, Worker } = await setup();
   const seen = [];

@@ -25,6 +25,8 @@ export interface DeliveryOutcome {
     error?: string;
     errorCode?: string;
     durationMs: number;
+    /** Client-provided retry hint (GitHub Retry-After for rate limits, ms). */
+    retryAfterMs?: number;
 }
 /**
  * Process one queued webhook delivery: re-verify the HMAC over the stored

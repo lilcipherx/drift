@@ -30,6 +30,8 @@ export interface DeliveryOutcome {
   error?: string;
   errorCode?: string;
   durationMs: number;
+  /** Client-provided retry hint (GitHub Retry-After for rate limits, ms). */
+  retryAfterMs?: number;
 }
 
 /**
@@ -45,10 +47,14 @@ export async function processDelivery(
   log: Logger = nullLogger,
 ): Promise<DeliveryOutcome> {
   const started = Date.now();
+  // Re-verify the HMAC over the stored raw body BEFORE auditing: the job
+  // persists the signature the intake server already verified, so a forged
+  // or tampered queued delivery is rejected exactly like a forged webhook.
   const event: WebhookEvent = {
     event: job.event,
     payload: (job.payload ?? {}) as Record<string, unknown>,
     rawBody: job.rawBody,
+    signature: job.signature || undefined,
   };
   try {
     const result = await handleWebhook(event, deps);
@@ -64,7 +70,15 @@ export async function processDelivery(
           errorCode: "transient",
           msg: "transient failure — job will be retried",
         });
-        return { terminal: false, ok: false, result, error: result.error, errorCode: "transient", durationMs };
+        return {
+          terminal: false,
+          ok: false,
+          result,
+          error: result.error,
+          errorCode: "transient",
+          durationMs,
+          retryAfterMs: result.retryAfterMs,
+        };
       }
       log.error({
         deliveryId: job.deliveryId,
@@ -215,7 +229,16 @@ export class Worker {
             this.metrics.jobPermanent();
           }
         } else {
-          const delay = backoffMs(job.attempts, this.baseBackoffMs, this.maxBackoffMs);
+          // Rate-limit retries must respect the server's Retry-After: back off
+          // at least that long (bounded by the configured cap so a hostile or
+          // stale Retry-After can never stall the queue forever).
+          const delay = Math.min(
+            Math.max(
+              backoffMs(job.attempts, this.baseBackoffMs, this.maxBackoffMs),
+              outcome.retryAfterMs ?? 0,
+            ),
+            this.maxBackoffMs,
+          );
           const state = this.queue.nack(job.id, outcome.error ?? "transient failure", delay);
           if (state === "dead") {
             this.metrics.jobDeadLettered();

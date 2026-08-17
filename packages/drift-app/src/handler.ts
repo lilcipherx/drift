@@ -18,7 +18,7 @@
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { GitHubClientLike, IssueComment } from "./github.js";
+import { RateLimitError, type GitHubClientLike, type IssueComment } from "./github.js";
 import { auditProvenanceIntegrity, extractIntentIds, fetchIntents } from "./intents.js";
 import { summarizeIntents } from "./summarize.js";
 import {
@@ -64,6 +64,8 @@ export interface WebhookResult {
   error?: string;
   /** False for client-side errors (GitHub must not retry). */
   retryable?: boolean;
+  /** Client-provided retry hint (GitHub Retry-After for rate limits, ms). */
+  retryAfterMs?: number;
   /** Structured Check Run + comment write outcomes for this delivery. */
   writeResult?: GitHubWriteResult;
 }
@@ -302,6 +304,21 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
+    // RateLimitError is the client's explicit transient signal: BOTH 429 and
+    // GitHub's secondary rate limit (403 WITH Retry-After). A bare 403 without
+    // Retry-After is a permanent permission error. Distinguishing the two is
+    // critical: misclassifying a secondary rate limit as permanent drops a
+    // delivery that GitHub would otherwise accept on retry.
+    if (err instanceof RateLimitError) {
+      return {
+        handled: true,
+        action: "error",
+        intentsFound: 0,
+        error,
+        retryable: true,
+        retryAfterMs: err.retryAfterMs,
+      };
+    }
     // Permanent GitHub API errors (4xx: repo deleted, bad permissions, invalid
     // installation) will never succeed on retry — ack with 200 so GitHub stops
     // redelivering. Only transient failures (network, 5xx) should be retried.

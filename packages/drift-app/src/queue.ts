@@ -37,6 +37,12 @@ export interface QueueJob {
   event: string;
   /** Bounded raw body (the server already enforced the size cap). */
   rawBody: string;
+  /**
+   * Verified X-Hub-Signature-256 over the raw body, persisted so the worker
+   * RE-verifies the HMAC before auditing (defense in depth: a forged job
+   * injected into the queue DB is rejected exactly like a forged webhook).
+   */
+  signature: string;
   /** Parsed JSON payload (bounded by the raw-body cap). */
   payload: unknown;
   status: JobStatus;
@@ -77,7 +83,7 @@ export interface QueueStats {
 
 export interface QueueAdapter {
   /** Idempotent enqueue keyed on the GitHub delivery id. */
-  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown): EnqueueResult;
+  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
   /** Claim up to `batchSize` due jobs (pending past next_attempt_at, or
    *  in_progress jobs whose lease expired) for `leaseMs`. */
   claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
@@ -116,6 +122,7 @@ CREATE TABLE IF NOT EXISTS webhook_jobs (
   delivery_id   TEXT NOT NULL UNIQUE,
   event         TEXT NOT NULL,
   raw_body      TEXT NOT NULL,
+  signature     TEXT NOT NULL DEFAULT '',
   payload_json  TEXT NOT NULL,
   status        TEXT NOT NULL DEFAULT 'pending',
   attempts      INTEGER NOT NULL DEFAULT 0,
@@ -141,6 +148,7 @@ function rowToJob(row: Record<string, unknown>): QueueJob {
     deliveryId: String(row.delivery_id ?? ""),
     event: String(row.event ?? ""),
     rawBody: String(row.raw_body ?? ""),
+    signature: String(row.signature ?? ""),
     payload: safeParseJson(String(row.payload_json ?? "{}"), {}),
     status: VALID_STATUS.includes(status) ? status : "pending",
     attempts: Number(row.attempts ?? 0),
@@ -195,10 +203,17 @@ export class SqliteQueue implements QueueAdapter {
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec("PRAGMA synchronous = NORMAL;");
     this.db.exec(SCHEMA);
+    // Migration for DBs created before the `signature` column existed: the
+    // worker must re-verify the HMAC, so a pre-migration job without a stored
+    // signature is treated as unauthenticated (fail closed) by the worker.
+    const cols = this.db.prepare("PRAGMA table_info(webhook_jobs)").all() as unknown as { name: string }[];
+    if (!cols.some((c) => c.name === "signature")) {
+      this.db.exec("ALTER TABLE webhook_jobs ADD COLUMN signature TEXT NOT NULL DEFAULT ''");
+    }
     this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
   }
 
-  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown): EnqueueResult {
+  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult {
     if (!deliveryId || deliveryId.length > 200) {
       throw new Error("delivery id is required and must be <= 200 chars");
     }
@@ -209,11 +224,20 @@ export class SqliteQueue implements QueueAdapter {
     const info = this.db
       .prepare(
         `INSERT OR IGNORE INTO webhook_jobs
-           (delivery_id, event, raw_body, payload_json, status, max_attempts,
+           (delivery_id, event, raw_body, signature, payload_json, status, max_attempts,
             next_attempt_at, lease_until, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, 0, 0, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, 0, 0, ?, ?)`,
       )
-      .run(deliveryId, event, rawBody, JSON.stringify(payload), this.defaultMaxAttempts, now, now);
+      .run(
+        deliveryId,
+        event,
+        rawBody,
+        signature ?? "",
+        JSON.stringify(payload),
+        this.defaultMaxAttempts,
+        now,
+        now,
+      );
     if (info.changes > 0) return { accepted: true, duplicate: false, alreadyProcessed: false };
     const existing = this.db.prepare("SELECT status FROM webhook_jobs WHERE delivery_id = ?").get(deliveryId) as
       | { status: string }
@@ -379,7 +403,7 @@ export class MemoryQueue implements QueueAdapter {
     this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
   }
 
-  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown): EnqueueResult {
+  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult {
     if (!deliveryId || deliveryId.length > 200) {
       throw new Error("delivery id is required and must be <= 200 chars");
     }
@@ -399,6 +423,7 @@ export class MemoryQueue implements QueueAdapter {
       deliveryId,
       event,
       rawBody,
+      signature: signature ?? "",
       payload,
       status: "pending",
       attempts: 0,
