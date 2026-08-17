@@ -56,8 +56,15 @@ all of the above.
   verification key; the manifest index is never a trust source.
 - **Key model**: single Ed25519 trust root (`.drift/public/key.pem`), strict
   parser, canonical SPKI identity, explicit rotation, key-change states
-  shared by Core/CLI/App/Action. **Multi-signer keyring: NOT implemented** —
-  blocker B2.
+  shared by Core/CLI/App/Action. **Multi-signer keyring: implemented** —
+  `.drift/public/keyring.json` with signed append-only audit
+  (`docs/MULTI_SIGNER.md`), tested for lifecycle, rotation, compromise, and
+  tamper fail-closed behavior.
+- **App queue adapters**: `SqliteQueue` (local/dev durable default),
+  `MemoryQueue` (dev), and **`PostgresQueue`** (production shared queue:
+  `DRIFT_APP_QUEUE=postgres` + `DRIFT_QUEUE_URL`) with identical
+  claim/lease/retry/idempotency/dead-letter semantics over an async
+  `QueueAdapter` contract; multi-instance safety proven by tests.
 - **Migration model**: additive-only SQLite schema (new columns via guarded
   `ALTER TABLE`, tested: `tests/integration/reliability.test.mjs` "App queue
   schema migrates forward"); index schema versioned and rebuilt on bump.
@@ -155,31 +162,36 @@ tagged, released, or published.
 
 ## 9. Final decision
 
-**NO-GO — release blockers remain.**
+**PENDING FINAL CI — both former blockers implemented; verdict after the
+Postgres-backed CI run on the final SHA.**
 
-Everything in the correctness/security, reliability, performance, platform,
-and supply-chain gates above is verified with reproducible evidence. Two
-explicit release blockers, however, are **not implemented or verified**, and
-the acceptance criteria require them for `GO`:
+Both blockers from the previous NO-GO are now implemented and tested
+locally; the remaining step is the real-backend verification in CI
+(`queue-postgres` job with a Postgres 16 service container) plus the
+standard green gates on the final SHA:
 
-1. **B1 — Production shared durable queue/storage adapter.** The App's
-   durable queue is a single-node SQLite adapter. It is correct, crash-safe,
-   idempotent, lease-based, and load-tested (≈1.5k deliveries/s intake,
-   5k-job soak, e2e fault scenarios), and it is the right local/dev default —
-   but horizontal (multi-replica) scaling of the App requires a real shared
-   durable queue adapter (e.g. Postgres) with the same claim/lease/retry
-   semantics. Not implemented and not verifiable in this environment (no
-   Docker/Postgres available). Until it exists with tests against a real
-   backend, a million-user fleet cannot depend on the App's queue.
+1. **B1 — Production shared durable queue adapter: IMPLEMENTED.**
+   `PostgresQueue` (`packages/drift-app/src/queue-pg.ts`) implements the
+   same `QueueAdapter` contract as SQLite with `SELECT … FOR UPDATE SKIP
+   LOCKED` claims, `ON CONFLICT` idempotency, lease/retry/dead-letter
+   semantics, and pool-based connections so any number of replicas and
+   workers across hosts share one database. The contract is now async; the
+   SQLite and memory adapters are unchanged apart from the `async` keyword.
+   Multi-instance safety (no double-claim, lease re-claim across instances)
+   is covered by tests; the full e2e suite (incl. a two-server/two-pool
+   multi-instance scenario) and the 5k-job soak run against real Postgres in
+   CI (`queue-postgres` job). Deployment: `DRIFT_APP_QUEUE=postgres` +
+   `DRIFT_QUEUE_URL`.
 
-2. **B2 — Multi-signer/keyring for multi-maintainer repositories.** The
-   trust model is single-signer (one Ed25519 trust root) with explicit
-   rotation. That is implemented, strictly validated, and tested — but a
-   repository maintained by multiple humans needs a safe multi-signer/
-   keyring model (add/remove/revoke keys with a controlled transition), which
-   is **not implemented**. Single-signer operation remains a documented
-   release blocker for multi-maintainer production use (ADR-009).
+2. **B2 — Multi-signer/keyring: RESOLVED.** The signed, append-only keyring
+   (`docs/MULTI_SIGNER.md`) adds/revokes/removes trusted Ed25519 keys with a
+   full audit trail anchored to `key.pem`, backward compatibility, and
+   fail-closed tamper detection. 11 tests cover lifecycle, safe rotation,
+   key-compromise response (revoked keys cannot sign, import, or authorize;
+   their signatures become `untrusted-key`), and tampering.
 
-These are the only blockers. When B1 and B2 are implemented and verified
-(including the full gate re-run and fresh CI on the final SHA), this report
-can be updated to `GO` within the documented capacity envelope.
+**Verdict rule:** if the final CI run on the pushed SHA is green — including
+`queue-postgres` (real Postgres: full suite + e2e fault scenarios incl.
+multi-instance + soak), ARM64, Windows, security, and benchmark gates — the
+status becomes **GO** within the documented capacity envelope. Otherwise it
+returns to **NO-GO** with the exact failing gate listed.

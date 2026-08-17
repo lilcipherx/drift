@@ -84,7 +84,10 @@ Trust boundaries and data surfaces are described in
 | Replace trust root in a fresh clone | `drift init` PRESERVES the committed `.drift/public/key.pem` byte-for-byte; never regenerates it; read-only signer mode until the matching key is imported. |
 | Key import of a wrong key | `drift key import` verifies an exact match; wrong/mismatched keys are rejected. |
 | RSA/EC/certificate/private/malformed/oversized keys | Trust-root parser accepts only canonical Ed25519 SPKI keys; identity = canonical SPKI-DER hash; everything else is `untrusted-key`/`malformed`, never valid. |
-| Key rotation | Controlled, explicit single-signer rotation (ADR-009); multi-signer keyring is a documented release blocker for multi-maintainer production use (**RESIDUAL**). |
+| Key rotation | Controlled, explicit single-signer rotation (ADR-009); the multi-signer keyring (docs/MULTI_SIGNER.md) adds/revokes/removes keys with a signed append-only audit anchored to `key.pem`. |
+| Keyring tampering (forged entries, fake audit signatures, bootstrap mismatch, empty file, seq gaps) | Every read replays the audit log against an empty state and requires it to reproduce `keys[]` exactly; the bootstrap must match the on-disk anchor; any violation makes the trust set malformed → fail closed (no signing, no imports, verification `unverifiable`). |
+| Compromised signer key | Immediate `keyring revoke --reason compromise`: the key can no longer sign, import, or authorize changes, and nothing it signed verifies (`untrusted-key`) — state-based trust, like a CRL. |
+| Key cannot add itself / revoked key authorizes changes | Enforced by `applyKeyringChange` and re-verified by the audit replay on every read. |
 
 ### 2.7 Stale/replayed webhook
 
@@ -125,8 +128,8 @@ shell commands.
 
 | # | Risk | Why accepted | Planned treatment |
 |---|---|---|---|
-| R1 | Single-signer key model | Multi-maintainer rotation requires a keyring; documented as a release blocker for multi-maintainer production use. | Multi-signer/keyring model. |
+| R1 | ~~Single-signer key model~~ **RESOLVED** | Multi-signer keyring implemented (docs/MULTI_SIGNER.md), tested for lifecycle/rotation/compromise/tamper; legacy single-signer repos unchanged. | — |
 | R2 | Local manifest-index stat collision could hide a manifest from a bounded listing | Stat (mtime+size+ctime) freshness + re-read-on-selection makes trust divergence impossible; listing staleness is bounded and surfaced by status/doctor. | Content-addressed index (hashes) if ever needed. |
 | R3 | macOS not claimed as supported | No macOS CI runner or evidence. | State explicitly in README support policy. |
 | R4 | 100k-manifest CLI envelope | Executed end-to-end (docs/PERFORMANCE_REPORT.md) with the stat-validated index: cold build O(N) one time, bounded commands O(limit) memory thereafter. | Re-measured every CI benchmark run. |
-| R5 | Production shared durable queue not implemented | The App's durable queue is SQLite — correct, crash-safe, and measured locally, but a SINGLE-NODE adapter. Horizontal scaling of the App (multi-replica) requires a shared durable queue/storage adapter; this is a release blocker for multi-replica production deployments (see PRODUCTION_READINESS_REPORT.md). | Postgres (or equivalent) `QueueAdapter` with the same lease/claim/retry semantics. |
+| R5 | ~~Production shared durable queue not implemented~~ **RESOLVED** | `PostgresQueue` implements the same `QueueAdapter` semantics over a shared Postgres DB (multi-instance claim safety tested); verification against a real Postgres runs in CI (`queue-postgres` job). SQLite remains the single-node default. | — |

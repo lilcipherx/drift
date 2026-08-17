@@ -82,8 +82,8 @@ HTTP response. No GitHub API work happens in the request thread.
 | Component | Model | Notes |
 |---|---|---|
 | HTTP replicas | Stateless; 10 replicas | Intake is CPU-cheap (HMAC + SQLite insert). No sticky sessions. |
-| Queue | SQLite-backed durable queue per node (`queue.db`, WAL) | Delivery-ID unique index gives exactly-once enqueue; jobs survive process restart (crash-consistency tested in `tests/app/queue.test.mjs`). |
-| Production adapter | Documented interface (`QueueAdapter`); production deployments may swap in a shared queue (Redis/Postgres) — see `docs/OBSERVABILITY.md` and `docs/OPERATIONS_RUNBOOK.md`. | The local adapter is the default; a horizontal deployment with >1 replica must use a shared adapter (migration documented). |
+| Queue | `SqliteQueue` (default) or `PostgresQueue` (`DRIFT_APP_QUEUE=postgres` + `DRIFT_QUEUE_URL`) — same async `QueueAdapter` contract | SQLite: `queue.db` WAL, `BEGIN IMMEDIATE` claims, exactly-once via the delivery-ID unique index, crash-consistent (tested). Postgres: shared database, `SELECT … FOR UPDATE SKIP LOCKED` claims — the horizontal (multi-replica) production adapter. |
+| Production adapter | `PostgresQueue` — real shared durable queue; multi-instance safety tested (no double-claim, lease re-claim across instances) | SQLite stays the local/dev default; `DRIFT_APP_QUEUE=postgres` is required for >1 replica (see `docs/OPERATIONS_RUNBOOK.md`). |
 | Workers | `concurrency` workers per process, exponential backoff + jitter, dead-letter after `maxRetries` | `packages/drift-app/src/worker.ts`. |
 | Idempotency | `X-GitHub-Delivery` unique; duplicates return 202 without re-audit | `packages/drift-app/src/server.ts`. |
 | Tenant isolation | All GitHub calls scoped to the installation token; rate-limit state tracked per installation | `packages/drift-app/src/github.ts`. |
@@ -184,7 +184,9 @@ benchmarks/results/.
 
 - 10 small stateless nodes (2 vCPU / 2 GB) — intake + workers co-located.
 - No managed queue/DB in the default adapter (SQLite per node); a production
-  deployment replacing the queue with a managed service adds that cost.
+  deployment using the shared Postgres adapter adds a managed Postgres cost
+  (the CI `queue-postgres` job runs the full suite + e2e + soak against
+  Postgres 16).
 - GitHub API: free within App rate limits at this volume (no paid tier needed).
 - Storage: negligible (TTL-swept).
 
@@ -199,6 +201,8 @@ benchmarks/results/.
   100,000 manifests (multi-manifest commits); a 1:1 100k-commit profile adds
   the measured git-log term (~3.3 s at 100k commits) to association scans.
 - Horizontal scaling beyond one node requires the shared-queue production
-  adapter; the local SQLite adapter is single-node by design.
-- Multi-signer keyring is **not** implemented; single-signer operation is a
-  documented release blocker for multi-maintainer production use (ADR-009).
+  adapter (`PostgresQueue`); the local SQLite adapter is single-node by
+  design. Verified against a real Postgres in CI (`queue-postgres` job).
+- Multi-signer keyring **is** implemented (`docs/MULTI_SIGNER.md`);
+  single-signer operation remains supported as the legacy default for
+  single-maintainer repositories.

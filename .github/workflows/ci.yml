@@ -262,6 +262,58 @@ jobs:
         shell: bash
         run: node scripts/docs-commands-test.mjs
 
+  # Production distributed-queue gate: the FULL queue test suite, e2e fault
+  # scenarios (incl. the multi-instance scenario), and the worker soak run
+  # against a REAL shared Postgres database (service container). This is the
+  # evidence that the Postgres adapter provides the same semantics as SQLite
+  # plus horizontal scaling (claim/lease/retry/idempotency/dead-letter across
+  # multiple replicas).
+  queue-postgres:
+    name: queue (Postgres 16, node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: drift
+          POSTGRES_PASSWORD: drift-test
+          POSTGRES_DB: drift_queue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U drift -d drift_queue"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DRIFT_TEST_PG_URL: postgres://drift:drift-test@127.0.0.1:5432/drift_queue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Full test suite against Postgres (queue + app + core)
+        run: npm test
+
+      - name: E2E fault scenarios over Postgres (incl. multi-instance)
+        run: node scripts/bench-app-e2e.mjs --scenario all --pg "$DRIFT_TEST_PG_URL" --json
+
+      - name: Worker soak over Postgres (multi-worker, retries, 0 dead letters)
+        run: node scripts/soak-app.mjs --jobs 5000 --pg "$DRIFT_TEST_PG_URL" --json
+
   # Performance evidence (PRD §6/§7): large-repo CLI benchmark + App intake
   # load + worker soak. Runs ONLY on trusted protected-branch pushes to the
   # self-hosted ARM64 runner (never on PRs/forks). Generates fresh artifacts

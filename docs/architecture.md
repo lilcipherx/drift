@@ -188,6 +188,24 @@ never touched, and the App never edits the Action's
 `<!-- drift:action-summary:v2 -->` comment. The Action posts as
 `github-actions[bot]` and follows the same ownership rule in reverse.
 
+### Queue adapters (durable webhook pipeline)
+
+Every webhook goes through a durable queue: bounded raw body → HMAC
+verification → delivery-ID idempotency → enqueue → fast `202`; the long
+GitHub API audit runs on a worker that re-verifies the stored HMAC before
+acting. The `QueueAdapter` contract is async and identical across adapters:
+
+| Adapter | Mode | Use |
+|---|---|---|
+| `SqliteQueue` | `DRIFT_APP_QUEUE=sqlite` (default) | single-node durable (WAL, `BEGIN IMMEDIATE` claims); local/dev default, also fine for a single-replica deployment |
+| `PostgresQueue` | `DRIFT_APP_QUEUE=postgres` + `DRIFT_QUEUE_URL` | production shared queue: any number of replicas/workers across hosts claim from one database (`SELECT … FOR UPDATE SKIP LOCKED`), same lease/retry/idempotency/dead-letter semantics |
+| `MemoryQueue` | `DRIFT_APP_QUEUE=memory` | non-durable local development |
+| inline | `DRIFT_APP_QUEUE=inline` | legacy single-process debugging (audit in the request thread) |
+
+`DRIFT_APP_MAX_ATTEMPTS` (default 8), `DRIFT_APP_WORKER_CONCURRENCY`
+(default 4) and `DRIFT_APP_POLL_INTERVAL_MS` tune the worker; readiness
+(`/ready`) reports queue depth and fails 503 when the queue is unreachable.
+
 The GitHub **Action** (`scripts/pr-comment.mjs`) uses the same public-manifest
 source and integrity audit but is scoped to **only the PR's commits**
 (`merge-base(base,head)..head`) and degrades gracefully on forks (step

@@ -141,14 +141,18 @@ actions, secret/license/tarball/SBOM gates, docs-command test.
 
 ## 8. Release blockers (see PRODUCTION_READINESS_REPORT.md)
 
-1. **Production shared durable queue/storage adapter** — the App queue is
-   SQLite (single-node). Horizontal (multi-replica) scaling requires a shared
-   durable queue adapter (e.g. Postgres) with the same lease/claim/retry
-   semantics; not implemented or verified (no infrastructure available).
-2. **Multi-signer/keyring** — single-signer trust root with explicit rotation
-   is implemented and tested; a multi-maintainer keyring (add/remove/revoke
-   keys, threshold semantics) is NOT implemented, so multi-maintainer
-   production use remains a blocker.
+1. **Production shared durable queue/storage adapter** — IMPLEMENTED
+   (`PostgresQueue`, async `QueueAdapter` contract, `DRIFT_APP_QUEUE=postgres`
+   + `DRIFT_QUEUE_URL`), with unit tests for multi-instance claim safety and
+   a dedicated CI job (`queue-postgres`) running the full suite, the e2e
+   fault scenarios (incl. multi-instance), and the soak against a real
+   Postgres 16 service container. Status: verification evidence comes from
+   the CI run on the final SHA.
+2. **Multi-signer/keyring** — RESOLVED. `docs/MULTI_SIGNER.md`; the signed,
+   append-only keyring (`keyring.json`) supports bootstrap/add/revoke/remove
+   with a full audit trail, backward compatibility, and fail-closed tamper
+   detection; 11 tests in `tests/integration/keyring.test.mjs` including key
+   compromise scenarios.
 
 ## 9. Performance/scalability bottlenecks (measured)
 
@@ -165,5 +169,6 @@ actions, secret/license/tarball/SBOM gates, docs-command test.
 
 None known within the documented capacity envelope; SLOs, runbooks, and
 disaster-recovery procedures are in SLOS.md / OPERATIONS_RUNBOOK.md /
-DISASTER_RECOVERY.md. Multi-replica deployment is the one unexecuted
-operational mode (blocker §8.1).
+DISASTER_RECOVERY.md. Multi-replica deployment is now supported by the
+Postgres queue adapter (§8.1); the operational runbook documents the
+`DRIFT_APP_QUEUE=postgres` configuration.

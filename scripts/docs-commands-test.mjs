@@ -136,6 +136,9 @@ try {
     ["blame --function login", ["blame", "src/auth.ts", "--function", "login"], { cwd: repo }],
     ["context", ["context", "src/auth.ts", "--limit", "5"], { cwd: repo }],
     ["doctor", ["doctor"], { cwd: repo }],
+    // Multi-signer keyring (docs/MULTI_SIGNER.md): bootstrap, add, list.
+    ["keyring init", ["keyring", "init"], { cwd: repo }],
+    ["keyring list", ["keyring", "list"], { cwd: repo }],
   ];
 
   for (const [label, args, opts] of steps) {
