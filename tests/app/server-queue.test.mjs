@@ -173,10 +173,10 @@ test("full queued path: server HMAC → durable enqueue → worker re-verifies �
   assert.equal(res.status, 202);
 
   const deadline = Date.now() + 10_000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
-  assert.equal(queue.stats().done, 1, "job completed");
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  assert.equal((await queue.stats()).done, 1, "job completed");
   assert.equal(checkRuns, 1, "audit completed and the Check Run was created");
-  assert.equal(queue.stats().dead, 0, "no dead letters");
+  assert.equal((await queue.stats()).dead, 0, "no dead letters");
   await worker.stop();
   queue.close();
 });
@@ -219,7 +219,7 @@ test("queued server: duplicate delivery id is deduplicated (202, duplicate: true
   assert.equal(second.status, 202);
   assert.equal(second.data.accepted, false);
   assert.equal(second.data.duplicate, true);
-  assert.equal(queue.depth(), 1, "only one job may exist per delivery id");
+  assert.equal(await queue.depth(), 1, "only one job may exist per delivery id");
 });
 
 test("queued server: rejects bad signatures before enqueueing", async () => {
@@ -236,7 +236,7 @@ test("queued server: rejects bad signatures before enqueueing", async () => {
     body: raw,
   });
   assert.equal(res.status, 401);
-  assert.equal(queue.depth(), 0);
+  assert.equal(await queue.depth(), 0);
 });
 
 test("queued server: missing delivery id is rejected (cannot guarantee idempotency)", async () => {
@@ -252,7 +252,7 @@ test("queued server: missing delivery id is rejected (cannot guarantee idempoten
     body: raw,
   });
   assert.equal(res.status, 400);
-  assert.equal(queue.depth(), 0);
+  assert.equal(await queue.depth(), 0);
 });
 
 test("queued server: oversized body is rejected with 413", async () => {
@@ -269,7 +269,7 @@ test("queued server: oversized body is rejected with 413", async () => {
     body: big,
   });
   assert.equal(res.status, 413);
-  assert.equal(queue.depth(), 0);
+  assert.equal(await queue.depth(), 0);
 });
 
 test("queued server: health and readiness endpoints", async () => {
@@ -284,7 +284,7 @@ test("queued server: health and readiness endpoints", async () => {
   assert.equal(r.status, "ready");
   assert.equal(r.mode, "queued");
   assert.equal(typeof r.queueDepth, "number");
-  queue.enqueue("delivery-health", "pull_request", "{}", {});
+  await queue.enqueue("delivery-health", "pull_request", "{}", {});
   const ready2 = await fetch(`http://127.0.0.1:${srv.port}/ready`);
   const r2 = await ready2.json();
   assert.ok(r2.queueDepth >= 1);
@@ -312,7 +312,7 @@ test("queued server: sqlite queue survives server restart (durable)", async () =
   const queue2 = new SqliteQueue({ path, maxAttempts: 3 });
   const srv2 = await createWebhookServer({ webhookSecret: SECRET, appId: "1", port: 0, queue: queue2 });
   servers.push(srv2);
-  assert.equal(queue2.depth(), 1, "job must survive a server restart");
+  assert.equal(await queue2.depth(), 1, "job must survive a server restart");
   await srv2.close();
   queue2.close();
 });
@@ -330,5 +330,5 @@ test("queued server: malformed JSON is rejected with 400", async () => {
     body: "{not json",
   });
   assert.equal(res.status, 400);
-  assert.equal(queue.depth(), 0);
+  assert.equal(await queue.depth(), 0);
 });

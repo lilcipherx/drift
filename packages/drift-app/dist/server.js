@@ -110,7 +110,7 @@ export async function createWebhookServer(opts) {
                 return;
             }
             try {
-                const depth = queue.depth();
+                const depth = await queue.depth();
                 sendJson(res, 200, { status: "ready", mode: "queued", queueDepth: depth });
             }
             catch (err) {
@@ -192,7 +192,7 @@ export async function createWebhookServer(opts) {
                 }
                 let enqueued;
                 try {
-                    enqueued = queue.enqueue(deliveryId, req.headers["x-github-event"] ?? "", rawBody, payload, signature);
+                    enqueued = await queue.enqueue(deliveryId, req.headers["x-github-event"] ?? "", rawBody, payload, signature);
                 }
                 catch (err) {
                     logger.error({
@@ -207,12 +207,13 @@ export async function createWebhookServer(opts) {
                 }
                 if (enqueued.accepted) {
                     metrics.deliveryReceived(deliveryId);
+                    const queueDepth = await queue.depth().catch(() => -1);
                     logger.info({
                         deliveryId,
                         op: "webhook.receive",
                         durationMs: Date.now() - started,
                         result: "accepted",
-                        queueDepth: queue.depth(),
+                        queueDepth,
                         msg: "delivery enqueued",
                     });
                     sendJson(res, 202, { accepted: true, deliveryId, duplicate: false });

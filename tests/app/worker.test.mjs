@@ -35,10 +35,10 @@ test("worker processes a job and acks it", async () => {
     pollIntervalMs: 10,
   });
   worker.start();
-  queue.enqueue("d-1", "pull_request", "{}", { action: "opened" });
+  await queue.enqueue("d-1", "pull_request", "{}", { action: "opened" });
   const deadline = Date.now() + 3000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 1);
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 1);
   assert.deepEqual(processed, ["d-1"]);
   await worker.stop();
   queue.close();
@@ -58,10 +58,10 @@ test("transient failure is retried then succeeds", async () => {
     baseBackoffMs: 0, // deterministic: no wait between retries
   });
   worker.start();
-  queue.enqueue("d-retry", "pull_request", "{}", {});
+  await queue.enqueue("d-retry", "pull_request", "{}", {});
   const deadline = Date.now() + 5000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 1, "job should eventually be processed");
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 1, "job should eventually be processed");
   assert.ok(calls >= 3, `expected >=3 calls, got ${calls}`);
   await worker.stop();
   queue.close();
@@ -79,10 +79,10 @@ test("permanent failure is acked (terminal) without retry", async () => {
     pollIntervalMs: 10,
   });
   worker.start();
-  queue.enqueue("d-perm", "pull_request", "{}", {});
+  await queue.enqueue("d-perm", "pull_request", "{}", {});
   const deadline = Date.now() + 3000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 1);
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 1);
   assert.equal(calls, 1, "permanent failures must not be retried");
   await worker.stop();
   queue.close();
@@ -97,11 +97,11 @@ test("repeated transient failures dead-letter at maxAttempts", async () => {
     baseBackoffMs: 0,
   });
   worker.start();
-  queue.enqueue("d-dead", "pull_request", "{}", {});
+  await queue.enqueue("d-dead", "pull_request", "{}", {});
   const deadline = Date.now() + 5000;
-  while (queue.stats().dead < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().dead, 1, "job should be dead-lettered");
-  assert.equal(queue.depth(), 0);
+  while ((await queue.stats()).dead < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).dead, 1, "job should be dead-lettered");
+  assert.equal(await queue.depth(), 0);
   await worker.stop();
   queue.close();
 });
@@ -123,10 +123,10 @@ test("bounded concurrency: at most N jobs in flight", async () => {
     pollIntervalMs: 10,
   });
   worker.start();
-  for (let i = 0; i < 6; i++) queue.enqueue(`d-${i}`, "pull_request", "{}", {});
+  for (let i = 0; i < 6; i++) await queue.enqueue(`d-${i}`, "pull_request", "{}", {});
   const deadline = Date.now() + 5000;
-  while (queue.stats().done < 6 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 6);
+  while ((await queue.stats()).done < 6 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 6);
   assert.ok(maxInFlight <= 2, `max concurrency was ${maxInFlight}`);
   await worker.stop();
   queue.close();
@@ -146,7 +146,7 @@ test("graceful stop waits for in-flight jobs", async () => {
     pollIntervalMs: 10,
   });
   worker.start();
-  queue.enqueue("d-slow", "pull_request", "{}", {});
+  await queue.enqueue("d-slow", "pull_request", "{}", {});
   await sleep(30); // let the worker claim it
   assert.equal(worker.busy, 1);
   await worker.stop();
@@ -167,10 +167,10 @@ test("lease expiry: crashed worker's job is re-claimed and processed", async () 
     leaseMs: 30, // very short lease simulates a crashed worker
   });
   worker.start();
-  queue.enqueue("d-crash", "pull_request", "{}", {});
+  await queue.enqueue("d-crash", "pull_request", "{}", {});
   const deadline = Date.now() + 5000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 1);
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 1);
   await worker.stop();
   queue.close();
 });
@@ -258,10 +258,10 @@ test("secondary rate limit (403 + Retry-After) is retried, never dropped permane
     maxBackoffMs: 100,
   });
   worker.start();
-  queue.enqueue("d-403", "pull_request", rawBody, payload, sig);
+  await queue.enqueue("d-403", "pull_request", rawBody, payload, sig);
   const deadline = Date.now() + 5000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 1, "job eventually done");
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 1, "job eventually done");
   assert.equal(checkRuns, 1, "delivery completed after the secondary-rate-limit retry");
   assert.ok(prCalls >= 2, "getPullRequest retried");
   await worker.stop();
@@ -282,15 +282,15 @@ test("worker never processes the same delivery id twice", async () => {
   worker.start();
   // Simulate GitHub redelivery + concurrent fan-out: three enqueues of the
   // same delivery id must collapse into one job.
-  const a = queue.enqueue("d-same", "pull_request", "{}", {});
-  const b = queue.enqueue("d-same", "pull_request", "{}", {});
-  const c = queue.enqueue("d-same", "pull_request", "{}", {});
+  const a = await queue.enqueue("d-same", "pull_request", "{}", {});
+  const b = await queue.enqueue("d-same", "pull_request", "{}", {});
+  const c = await queue.enqueue("d-same", "pull_request", "{}", {});
   assert.equal(a.accepted, true);
   assert.equal(b.duplicate, true);
   assert.equal(c.duplicate, true);
   const deadline = Date.now() + 3000;
-  while (queue.stats().done < 1 && Date.now() < deadline) await sleep(10);
-  assert.equal(queue.stats().done, 1);
+  while ((await queue.stats()).done < 1 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 1);
   assert.equal(seen.filter((d) => d === "d-same").length, 1);
   await worker.stop();
   queue.close();

@@ -12,7 +12,7 @@
  * failures that must retry). The real audit path is exercised by the live
  * handler tests; this soak proves the pipeline under sustained load.
  *
- * Usage: node scripts/soak-app.mjs [--jobs N] [--json]
+ * Usage: node scripts/soak-app.mjs [--jobs N] [--json] [--pg <postgres-url>]
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -29,6 +29,8 @@ const args = process.argv.slice(2);
 const nIdx = args.indexOf("--jobs");
 const JOBS = nIdx !== -1 ? Number(args[nIdx + 1]) : 3_000; // ≈ 2× modeled peak day in microcosm
 const asJson = args.includes("--json");
+const pgIdx = args.indexOf("--pg");
+const PG_URL = pgIdx !== -1 ? args[pgIdx + 1] : process.env.DRIFT_TEST_PG_URL ?? "";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pct = (arr, p) => {
@@ -40,10 +42,13 @@ const dir = mkdtempSync(join(tmpdir(), "drift-app-soak-"));
 let ok = false;
 try {
   const { SqliteQueue } = await mod("queue.js");
+  const { PostgresQueue } = await mod("queue-pg.js");
   const { Worker } = await mod("worker.js");
   const { createMetrics } = await mod("metrics.js");
 
-  const queue = new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 6 });
+  const queue = PG_URL
+    ? new PostgresQueue({ url: PG_URL, maxAttempts: 6 })
+    : new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 6 });
   const metrics = createMetrics();
   const audits = [];
   let processedUnique = 0;
@@ -77,7 +82,7 @@ try {
     const dup = i > 0 && i % 6 === 0;
     const deliveryId = dup ? `delivery-${i - 1}` : `delivery-${i}`;
     if (dup) duplicateOf.add(deliveryId);
-    queue.enqueue(deliveryId, "pull_request", "{}", { action: "synchronize", n: i });
+    await queue.enqueue(deliveryId, "pull_request", "{}", { action: "synchronize", n: i });
   }
   const duplicates = duplicateOf.size;
   const enqueuedTotal = unique - duplicates + duplicates * 0; // unique deliveries
@@ -92,7 +97,7 @@ try {
   const maxBackoffMs = 2_000;
   let quietMs = 0;
   while (Date.now() < deadline) {
-    const s = queue.stats();
+    const s = await queue.stats();
     if (s.pending === 0 && s.inProgress === 0) quietMs += 50;
     else quietMs = 0;
     if (quietMs > maxBackoffMs + 100) break;
@@ -100,13 +105,13 @@ try {
   }
   await worker.stop();
   const wallMs = performance.now() - t0;
-  const stats = queue.stats();
+  const stats = await queue.stats();
   const snap = metrics.snapshot();
   await queue.close();
 
   ok = stats.pending === 0 && stats.done === enqueuedTotal && snap.jobs.deadLettered === 0 && snap.jobs.nackFailed === 0;
   const out = {
-    scenario: { uniqueJobs: unique, duplicateDeliveries: duplicates, transientRate: 0.02, concurrency: 16, machine: `${process.platform} ${process.arch}` },
+    scenario: { uniqueJobs: unique, duplicateDeliveries: duplicates, transientRate: 0.02, concurrency: 16, adapter: PG_URL ? "postgres" : "sqlite", machine: `${process.platform} ${process.arch}` },
     drainMs: Math.round(wallMs),
     throughputPerSec: Math.round((enqueuedTotal / (wallMs / 1000)) * 10) / 10,
     queue: { pending: stats.pending, done: stats.done, dead: stats.dead },

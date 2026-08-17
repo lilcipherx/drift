@@ -116,7 +116,7 @@ export class SqliteQueue {
         }
         this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
     }
-    enqueue(deliveryId, event, rawBody, payload, signature) {
+    async enqueue(deliveryId, event, rawBody, payload, signature) {
         if (!deliveryId || deliveryId.length > 200) {
             throw new Error("delivery id is required and must be <= 200 chars");
         }
@@ -139,7 +139,7 @@ export class SqliteQueue {
             alreadyProcessed: existing?.status === "done",
         };
     }
-    claim(batchSize, leaseMs, workerId) {
+    async claim(batchSize, leaseMs, workerId) {
         const n = clampPositiveInt(batchSize, 1);
         const lease = clampNonNegInt(leaseMs, 30_000);
         const now = Date.now();
@@ -175,7 +175,7 @@ export class SqliteQueue {
             .all(...ids);
         return jobs.map(rowToJob);
     }
-    ack(id, result) {
+    async ack(id, result) {
         const now = Date.now();
         this.db
             .prepare(`UPDATE webhook_jobs
@@ -184,7 +184,7 @@ export class SqliteQueue {
          WHERE id = ? AND status = 'in_progress'`)
             .run(result ? boundedError(result) : null, now, id);
     }
-    nack(id, error, backoffOverrideMs) {
+    async nack(id, error, backoffOverrideMs) {
         const now = Date.now();
         const row = this.db.prepare("SELECT attempts, max_attempts FROM webhook_jobs WHERE id = ?").get(id);
         if (!row)
@@ -211,7 +211,7 @@ export class SqliteQueue {
             .run(attempts, boundedError(error), now + Math.max(0, Math.floor(delay)), now, id);
         return "retrying";
     }
-    deadLetter(id, error) {
+    async deadLetter(id, error) {
         const now = Date.now();
         this.db
             .prepare(`UPDATE webhook_jobs
@@ -219,13 +219,13 @@ export class SqliteQueue {
          WHERE id = ?`)
             .run(boundedError(error), now, id);
     }
-    depth() {
+    async depth() {
         const row = this.db
             .prepare("SELECT COUNT(*) AS n FROM webhook_jobs WHERE status IN ('pending','in_progress')")
             .get();
         return Number(row?.n ?? 0);
     }
-    stats() {
+    async stats() {
         const rows = this.db
             .prepare("SELECT status, COUNT(*) AS n FROM webhook_jobs GROUP BY status")
             .all();
@@ -242,7 +242,7 @@ export class SqliteQueue {
             total,
         };
     }
-    purgeDone(retainDoneForMs) {
+    async purgeDone(retainDoneForMs) {
         const cutoff = Date.now() - clampNonNegInt(retainDoneForMs, 7 * 24 * 3600 * 1000);
         const info = this.db
             .prepare("DELETE FROM webhook_jobs WHERE status = 'done' AND updated_at < ?")
@@ -266,7 +266,7 @@ export class MemoryQueue {
     constructor(opts = {}) {
         this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
     }
-    enqueue(deliveryId, event, rawBody, payload, signature) {
+    async enqueue(deliveryId, event, rawBody, payload, signature) {
         if (!deliveryId || deliveryId.length > 200) {
             throw new Error("delivery id is required and must be <= 200 chars");
         }
@@ -303,7 +303,7 @@ export class MemoryQueue {
         this.byDelivery.set(deliveryId, id);
         return { accepted: true, duplicate: false, alreadyProcessed: false };
     }
-    claim(batchSize, leaseMs, workerId) {
+    async claim(batchSize, leaseMs, workerId) {
         const n = clampPositiveInt(batchSize, 1);
         const lease = clampNonNegInt(leaseMs, 30_000);
         const now = Date.now();
@@ -320,7 +320,7 @@ export class MemoryQueue {
         }
         return due.map((j) => ({ ...j, payload: j.payload }));
     }
-    ack(id, result) {
+    async ack(id, result) {
         const job = this.jobs.get(id);
         if (!job || job.status !== "in_progress")
             return;
@@ -331,7 +331,7 @@ export class MemoryQueue {
         job.lastResult = result ? boundedError(result) : null;
         job.updatedAt = Date.now();
     }
-    nack(id, error, backoffOverrideMs) {
+    async nack(id, error, backoffOverrideMs) {
         const job = this.jobs.get(id);
         if (!job)
             return "dead";
@@ -354,7 +354,7 @@ export class MemoryQueue {
         job.leaseOwner = "";
         return "retrying";
     }
-    deadLetter(id, error) {
+    async deadLetter(id, error) {
         const job = this.jobs.get(id);
         if (!job)
             return;
@@ -362,7 +362,7 @@ export class MemoryQueue {
         job.lastError = boundedError(error);
         job.updatedAt = Date.now();
     }
-    depth() {
+    async depth() {
         let n = 0;
         for (const j of this.jobs.values()) {
             if (j.status === "pending" || j.status === "in_progress")
@@ -370,7 +370,7 @@ export class MemoryQueue {
         }
         return n;
     }
-    stats() {
+    async stats() {
         const counts = { pending: 0, in_progress: 0, done: 0, dead: 0 };
         for (const j of this.jobs.values()) {
             if (j.status in counts)
@@ -385,7 +385,7 @@ export class MemoryQueue {
             total,
         };
     }
-    purgeDone(retainDoneForMs) {
+    async purgeDone(retainDoneForMs) {
         const cutoff = Date.now() - clampNonNegInt(retainDoneForMs, 7 * 24 * 3600 * 1000);
         let purged = 0;
         for (const [id, job] of [...this.jobs.entries()]) {

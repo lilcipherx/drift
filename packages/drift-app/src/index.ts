@@ -14,6 +14,7 @@ import { GitHubAppClient } from "./github.js";
 import { handleWebhook, type WebhookEvent } from "./handler.js";
 import { assertWebhookAuthConfigured, createWebhookServer } from "./server.js";
 import { SqliteQueue, MemoryQueue, type QueueAdapter } from "./queue.js";
+import { PostgresQueue } from "./queue-pg.js";
 import { Worker } from "./worker.js";
 import { createLogger } from "./logger.js";
 import { createMetrics } from "./metrics.js";
@@ -33,14 +34,22 @@ Usage:
 `;
 
 /**
- * Build the durable queue (production default: SQLite — see CAPACITY_MODEL).
- * `inline` keeps the legacy single-process behavior (audit in the request
- * thread) for local debugging; `memory` is a non-durable dev queue.
+ * Build the durable queue (see CAPACITY_MODEL / docs/ARCHITECTURE):
+ *   sqlite   — single-node durable default (WAL, shared by local replicas).
+ *   postgres — production shared queue: any number of replicas/workers across
+ *              hosts claim from one Postgres database (DRIFT_QUEUE_URL).
+ *   memory   — non-durable local development queue.
+ *   inline   — legacy single-process behavior (audit in the request thread).
  */
 function createQueue(env: NodeJS.ProcessEnv = process.env): QueueAdapter {
   const mode = env.DRIFT_APP_QUEUE ?? "sqlite";
   if (mode === "inline") return null as unknown as QueueAdapter;
   if (mode === "memory") return new MemoryQueue({ maxAttempts: parsePositiveInt(env.DRIFT_APP_MAX_ATTEMPTS, 8) });
+  if (mode === "postgres") {
+    const url = env.DRIFT_QUEUE_URL ?? "";
+    if (!url) throw new Error("DRIFT_APP_QUEUE=postgres requires DRIFT_QUEUE_URL (postgres://...)");
+    return new PostgresQueue({ url, maxAttempts: parsePositiveInt(env.DRIFT_APP_MAX_ATTEMPTS, 8) });
+  }
   const dataDir = env.DRIFT_APP_DATA_DIR || join(process.cwd(), ".drift-app-data");
   return new SqliteQueue({
     path: join(dataDir, "queue.db"),

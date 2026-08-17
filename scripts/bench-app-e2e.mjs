@@ -43,6 +43,8 @@ const args = process.argv.slice(2);
 const scIdx = args.indexOf("--scenario");
 const want = scIdx !== -1 ? args[scIdx + 1] ?? "all" : "all";
 const asJson = args.includes("--json");
+const pgIdx = args.indexOf("--pg");
+const pgUrl = pgIdx !== -1 ? args[pgIdx + 1] : process.env.DRIFT_TEST_PG_URL ?? "";
 const SECRET = "bench-secret";
 
 const shaOf = (i) => `e2e${i.toString(16).padStart(37, "0")}`;
@@ -210,15 +212,15 @@ function percentiles(sorted) {
 async function waitDrain(queue, expected, timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const s = queue.stats();
+    const s = await queue.stats();
     if (s.done + s.dead >= expected) {
       // One extra settle tick: in_progress jobs that are about to ack.
       await sleep(100);
-      return queue.stats();
+      return await queue.stats();
     }
     await sleep(25);
   }
-  throw new Error(`drain timeout: expected ${expected} done+dead, got ${JSON.stringify(queue.stats())}`);
+  throw new Error(`drain timeout: expected ${expected} done+dead, got ${JSON.stringify(await queue.stats())}`);
 }
 
 async function post(port, raw, deliveryId) {
@@ -241,48 +243,61 @@ async function post(port, raw, deliveryId) {
     /* non-json */
   }
   return { status: res.status, data, intakeMs };
+}async function makeQueue(pgUrl) {
+  if (pgUrl) {
+    const { PostgresQueue } = await mod("queue-pg.js");
+    return new PostgresQueue({ url: pgUrl, maxAttempts: 6 });
+  }
+  const { SqliteQueue } = await mod("queue.js");
+  return new SqliteQueue({ path: join(mkdtempSync(join(tmpdir(), "drift-e2e-")), "queue.db"), maxAttempts: 6 });
 }
 
-async function runScenario(sc) {
+async function runScenario(sc, pgUrl) {
   const dir = mkdtempSync(join(tmpdir(), "drift-e2e-"));
-  const { SqliteQueue } = await mod("queue.js");
   const { createWebhookServer } = await mod("server.js");
   const { Worker } = await mod("worker.js");
-  const queue = new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 6 });
   const mock = new MockGitHub(sc.faults, {});
   const deps = { github: mock, webhookSecret: SECRET, appId: "12345" };
-  const srv = await createWebhookServer({ ...deps, port: 0, queue });
 
+  // Multi-instance: two SEPARATE queue objects + servers + worker pools share
+  // one Postgres database — the production horizontal-scaling topology.
+  const instances = sc.multiInstance ? 2 : 1;
+  const queues = [];
+  const srvs = [];
   const workers = [];
-  for (let w = 0; w < sc.workers; w++) {
-    const workerOpts = {
-      queue,
-      deps,
-      concurrency: sc.concurrency ?? 2,
-      pollIntervalMs: 20,
-      leaseMs: sc.leaseMs ?? 30_000,
-      baseBackoffMs: sc.baseBackoffMs ?? 100,
-      maxBackoffMs: sc.maxBackoffMs ?? 2_000,
-    };
-    if (sc.crashWorker && w === 0) {
-      // Simulated crash: this worker claims the first job and never finishes
-      // (a dead process). The lease expires and another worker re-claims.
-      workerOpts.process = (job) => (job.id === sc.crashOnJob ? new Promise(() => {}) : undefined);
-      // `undefined` above would break the worker — make the default explicit:
-      workerOpts.process = async (job) => {
-        if (job.id === sc.crashOnJob) return new Promise(() => {});
-        const { processDelivery } = await mod("worker.js");
-        return processDelivery(deps, job);
+  for (let inst = 0; inst < instances; inst++) {
+    const queue = await makeQueue(pgUrl);
+    queues.push(queue);
+    const srv = await createWebhookServer({ ...deps, port: 0, queue });
+    srvs.push(srv);
+    for (let w = 0; w < Math.max(1, Math.ceil(sc.workers / instances)); w++) {
+      const workerOpts = {
+        queue,
+        deps,
+        concurrency: sc.concurrency ?? 2,
+        pollIntervalMs: 20,
+        leaseMs: sc.leaseMs ?? 30_000,
+        baseBackoffMs: sc.baseBackoffMs ?? 100,
+        maxBackoffMs: sc.maxBackoffMs ?? 2_000,
       };
+      if (sc.crashWorker && inst === 0 && w === 0) {
+        // Simulated crash: this worker claims the first job and never finishes
+        // (a dead process). The lease expires and another worker re-claims.
+        workerOpts.process = async (job) => {
+          if (job.id === sc.crashOnJob) return new Promise(() => {});
+          const { processDelivery } = await mod("worker.js");
+          return processDelivery(deps, job);
+        };
+      }
+      const worker = new Worker(workerOpts);
+      if (!(sc.crashWorker && inst === 0 && w === 0 && sc.crashJoinDelayMs > 0)) worker.start();
+      workers.push(worker);
     }
-    const worker = new Worker(workerOpts);
-    if (!(sc.crashWorker && w === 0 && sc.crashJoinDelayMs > 0)) worker.start();
-    workers.push(worker);
   }
   if (sc.crashWorker) {
     // Worker B joins shortly after A has claimed (and hung on) the first job.
     const joinDelay = sc.crashJoinDelayMs ?? 300;
-    setTimeout(() => workers[workers.length - 1]?.start(), joinDelay);
+    setTimeout(() => workers[1]?.start(), joinDelay);
   }
 
   const N = sc.deliveries;
@@ -300,6 +315,8 @@ async function runScenario(sc) {
       mock.prs.set(prNumber, { ...mock.prs.get(prNumber), headSha: `stale${i.toString(16).padStart(36, "0")}` });
     }
     const raw = payload(deliveryId, prNumber, headSha, i);
+    // Multi-instance: round-robin across the two servers.
+    const srv = srvs[i % srvs.length];
     const res = await post(srv.port, raw, deliveryId);
     intake.push(res.intakeMs);
     if (res.status !== 202) throw new Error(`${sc.name}: expected 202, got ${res.status}`);
@@ -326,13 +343,13 @@ async function runScenario(sc) {
     }
   }
 
-  const finalStats = await waitDrain(queue, N);
-  await srv.close();
+const finalStats = await waitDrain(queues[0], N);
+  for (const s of srvs) await s.close();
   for (const w of workers) {
     if (w === workers[0] && sc.crashWorker) continue; // abandoned (simulated crash)
     await w.stop();
   }
-  queue.close();
+  for (const q of queues) q.close();
 
   // E2E latency: enqueue (202) → check run recorded by the mock.
   const e2e = [];
@@ -445,18 +462,26 @@ const SCENARIOS = [
   { name: "stale", deliveries: 1, workers: 1, concurrency: 1, stale: true },
   { name: "worker-crash", deliveries: 20, workers: 2, concurrency: 1, crashWorker: true, crashOnJob: 1, crashJoinDelayMs: 250, leaseMs: 700 },
   { name: "parallel-workers", deliveries: 60, workers: 3, concurrency: 2 },
+  // True multi-instance: two servers + worker pools over ONE Postgres database
+  // (production horizontal scaling; only valid with --pg).
+  { name: "multi-instance", deliveries: 60, workers: 2, concurrency: 2, multiInstance: true },
 ];
 
 async function main() {
-  const { createHmac: _unused } = await import("node:crypto"); // (kept for clarity)
-  const selected = SCENARIOS.filter((s) => want === "all" || s.name === want);
+  // multi-instance requires a SHARED database (Postgres); without --pg it is
+  // excluded from `all` and refused when selected explicitly.
+  if (want === "multi-instance" && !pgUrl) {
+    console.error("multi-instance requires --pg <postgres-url>");
+    process.exit(1);
+  }
+  const selected = SCENARIOS.filter((s) => (want === "all" ? s.name !== "multi-instance" || !!pgUrl : s.name === want));
   if (selected.length === 0) {
     console.error(`unknown scenario: ${want} (expected one of ${SCENARIOS.map((s) => s.name).join(", ")} or all)`);
     process.exit(1);
   }
   const results = [];
   for (const sc of selected) {
-    const r = await runScenario(sc);
+    const r = await runScenario(sc, pgUrl);
     results.push(r);
     const failed = Object.values(r.assertions).filter((v) => !v).length;
     console.error(
@@ -464,7 +489,7 @@ async function main() {
     );
   }
   const passed = results.every((r) => Object.values(r.assertions).every((v) => v === true));
-  const out = { scenario: want, machine: `${process.platform} ${process.arch}`, results, passed };
+  const out = { scenario: want, adapter: pgUrl ? "postgres" : "sqlite", machine: `${process.platform} ${process.arch}`, results, passed };
   if (asJson) {
     const json = JSON.stringify(out, null, 2);
     console.log(json);

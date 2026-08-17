@@ -73,23 +73,23 @@ export interface QueueStats {
 }
 export interface QueueAdapter {
     /** Idempotent enqueue keyed on the GitHub delivery id. */
-    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
+    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult>;
     /** Claim up to `batchSize` due jobs (pending past next_attempt_at, or
      *  in_progress jobs whose lease expired) for `leaseMs`. */
-    claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
+    claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]>;
     /** Acknowledge a job as processed successfully (keeps the delivery-id
      *  record so redeliveries are deduplicated). */
-    ack(id: number, result?: string): void;
+    ack(id: number, result?: string): Promise<void>;
     /** Mark a job for retry: attempts+1, exponential backoff with jitter; the
      *  job is dead-lettered when attempts reach maxAttempts. */
-    nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead";
+    nack(id: number, error: string, backoffOverrideMs?: number): Promise<"retrying" | "dead">;
     /** Explicitly dead-letter a job (non-retryable failure). */
-    deadLetter(id: number, error: string): void;
+    deadLetter(id: number, error: string): Promise<void>;
     /** Number of pending + in_progress jobs. */
-    depth(): number;
-    stats(): QueueStats;
+    depth(): Promise<number>;
+    stats(): Promise<QueueStats>;
     /** Purge `done` jobs older than `retainDoneForMs` (bounds storage growth). */
-    purgeDone(retainDoneForMs: number): number;
+    purgeDone(retainDoneForMs: number): Promise<number>;
     /** Release resources. */
     close(): void;
 }
@@ -110,14 +110,14 @@ export declare class SqliteQueue implements QueueAdapter {
     private db;
     private readonly defaultMaxAttempts;
     constructor(opts: SqliteQueueOptions);
-    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
-    claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
-    ack(id: number, result?: string): void;
-    nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead";
-    deadLetter(id: number, error: string): void;
-    depth(): number;
-    stats(): QueueStats;
-    purgeDone(retainDoneForMs: number): number;
+    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult>;
+    claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]>;
+    ack(id: number, result?: string): Promise<void>;
+    nack(id: number, error: string, backoffOverrideMs?: number): Promise<"retrying" | "dead">;
+    deadLetter(id: number, error: string): Promise<void>;
+    depth(): Promise<number>;
+    stats(): Promise<QueueStats>;
+    purgeDone(retainDoneForMs: number): Promise<number>;
     close(): void;
 }
 export interface MemoryQueueOptions {
@@ -129,14 +129,14 @@ export declare class MemoryQueue implements QueueAdapter {
     private nextId;
     private readonly defaultMaxAttempts;
     constructor(opts?: MemoryQueueOptions);
-    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
-    claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
-    ack(id: number, result?: string): void;
-    nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead";
-    deadLetter(id: number, error: string): void;
-    depth(): number;
-    stats(): QueueStats;
-    purgeDone(retainDoneForMs: number): number;
+    enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult>;
+    claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]>;
+    ack(id: number, result?: string): Promise<void>;
+    nack(id: number, error: string, backoffOverrideMs?: number): Promise<"retrying" | "dead">;
+    deadLetter(id: number, error: string): Promise<void>;
+    depth(): Promise<number>;
+    stats(): Promise<QueueStats>;
+    purgeDone(retainDoneForMs: number): Promise<number>;
     close(): void;
 }
 //# sourceMappingURL=queue.d.ts.map

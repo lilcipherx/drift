@@ -195,7 +195,7 @@ export class Worker {
     while (!this.stopped) {
       let job: QueueJob | undefined;
       try {
-        const batch = this.queue.claim(1, this.leaseMs, this.workerId);
+        const batch = await this.queue.claim(1, this.leaseMs, this.workerId);
         job = batch[0];
       } catch (err) {
         this.log.error({
@@ -220,12 +220,12 @@ export class Worker {
         this.metrics.observeAudit(durationMs);
         if (outcome.terminal) {
           if (outcome.ok) {
-            this.queue.ack(job.id, outcome.result?.action ?? "ok");
+            await this.queue.ack(job.id, outcome.result?.action ?? "ok");
             this.metrics.jobAcked();
           } else {
             // Permanent failure: acknowledge (never retried) and record the
             // reason on the job so operators can inspect dead/terminal jobs.
-            this.queue.ack(job.id, `permanent: ${outcome.errorCode ?? "permanent"}`);
+            await this.queue.ack(job.id, `permanent: ${outcome.errorCode ?? "permanent"}`);
             this.metrics.jobPermanent();
           }
         } else {
@@ -239,7 +239,7 @@ export class Worker {
             ),
             this.maxBackoffMs,
           );
-          const state = this.queue.nack(job.id, outcome.error ?? "transient failure", delay);
+          const state = await this.queue.nack(job.id, outcome.error ?? "transient failure", delay);
           if (state === "dead") {
             this.metrics.jobDeadLettered();
             this.log.error({
@@ -261,7 +261,7 @@ export class Worker {
         // fails the lease will expire and the job is re-claimed.
         this.metrics.jobNackFailed();
         try {
-          this.queue.nack(job.id, err instanceof Error ? err.message : String(err), 0);
+          await this.queue.nack(job.id, err instanceof Error ? err.message : String(err), 0);
         } catch {
           this.log.error({
             deliveryId: job.deliveryId,

@@ -206,12 +206,12 @@ test("App queue schema migrates forward (pre-signature DB keeps working)", async
   // New code opens the old DB: the migration adds the column, and the legacy
   // row round-trips with an empty signature (worker treats it as unsigned).
   const queue = new SqliteQueue({ path: dbPath, maxAttempts: 3 });
-  const claimed = queue.claim(10, 1000, "w1");
+  const claimed = await queue.claim(10, 1000, "w1");
   assert.equal(claimed.length, 1, "legacy job is claimable");
   assert.equal(claimed[0].signature, "", "legacy job has no stored signature");
-  const enq = queue.enqueue("new-delivery", "pull_request", "{}", {}, "sha256=abc");
+  const enq = await queue.enqueue("new-delivery", "pull_request", "{}", {}, "sha256=abc");
   assert.equal(enq.accepted, true);
-  const claimed2 = queue.claim(10, 1000, "w2");
+  const claimed2 = await queue.claim(10, 1000, "w2");
   const newJob = claimed2.find((j) => j.deliveryId === "new-delivery");
   assert.equal(newJob?.signature, "sha256=abc", "new jobs persist the signature");
   queue.close();

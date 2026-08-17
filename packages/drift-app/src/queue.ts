@@ -83,23 +83,23 @@ export interface QueueStats {
 
 export interface QueueAdapter {
   /** Idempotent enqueue keyed on the GitHub delivery id. */
-  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult;
+  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult>;
   /** Claim up to `batchSize` due jobs (pending past next_attempt_at, or
    *  in_progress jobs whose lease expired) for `leaseMs`. */
-  claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[];
+  claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]>;
   /** Acknowledge a job as processed successfully (keeps the delivery-id
    *  record so redeliveries are deduplicated). */
-  ack(id: number, result?: string): void;
+  ack(id: number, result?: string): Promise<void>;
   /** Mark a job for retry: attempts+1, exponential backoff with jitter; the
    *  job is dead-lettered when attempts reach maxAttempts. */
-  nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead";
+  nack(id: number, error: string, backoffOverrideMs?: number): Promise<"retrying" | "dead">;
   /** Explicitly dead-letter a job (non-retryable failure). */
-  deadLetter(id: number, error: string): void;
+  deadLetter(id: number, error: string): Promise<void>;
   /** Number of pending + in_progress jobs. */
-  depth(): number;
-  stats(): QueueStats;
+  depth(): Promise<number>;
+  stats(): Promise<QueueStats>;
   /** Purge `done` jobs older than `retainDoneForMs` (bounds storage growth). */
-  purgeDone(retainDoneForMs: number): number;
+  purgeDone(retainDoneForMs: number): Promise<number>;
   /** Release resources. */
   close(): void;
 }
@@ -213,7 +213,7 @@ export class SqliteQueue implements QueueAdapter {
     this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
   }
 
-  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult {
+  async enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult> {
     if (!deliveryId || deliveryId.length > 200) {
       throw new Error("delivery id is required and must be <= 200 chars");
     }
@@ -249,7 +249,7 @@ export class SqliteQueue implements QueueAdapter {
     };
   }
 
-  claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[] {
+  async claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]> {
     const n = clampPositiveInt(batchSize, 1);
     const lease = clampNonNegInt(leaseMs, 30_000);
     const now = Date.now();
@@ -288,7 +288,7 @@ export class SqliteQueue implements QueueAdapter {
     return jobs.map(rowToJob);
   }
 
-  ack(id: number, result?: string): void {
+  async ack(id: number, result?: string): Promise<void> {
     const now = Date.now();
     this.db
       .prepare(
@@ -300,7 +300,7 @@ export class SqliteQueue implements QueueAdapter {
       .run(result ? boundedError(result) : null, now, id);
   }
 
-  nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead" {
+  async nack(id: number, error: string, backoffOverrideMs?: number): Promise<"retrying" | "dead"> {
     const now = Date.now();
     const row = this.db.prepare("SELECT attempts, max_attempts FROM webhook_jobs WHERE id = ?").get(id) as
       | { attempts: number; max_attempts: number }
@@ -334,7 +334,7 @@ export class SqliteQueue implements QueueAdapter {
     return "retrying";
   }
 
-  deadLetter(id: number, error: string): void {
+  async deadLetter(id: number, error: string): Promise<void> {
     const now = Date.now();
     this.db
       .prepare(
@@ -345,14 +345,14 @@ export class SqliteQueue implements QueueAdapter {
       .run(boundedError(error), now, id);
   }
 
-  depth(): number {
+  async depth(): Promise<number> {
     const row = this.db
       .prepare("SELECT COUNT(*) AS n FROM webhook_jobs WHERE status IN ('pending','in_progress')")
       .get() as unknown as { n: number };
     return Number(row?.n ?? 0);
   }
 
-  stats(): QueueStats {
+  async stats(): Promise<QueueStats> {
     const rows = this.db
       .prepare("SELECT status, COUNT(*) AS n FROM webhook_jobs GROUP BY status")
       .all() as unknown as { status: string; n: number }[];
@@ -368,7 +368,7 @@ export class SqliteQueue implements QueueAdapter {
     };
   }
 
-  purgeDone(retainDoneForMs: number): number {
+  async purgeDone(retainDoneForMs: number): Promise<number> {
     const cutoff = Date.now() - clampNonNegInt(retainDoneForMs, 7 * 24 * 3600 * 1000);
     const info = this.db
       .prepare("DELETE FROM webhook_jobs WHERE status = 'done' AND updated_at < ?")
@@ -403,7 +403,7 @@ export class MemoryQueue implements QueueAdapter {
     this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
   }
 
-  enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): EnqueueResult {
+  async enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult> {
     if (!deliveryId || deliveryId.length > 200) {
       throw new Error("delivery id is required and must be <= 200 chars");
     }
@@ -441,7 +441,7 @@ export class MemoryQueue implements QueueAdapter {
     return { accepted: true, duplicate: false, alreadyProcessed: false };
   }
 
-  claim(batchSize: number, leaseMs: number, workerId: string): QueueJob[] {
+  async claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]> {
     const n = clampPositiveInt(batchSize, 1);
     const lease = clampNonNegInt(leaseMs, 30_000);
     const now = Date.now();
@@ -462,7 +462,7 @@ export class MemoryQueue implements QueueAdapter {
     return due.map((j) => ({ ...j, payload: j.payload }));
   }
 
-  ack(id: number, result?: string): void {
+  async ack(id: number, result?: string): Promise<void> {
     const job = this.jobs.get(id);
     if (!job || job.status !== "in_progress") return;
     job.status = "done";
@@ -473,7 +473,7 @@ export class MemoryQueue implements QueueAdapter {
     job.updatedAt = Date.now();
   }
 
-  nack(id: number, error: string, backoffOverrideMs?: number): "retrying" | "dead" {
+  async nack(id: number, error: string, backoffOverrideMs?: number): Promise<"retrying" | "dead"> {
     const job = this.jobs.get(id);
     if (!job) return "dead";
     const attempts = job.attempts + 1;
@@ -497,7 +497,7 @@ export class MemoryQueue implements QueueAdapter {
     return "retrying";
   }
 
-  deadLetter(id: number, error: string): void {
+  async deadLetter(id: number, error: string): Promise<void> {
     const job = this.jobs.get(id);
     if (!job) return;
     job.status = "dead";
@@ -505,7 +505,7 @@ export class MemoryQueue implements QueueAdapter {
     job.updatedAt = Date.now();
   }
 
-  depth(): number {
+  async depth(): Promise<number> {
     let n = 0;
     for (const j of this.jobs.values()) {
       if (j.status === "pending" || j.status === "in_progress") n++;
@@ -513,7 +513,7 @@ export class MemoryQueue implements QueueAdapter {
     return n;
   }
 
-  stats(): QueueStats {
+  async stats(): Promise<QueueStats> {
     const counts = { pending: 0, in_progress: 0, done: 0, dead: 0 };
     for (const j of this.jobs.values()) {
       if (j.status in counts) counts[j.status as keyof typeof counts]++;
@@ -528,7 +528,7 @@ export class MemoryQueue implements QueueAdapter {
     };
   }
 
-  purgeDone(retainDoneForMs: number): number {
+  async purgeDone(retainDoneForMs: number): Promise<number> {
     const cutoff = Date.now() - clampNonNegInt(retainDoneForMs, 7 * 24 * 3600 * 1000);
     let purged = 0;
     for (const [id, job] of [...this.jobs.entries()]) {
