@@ -1,0 +1,58 @@
+name: Soak
+
+# Scheduled longer-running soak (PRD §8): exercises the App worker pipeline
+# and large-repo benchmark on the trusted persistent ARM64 runner only.
+# Scheduled and manual-dispatch runs are trusted (no PR code ever executes
+# on the persistent runner — see the trust policy in ci.yml).
+
+on:
+  schedule:
+    # Weekly: Sunday 04:17 UTC (staggered off common cron hours).
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: soak (worker pipeline + large repo)
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Full test suite (gate for the soak itself)
+        run: npm test
+
+      - name: Worker soak — 10k jobs, 2% transient failures, duplicates, 0 data loss
+        run: |
+          node scripts/soak-app.mjs --jobs 10000 --json
+
+      - name: App webhook intake load benchmark
+        run: |
+          node scripts/bench-app-intake.mjs --deliveries 5000 --json
+
+      - name: Large-repo CLI benchmark (40k commits / manifests)
+        run: |
+          node scripts/bench-large-repo.mjs --commits 40000 --json
+
+      - name: Report
+        run: |
+          echo "Soak complete — see the benchmark steps above for latency distributions."

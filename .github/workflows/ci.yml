@@ -249,3 +249,55 @@ jobs:
           test -x node_modules/.bin/drift
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
+
+  # Performance evidence (PRD §6/§7): large-repo CLI benchmark + App intake
+  # load + worker soak. Runs ONLY on trusted protected-branch pushes to the
+  # self-hosted ARM64 runner (never on PRs/forks). Generates fresh artifacts
+  # that docs/PERFORMANCE_REPORT.md and docs/SLOS.md reference; the job fails
+  # if a benchmark regresses past the documented SLOs.
+  benchmark:
+    name: benchmark (large-repo + app intake + soak)
+    runs-on: [self-hosted, Linux, ARM64]
+    if: github.event_name == 'push'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Large-repo CLI benchmark (20k commits / manifests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/bench-large-repo.mjs --commits 20000 --json > /tmp/bench-large-20k.json
+          node -e '
+            const j = require("/tmp/bench-large-20k.json");
+            const m = Object.fromEntries(j.engineMeasurements.map((x) => [x.label, x.wallMsMs]));
+            console.log(JSON.stringify(m, null, 1));
+            // SLO regression gate (docs/SLOS.md): warm log --limit 20 must stay
+            // well under the 5 s SLO on this hardware.
+            const warm = m["log --limit 20 (warm)"] ?? Infinity;
+            if (warm > 5000) { console.error("SLO regression: warm log --limit 20 = " + warm + " ms"); process.exit(1); }
+            const verify = m["verify-intent"] ?? Infinity;
+            if (verify > 200) { console.error("SLO regression: verify-intent = " + verify + " ms"); process.exit(1); }
+          '
+
+      - name: App webhook intake load benchmark
+        shell: bash
+        run: |
+          node scripts/bench-app-intake.mjs --deliveries 2000 --json
+
+      - name: Worker soak (2% transient failures, duplicates, 0 data loss)
+        shell: bash
+        run: |
+          node scripts/soak-app.mjs --jobs 3000 --json
