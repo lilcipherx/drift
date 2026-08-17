@@ -453,9 +453,22 @@ test("crash mid-refresh: next run recovers and serves the full tree", async () =
   });
   if (!started) throw new Error("child did not reach the refresh window");
 
-  // Next run must recover (WAL rollback of the torn transaction).
-  const drift = Drift.fromCwd(repo);
-  const after = drift.log({ limit: 100 });
+  // Next run must recover (WAL rollback of the torn transaction). A hard
+  // kill on Windows can briefly leave the DB handle locked — retry the open a
+  // few times (transient), but REQUIRE a full, clean recovery: 100 entries,
+  // no malformed files, the complete index rebuilt.
+  let drift;
+  let after;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      drift = Drift.fromCwd(repo);
+      after = drift.log({ limit: 100 });
+      break;
+    } catch (err) {
+      if (attempt === 3) throw err;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
   assert.equal(after.length, 100, "bounded log works after a killed refresh");
   const status = Drift.status(repo);
   assert.equal((status.malformedManifests ?? []).length, 0);
