@@ -24,7 +24,7 @@ const { summarizeIntents, SUMMARY_MARKER } = await mod("summarize.js");
 const { verifyWebhookSignature, handleWebhook } = await mod("handler.js");
 const { createAppJwt, decodeJwt } = await mod("jwt.js");
 const { createWebhookServer, assertWebhookAuthConfigured } = await mod("server.js");
-const { deriveProvenanceConclusion, evaluateKeyChange, isDriftOwnedComment } = await mod("trust.js");
+const { deriveProvenanceConclusion, evaluateKeyChange, evaluateKeyringChangeState, isDriftOwnedComment } = await mod("trust.js");
 const { signatureStateFor, auditProvenanceIntegrity, parseLoadedManifest } = await mod("intents.js");
 const { generateKeyPair, newIntentId, PublicStore, signingKeyIdFor } = await import("@drift/core");
 
@@ -580,6 +580,31 @@ test("evaluateKeyChange: strict states — bootstrap, removal, replacement AND m
   assert.equal(evaluateKeyChange(A, garbage), "malformed-replacement");
   assert.equal(evaluateKeyChange(garbage, A), "base-malformed");
   assert.equal(evaluateKeyChange(garbage, garbage), "base-malformed");
+});
+
+test("deriveProvenanceConclusion: keyring history continuity (append-only trust set)", () => {
+  const pair = generateKeyPairSync("ed25519");
+  const pem = pair.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const kr = JSON.stringify({ schemaVersion: 1, keys: [], audit: [{ seq: 1, action: "bootstrap", fingerprint: "x", by: "x", at: 1, reason: null, payload: "p", signature: "s" }] });
+
+  // A legitimate append-only extension never blocks.
+  let r = deriveProvenanceConclusion({ intents: [state("valid")], keyChange: "unchanged", keyringChange: "extended" });
+  assert.equal(r.conclusion, "success", "a signed keyring extension must not block valid provenance");
+  r = deriveProvenanceConclusion({ intents: [], keyChange: "unchanged", keyringChange: "extended" });
+  assert.equal(r.conclusion, "neutral");
+
+  // History attacks always fail the check, even with zero intents.
+  for (const bad of ["replaced", "removed", "malformed-bootstrap", "malformed-replacement", "base-malformed"]) {
+    const r1 = deriveProvenanceConclusion({ intents: [state("valid")], keyChange: "unchanged", keyringChange: bad });
+    assert.equal(r1.conclusion, "failure", `keyringChange=${bad} must fail even with valid intents`);
+    assert.ok(r1.summary.includes("keyring"), `summary must mention the keyring for ${bad}`);
+    const r2 = deriveProvenanceConclusion({ intents: [], keyChange: "unchanged", keyringChange: bad });
+    assert.equal(r2.conclusion, "failure", `key-only keyringChange=${bad} must fail`);
+  }
+  // The reason text explains the append-only rule.
+  const f = deriveProvenanceConclusion({ intents: [], keyChange: "unchanged", keyringChange: "replaced" });
+  assert.ok(f.summary.includes("append"), "replaced history reason must state the append-only rule");
+  void kr;
 });
 
 // ----------------------------------------------- B: key-only PR visibility

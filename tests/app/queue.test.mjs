@@ -8,8 +8,9 @@
 
 import { describe, test, after } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
@@ -255,5 +256,74 @@ describe("postgres queue: multi-instance claim safety", { skip: !process.env.DRI
     assert.equal((await q2.stats()).done, 1);
     q1.close();
     q2.close();
+  });
+
+  test("SQLite → Postgres migration copies every job state with matching counts", async () => {
+    const { SqliteQueue, MemoryQueue: _mem } = await mod("queue.js");
+    const { PostgresQueue } = await mod("queue-pg.js");
+    const url = process.env.DRIFT_TEST_PG_URL;
+    await freshPg();
+
+    // Build a source SQLite queue with jobs in every lifecycle state.
+    const dir = mkdtempSync(join(tmpdir(), "drift-queue-migrate-"));
+    const src = new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 3 });
+    await src.enqueue("mig-pending", "pull_request", "{}", { n: 1 });
+    await src.enqueue("mig-done", "pull_request", "{}", { n: 2 });
+    const doneJob = (await src.claim(10, 30_000, "w1")).find((j) => j.deliveryId === "mig-done");
+    await src.ack(doneJob.id, "ok");
+    await src.enqueue("mig-dead", "pull_request", "{}", { n: 3 });
+    const deadJob = (await src.claim(10, 30_000, "w1")).find((j) => j.deliveryId === "mig-dead");
+    await src.deadLetter(deadJob.id, "permanent");
+    // An in_progress job with an EXPIRED lease (crashed worker) must migrate
+    // as in_progress and become re-claimable on the target.
+    await src.enqueue("mig-inflight", "pull_request", "{}", { n: 4 });
+    await src.claim(10, 1, "w1"); // 1 ms lease
+    const srcStats = await src.stats();
+    assert.deepEqual(
+      { pending: srcStats.pending, inProgress: srcStats.inProgress, done: srcStats.done, dead: srcStats.dead },
+      { pending: 1, inProgress: 1, done: 1, dead: 1 },
+    );
+    src.close();
+
+    // Run the actual migration script (idempotent, ON CONFLICT DO NOTHING).
+    const script = resolve(process.cwd(), "scripts", "migrate-queue-sqlite-to-pg.mjs");
+    const res = spawnSync(process.execPath, [script, "--sqlite", join(dir, "queue.db"), "--pg", url], {
+      encoding: "utf8",
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    assert.equal(res.status, 0, `migration failed: ${res.stderr}`);
+    // Idempotent: re-running must not duplicate rows.
+    const res2 = spawnSync(process.execPath, [script, "--sqlite", join(dir, "queue.db"), "--pg", url], {
+      encoding: "utf8",
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    assert.equal(res2.status, 0, `re-run failed: ${res2.stderr}`);
+
+    // The target honors the migrated state exactly.
+    const tgt = new PostgresQueue({ url, maxAttempts: 3 });
+    const tgtStats = await tgt.stats();
+    assert.deepEqual(
+      { pending: tgtStats.pending, inProgress: tgtStats.inProgress, done: tgtStats.done, dead: tgtStats.dead },
+      { pending: 1, inProgress: 1, done: 1, dead: 1 },
+      "migrated counts must match the source exactly",
+    );
+    // The expired-lease job is re-claimable on Postgres (crash recovery).
+    const reclaimed = await tgt.claim(10, 30_000, "new-instance");
+    assert.equal(reclaimed.length, 1);
+    assert.equal(reclaimed[0].deliveryId, "mig-inflight");
+    await tgt.ack(reclaimed[0].id, "recovered");
+    // The done/dead rows are untouched; dedupe still works after migration.
+    const dup = await tgt.enqueue("mig-done", "pull_request", "{}", { n: 2 });
+    assert.equal(dup.duplicate, true);
+    assert.equal(dup.alreadyProcessed, true);
+    tgt.close();
+    for (let i = 0; i < 5; i++) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
   });
 });

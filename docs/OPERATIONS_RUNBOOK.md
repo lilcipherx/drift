@@ -102,17 +102,29 @@ lost work uses the durable queue + delivery-id dedupe; see DISASTER_RECOVERY.
 
 ## 5. Migrating to the shared Postgres queue (production horizontal scale)
 
-1. Provision Postgres (managed or self-hosted) and set
-   `DRIFT_APP_QUEUE=postgres` + `DRIFT_QUEUE_URL` on every replica/worker.
-   The schema is created automatically (idempotent `CREATE TABLE IF NOT
-   EXISTS` + indexes) on first use.
-2. Contract tests: the entire `tests/app/queue.test.mjs` suite runs against
+1. Provision Postgres (managed or self-hosted), then copy the existing
+   SQLite queue with the migration script (STOP the workers first so the
+   snapshot is consistent; the script is idempotent — safe to re-run):
+
+   ```bash
+   node scripts/migrate-queue-sqlite-to-pg.mjs \
+     --sqlite ./.drift-app-data/queue.db --pg postgres://user:pass@host/db
+   ```
+
+   The script verifies per-status counts match between source and target
+   and exits non-zero otherwise. Covered by the Postgres suite test
+   "SQLite → Postgres migration copies every job state with matching
+   counts" (every lifecycle state incl. expired-lease jobs).
+2. Set `DRIFT_APP_QUEUE=postgres` + `DRIFT_QUEUE_URL` on every
+   replica/worker. The schema is created automatically (idempotent
+   `CREATE TABLE IF NOT EXISTS` + indexes) on first use.
+3. Contract tests: the entire `tests/app/queue.test.mjs` suite runs against
    every adapter, so `PostgresQueue` passes the same suite as SQLite
-   (including the multi-instance claim-safety tests).
-3. Verify: `node scripts/bench-app-e2e.mjs --scenario all --pg <url>`
+   (including the multi-instance claim-safety tests and the migration test).
+4. Verify: `node scripts/bench-app-e2e.mjs --scenario all --pg <url>`
    (includes the two-server/two-pool multi-instance scenario) and
    `node scripts/soak-app.mjs --jobs 5000 --pg <url>`.
-4. Rollback: the webhook server is adapter-agnostic; switching back to the
+5. Rollback: the webhook server is adapter-agnostic; switching back to the
    SQLite adapter requires draining the shared queue first (or accepting
    redelivery, which the dedupe handles).
 

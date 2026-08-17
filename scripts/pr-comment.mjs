@@ -529,6 +529,87 @@ export function evaluateTrustRootChange(baseKey, headKey) {
 }
 
 /**
+ * Compact keyring change evaluator (mirror of @drift/core
+ * `evaluateKeyringChange`, structural checks only — the full cryptographic
+ * audit-log replay is @drift/core's job on every local read). The keyring is
+ * APPEND-ONLY: the only legitimate change is a strict extension of the audit
+ * log. Deleting, editing, or replacing the history is a trust-set attack:
+ * replaced / removed / malformed-* / base-malformed.
+ */
+export function evaluateKeyringChange(baseRaw, headRaw, baseAnchor, headAnchor) {
+  const baseText = String(baseRaw ?? "");
+  const headText = String(headRaw ?? "");
+  const baseAnchorText = String(baseAnchor ?? "");
+  const headAnchorText = String(headAnchor ?? "");
+  const basePresent = baseText.trim().length > 0;
+  const headPresent = headText.trim().length > 0;
+  if (!basePresent && !headPresent) return "none";
+  if (!basePresent && headPresent) {
+    return parseCompactKeyring(headText, headAnchorText) ? "bootstrap" : "malformed-bootstrap";
+  }
+  if (!parseCompactKeyring(baseText, baseAnchorText)) return "base-malformed";
+  if (!headPresent) return "removed";
+  if (!parseCompactKeyring(headText, headAnchorText)) return "malformed-replacement";
+  const baseAudit = auditEntriesOf(baseText);
+  const headAudit = auditEntriesOf(headText);
+  if (JSON.stringify(baseAudit) === JSON.stringify(headAudit)) return "unchanged";
+  if (headAudit.length > baseAudit.length && isAuditPrefix(baseAudit, headAudit)) return "extended";
+  return "replaced";
+}
+
+/** Structural keyring check: JSON, keys parse, contiguous audit, bootstrap
+ * matches the anchor fingerprint (cryptographic signature verification of
+ * every entry is performed by @drift/core on reads). */
+function parseCompactKeyring(text, anchorPem) {
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (!json || json.schemaVersion !== 1 || !Array.isArray(json.keys) || !Array.isArray(json.audit)) return false;
+  const anchor = parseTrustRootPem(anchorPem);
+  if (anchor.state !== "valid") return false;
+  for (const k of json.keys) {
+    if (!k || typeof k.pem !== "string" || typeof k.fingerprint !== "string") return false;
+    const p = parseTrustRootPem(k.pem);
+    if (p.state !== "valid" || p.fingerprint !== k.fingerprint) return false;
+  }
+  const audit = json.audit;
+  for (let i = 0; i < audit.length; i++) {
+    const a = audit[i];
+    if (!a || typeof a !== "object") return false;
+    if (a.seq !== i + 1) return false;
+    if (typeof a.action !== "string" || typeof a.signature !== "string") return false;
+  }
+  const first = audit[0];
+  if (!first || first.action !== "bootstrap") return false;
+  const firstKey = json.keys.find((k) => k.fingerprint === first.fingerprint);
+  if (!firstKey || firstKey.fingerprint !== anchor.fingerprint) return false;
+  return true;
+}
+
+function auditEntriesOf(text) {
+  return JSON.parse(text).audit.map((a) => ({
+    seq: a.seq,
+    action: a.action,
+    fingerprint: a.fingerprint,
+    by: a.by,
+    at: a.at,
+    reason: a.reason ?? null,
+    payload: a.payload,
+    signature: a.signature,
+  }));
+}
+
+function isAuditPrefix(prefix, full) {
+  for (let i = 0; i < prefix.length; i++) {
+    if (JSON.stringify(prefix[i]) !== JSON.stringify(full[i])) return false;
+  }
+  return true;
+}
+
+/**
  * Walk PR commits, collect their intent ids (in order, deduped), hydrate from
  * `.drift/public/intents/`. When a public manifest is missing the summary is
  * a generic NON-PROMPT fallback (`Drift intent <id>`) — the commit subject is
@@ -812,6 +893,17 @@ const FAILING_KEY_CHANGES = new Set([
   "base-malformed",
 ]);
 
+/** Keyring (multi-signer trust-set) states that are provenance ERRORS: the
+ * trust-set history is append-only, so a rewrite, removal, or malformed
+ * keyring fails the workflow exactly like a trust-root change. */
+const FAILING_KEYRING_CHANGES = new Set([
+  "replaced",
+  "removed",
+  "malformed-bootstrap",
+  "malformed-replacement",
+  "base-malformed",
+]);
+
 /**
  * Whether the PR carries a provenance error that should fail the workflow
  * when `fail-on-provenance-error` is true (the default): invalid signatures,
@@ -820,8 +912,9 @@ const FAILING_KEY_CHANGES = new Set([
  * integrity violation. Neutral states (valid bootstrap, unsigned,
  * unverifiable, legacy-missing manifests, no intents) are NOT errors.
  */
-export function hasProvenanceError({ intents, keyChange, audit }) {
+export function hasProvenanceError({ intents, keyChange, keyringChange, audit }) {
   if (FAILING_KEY_CHANGES.has(keyChange)) return true;
+  if (FAILING_KEYRING_CHANGES.has(keyringChange)) return true;
   if (Array.isArray(intents) && intents.some((i) => FAILING_SIGNATURE_STATES.has(i.signatureState))) return true;
   if (
     audit &&
@@ -840,30 +933,46 @@ export function hasProvenanceError({ intents, keyChange, audit }) {
  * bootstrap stays visible (and neutral) while replacement/removal render the
  * blocking warning.
  */
-export function buildSummary(intents, { keyChange, audit } = {}) {
+export function buildSummary(intents, { keyChange, keyringChange, audit } = {}) {
   const hasIntents = Array.isArray(intents) && intents.length > 0;
   const integrityIssues =
     audit &&
     (audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0);
   const keyState = keyChange ?? "none";
+  const keyringState = keyringChange ?? "none";
   // Failure states: replacement, removal, and ANY malformed key state (an
   // initial malformed key, a malformed replacement, or a malformed base
   // root). Only a cryptographically parseable initial key is a neutral
   // bootstrap.
-  const blockingKey = FAILING_KEY_CHANGES.has(keyState);
+  const blockingKey = FAILING_KEY_CHANGES.has(keyState) || FAILING_KEYRING_CHANGES.has(keyringState);
   const bootstrapping = keyState === "bootstrap";
   if (!hasIntents && !blockingKey && !bootstrapping && !integrityIssues) return null;
   const lines = [SUMMARY_MARKER];
   if (blockingKey) {
-    lines.push(
-      keyState === "base-malformed"
-        ? "## ⚠ Drift trust root is malformed on the base branch\n\n`.drift/public/key.pem` on the base branch is not a valid Drift public key — no trust root can be established, so this PR's provenance is unverifiable and blocked."
-        : keyState === "malformed-bootstrap"
-          ? "## ⚠ Drift initial trust root is malformed\n\nThis pull request introduces `.drift/public/key.pem`, but the file is not a valid Drift public key. A malformed initial key is NOT a bootstrap — provenance on this PR is blocked until a valid key is introduced."
-          : keyState === "malformed-replacement"
-            ? "## ⚠ Drift trust-root replacement is malformed\n\nThis pull request replaces `.drift/public/key.pem` with content that is not a valid Drift public key. The malformed replacement cannot be trusted — blocked until a valid key is introduced through the rotation process."
-            : TRUST_ROOT_WARNING,
-    );
+    const keyringBlocking = FAILING_KEYRING_CHANGES.has(keyringState);
+    if (keyringBlocking) {
+      lines.push(
+        keyringState === "base-malformed"
+          ? "## ⚠ Drift trust-set (keyring) is malformed on the base branch\n\n`.drift/public/keyring.json` on the base branch is malformed — no trust set can be established, so this PR's provenance is unverifiable and blocked."
+          : keyringState === "malformed-bootstrap"
+            ? "## ⚠ Drift initial keyring is malformed\n\nThis pull request introduces `.drift/public/keyring.json`, but the file is not a valid keyring. A malformed initial keyring is NOT a bootstrap — provenance on this PR is blocked."
+            : keyringState === "malformed-replacement"
+              ? "## ⚠ Drift keyring replacement is malformed\n\nThis pull request replaces `.drift/public/keyring.json` with content that is not a valid keyring. The malformed replacement cannot be trusted — blocked."
+              : keyringState === "removed"
+                ? "## ⚠ Drift keyring history removed\n\nThis pull request REMOVES `.drift/public/keyring.json`. The multi-signer trust-set history is append-only and can never be deleted — blocked."
+                : "## ⚠ Drift keyring history rewritten\n\nThis pull request REWRITES `.drift/public/keyring.json`. The multi-signer trust-set history is append-only: it can only be extended by a signed add/revoke/remove — blocked.",
+      );
+    } else if (FAILING_KEY_CHANGES.has(keyState)) {
+      lines.push(
+        keyState === "base-malformed"
+          ? "## ⚠ Drift trust root is malformed on the base branch\n\n`.drift/public/key.pem` on the base branch is not a valid Drift public key — no trust root can be established, so this PR's provenance is unverifiable and blocked."
+          : keyState === "malformed-bootstrap"
+            ? "## ⚠ Drift initial trust root is malformed\n\nThis pull request introduces `.drift/public/key.pem`, but the file is not a valid Drift public key. A malformed initial key is NOT a bootstrap — provenance on this PR is blocked until a valid key is introduced."
+            : keyState === "malformed-replacement"
+              ? "## ⚠ Drift trust-root replacement is malformed\n\nThis pull request replaces `.drift/public/key.pem` with content that is not a valid Drift public key. The malformed replacement cannot be trusted — blocked until a valid key is introduced through the rotation process."
+              : TRUST_ROOT_WARNING,
+      );
+    }
     if (!hasIntents && !integrityIssues) return lines.join("\n");
     lines.push("", "---", "");
   }
@@ -1118,6 +1227,11 @@ async function main() {
   // malformed material. Malformed bootstrap/replacement keys and a malformed
   // base root are explicit failure states.
   const keyChange = evaluateTrustRootChange(baseKey, headKey);
+  // Multi-signer keyring continuity: the trust-set history is append-only, so
+  // a PR may only EXTEND it. Deleted/edited/replaced history fails the audit.
+  const baseKeyring = getFileAt(repoRoot, event.baseSha, ".drift/public/keyring.json");
+  const headKeyring = getFileAt(repoRoot, event.headSha, ".drift/public/keyring.json");
+  const keyringChange = evaluateKeyringChange(baseKeyring, headKeyring, baseKey, headKey);
 
   // 4. intents from PR commits only; manifests read at the immutable HEAD
   // commit (`readManifestAt`), so uncommitted working-tree mutations are
@@ -1142,11 +1256,11 @@ async function main() {
   // 5. The provenance error is computed EARLY and applied at the very end,
   // after the safe step summary and any comment work — never skipped by a
   // missing token.
-  const provenanceError = hasProvenanceError({ intents, keyChange, audit });
+  const provenanceError = hasProvenanceError({ intents, keyChange, keyringChange, audit });
 
   // 6. The body always carries the trust-root state; for a key-only PR the
   // warning/bootstrap section IS the body.
-  const body = buildSummary(intents, { keyChange, audit });
+  const body = buildSummary(intents, { keyChange, keyringChange, audit });
   if (!body) {
     console.log("pr-comment: no Drift intents, no trust-root change and no provenance violations on this PR — nothing to summarize");
     appendStepSummary("_Drift: no Drift intents on this PR — nothing to summarize._");

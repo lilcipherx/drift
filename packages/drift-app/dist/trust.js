@@ -10,7 +10,7 @@
  *    to a Check Run conclusion. The App never reports unconditional success:
  *    invalid/untrusted/malformed/key-change provenance fails the check.
  */
-import { evaluateTrustRootChange } from "@drift/core";
+import { evaluateKeyringChange, evaluateTrustRootChange } from "@drift/core";
 /** Comment marker version 2 — the App owns the app-specific marker and must
  * never edit the Action's comment (and vice versa). Legacy markers are
  * recognized for in-place migration ONLY when ownership is independently
@@ -21,6 +21,9 @@ export const LEGACY_SUMMARY_MARKERS = ["<!-- drift:pr-summary:v2 -->", "<!-- dri
 export const TRUST_ROOT_WARNING = "## ⚠ Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
 export function evaluateKeyChange(baseKey, headKey) {
     return evaluateTrustRootChange(baseKey, headKey);
+}
+export function evaluateKeyringChangeState(baseKeyring, headKeyring, baseKey, headKey) {
+    return evaluateKeyringChange(baseKeyring, headKeyring, baseKey, headKey);
 }
 /**
  * A comment belongs to the APP ONLY when GitHub itself attests that THIS App
@@ -87,6 +90,7 @@ export const NO_AUDIT = { violations: [], replayIds: [], ambiguousIds: [] };
  */
 export function deriveProvenanceConclusion(input) {
     const { intents, keyChange } = input;
+    const keyringChange = input.keyringChange ?? "none";
     const audit = input.audit ?? NO_AUDIT;
     const failing = intents.filter((i) => FAILING_STATES.has(i.signatureState));
     const validCount = intents.filter((i) => i.signatureState === "valid").length;
@@ -100,7 +104,17 @@ export function deriveProvenanceConclusion(input) {
         "malformed-replacement",
         "base-malformed",
     ]);
-    const blockingKeyChange = FAILING_KEY_STATES.has(keyChange);
+    // The keyring (multi-signer trust set) has the same failing states: a
+    // history rewrite or removal is a trust-set attack. `extended` (append-only
+    // add/revoke/remove) is legitimate and does NOT block.
+    const FAILING_KEYRING_STATES = new Set([
+        "replaced",
+        "removed",
+        "malformed-bootstrap",
+        "malformed-replacement",
+        "base-malformed",
+    ]);
+    const blockingKeyChange = FAILING_KEY_STATES.has(keyChange) || FAILING_KEYRING_STATES.has(keyringChange);
     const integrityBroken = audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0;
     const count = (state) => intents.filter((i) => i.signatureState === state).length;
     const parts = [
@@ -113,21 +127,36 @@ export function deriveProvenanceConclusion(input) {
         `Bootstrap: ${count("bootstrap")}`,
         `Missing manifests: ${count("missing")}`,
         `Trust-root change: ${keyChange}`,
+        `Trust-set (keyring) change: ${keyringChange}`,
         `Provenance violations: ${audit.violations.length + audit.replayIds.length + audit.ambiguousIds.length}`,
     ];
     const summary = parts.join(" · ");
     if (failing.length > 0 || blockingKeyChange || integrityBroken) {
         const reasons = [];
         if (blockingKeyChange) {
-            reasons.push(keyChange === "replaced"
-                ? "the pull request replaces .drift/public/key.pem (trust-root change)"
-                : keyChange === "removed"
-                    ? "the pull request removes .drift/public/key.pem (trust-root change)"
-                    : keyChange === "base-malformed"
-                        ? "the base branch trust root (.drift/public/key.pem) is not a valid Drift public key — no trust root can be established"
-                        : keyChange === "malformed-bootstrap"
-                            ? "the pull request introduces a MALFORMED .drift/public/key.pem — a malformed initial key is not a bootstrap"
-                            : "the pull request replaces .drift/public/key.pem with MALFORMED content that is not a valid Drift public key");
+            const keyringBlocking = FAILING_KEYRING_STATES.has(keyringChange);
+            if (keyringBlocking) {
+                reasons.push(keyringChange === "replaced"
+                    ? "the pull request REWRITES .drift/public/keyring.json (trust-set history can only be appended, never replaced)"
+                    : keyringChange === "removed"
+                        ? "the pull request REMOVES .drift/public/keyring.json (trust-set history can never be deleted)"
+                        : keyringChange === "base-malformed"
+                            ? "the base branch keyring (.drift/public/keyring.json) is malformed — no trust set can be established"
+                            : keyringChange === "malformed-bootstrap"
+                                ? "the pull request introduces a MALFORMED .drift/public/keyring.json — a malformed initial keyring is not a bootstrap"
+                                : "the pull request replaces .drift/public/keyring.json with MALFORMED content");
+            }
+            if (FAILING_KEY_STATES.has(keyChange)) {
+                reasons.push(keyChange === "replaced"
+                    ? "the pull request replaces .drift/public/key.pem (trust-root change)"
+                    : keyChange === "removed"
+                        ? "the pull request removes .drift/public/key.pem (trust-root change)"
+                        : keyChange === "base-malformed"
+                            ? "the base branch trust root (.drift/public/key.pem) is not a valid Drift public key — no trust root can be established"
+                            : keyChange === "malformed-bootstrap"
+                                ? "the pull request introduces a MALFORMED .drift/public/key.pem — a malformed initial key is not a bootstrap"
+                                : "the pull request replaces .drift/public/key.pem with MALFORMED content that is not a valid Drift public key");
+            }
         }
         for (const i of failing) {
             reasons.push(`${i.signatureState === "malformed" ? "malformed manifest" : `${i.signatureState} signature`} for ${i.id ?? "an intent"}`);

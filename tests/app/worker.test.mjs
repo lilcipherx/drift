@@ -295,3 +295,116 @@ test("worker never processes the same delivery id twice", async () => {
   await worker.stop();
   queue.close();
 });
+
+test("tenant isolation: concurrent jobs from different installations never cross installation-scoped clients", async () => {
+  const { queue, Worker } = await setup();
+  const { processDelivery } = await mod("worker.js");
+  const { createHmac } = await import("node:crypto");
+  const seenPairs = [];
+  let mismatches = 0;
+  let checkRuns = 0;
+  // Each installation owns exactly one repo; the mock records the
+  // (installation, repo) pair used for every GitHub call and fails the test
+  // if the client for one installation ever serves another's repo (a
+  // cross-tenant token/state swap).
+  const sha = () => `t${Math.floor(Math.random() * 1e9).toString(16).padStart(39, "0")}`;
+  const didOf = (i) => `did_${i.toString(16).padStart(32, "0")}`;
+  // One PR per delivery: prNumber → { installation, headSha, intentId }.
+  const prs = new Map();
+  const github = {
+    currentInstallation: null,
+    setInstallation(id) {
+      this.currentInstallation = id;
+    },
+    getAppId: () => "12345",
+    async getPullRequest(_o, _r, prNumber) {
+      const p = prs.get(prNumber);
+      seenPairs.push(`${this.currentInstallation}:${prNumber}`);
+      if (this.currentInstallation !== p.inst) mismatches++;
+      return { headSha: p.headSha, baseSha: "0".repeat(40), commits: 1, changedFiles: 1, title: "t" };
+    },
+    async getPullCommits(_o, _r, prNumber) {
+      const p = prs.get(prNumber);
+      return { commits: [{ sha: p.headSha, message: `feat: x\n\nDrift-Intent: ${p.did}` }], expectedCount: 1, complete: true };
+    },
+    async getCompareCommits(_o, _r, _b, headSha) {
+      return [headSha];
+    },
+    async getPullFiles(_o, _r, prNumber) {
+      const p = prs.get(prNumber);
+      return { files: [{ filename: `.drift/public/intents/${p.did}.json`, status: "added" }], truncated: false };
+    },
+    async getFileContent(_o, _r, path) {
+      if (path === ".drift/public/key.pem" || path === ".drift/public/keyring.json") return null;
+      for (const p of prs.values()) {
+        if (path.endsWith(`${p.did}.json`)) {
+          return JSON.stringify({
+            schemaVersion: 2,
+            id: p.did,
+            summary: `intent for install ${p.inst}`,
+            agent: { type: "AGENT", identifier: "t" },
+            files: [],
+            timestamp: 1,
+            signingKeyId: "0123456789abcdef",
+            signature: "QUJD",
+          });
+        }
+      }
+      return null;
+    },
+    async listDirectory() {
+      return [];
+    },
+    async listIssueComments() {
+      return [];
+    },
+    async postComment() {
+      return 1;
+    },
+    async updateComment() {},
+    async createCheckRun() {
+      checkRuns++;
+      return checkRuns;
+    },
+  };
+
+  const worker = new Worker({
+    queue,
+    deps: { github, webhookSecret: "s" },
+    concurrency: 3,
+    pollIntervalMs: 10,
+  });
+  worker.start();
+  // 3 installations × 3 deliveries, interleaved so the worker pool must
+  // switch installation scope continuously. Each delivery is its own PR.
+  for (let i = 0; i < 9; i++) {
+    const inst = (i % 3) + 1;
+    const prNumber = 100 + i;
+    prs.set(prNumber, { inst, headSha: sha(), did: didOf(i) });
+    const p = prs.get(prNumber);
+    const payload = {
+      action: "opened",
+      installation: { id: inst },
+      repository: { name: `repo-${inst}`, owner: { login: "owner" } },
+      pull_request: { number: prNumber, title: "t", head: { sha: p.headSha }, base: { sha: "0".repeat(40) } },
+    };
+    const rawBody = JSON.stringify(payload);
+    const sig = `sha256=${createHmac("sha256", "s").update(rawBody, "utf8").digest("hex")}`;
+    await queue.enqueue(`delivery-${inst}-${i}`, "pull_request", rawBody, payload, sig);
+  }
+  const deadline = Date.now() + 10_000;
+  while ((await queue.stats()).done < 9 && Date.now() < deadline) await sleep(10);
+  assert.equal((await queue.stats()).done, 9, "all 9 jobs processed");
+  assert.equal(checkRuns, 9, "one check run per delivery");
+  assert.equal(mismatches, 0, "no cross-installation client use (every call used the payload's installation)");
+  // Every delivery was audited under ITS OWN installation (the pairing that
+  // would break if an installation-scoped client were ever reused across
+  // tenants).
+  for (let i = 0; i < 9; i++) {
+    const inst = (i % 3) + 1;
+    const count = seenPairs.filter((p) => p === `${inst}:${100 + i}`).length;
+    assert.equal(count, 1, `delivery ${100 + i} audited under installation ${inst} exactly once (got ${count})`);
+  }
+  await worker.stop();
+  queue.close();
+});

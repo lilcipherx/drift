@@ -24,8 +24,10 @@ import { summarizeIntents } from "./summarize.js";
 import {
   deriveProvenanceConclusion,
   evaluateKeyChange,
+  evaluateKeyringChangeState,
   findOwnedDriftComment,
   type KeyChange,
+  type KeyringChangeState,
 } from "./trust.js";
 
 export interface WebhookDeps {
@@ -181,6 +183,12 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     const baseKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", effectiveBaseSha);
     const headKey = await github.getFileContent(owner, repoName, ".drift/public/key.pem", effectiveHeadSha);
     const keyChange: KeyChange = evaluateKeyChange(baseKey, headKey);
+    // Multi-signer keyring: the trust set is append-only. A PR may only EXTEND
+    // the audit log (signed add/revoke/remove); deleting, editing, or
+    // replacing the history fails the trust audit (see trust.ts).
+    const baseKeyring = await github.getFileContent(owner, repoName, ".drift/public/keyring.json", effectiveBaseSha);
+    const headKeyring = await github.getFileContent(owner, repoName, ".drift/public/keyring.json", effectiveHeadSha);
+    const keyringChange: KeyringChangeState = evaluateKeyringChangeState(baseKeyring, headKeyring, baseKey, headKey);
 
     // Commit enumeration WITH completeness proof: the App must never conclude
     // trust from a truncated commit list (the REST endpoint caps at 250).
@@ -219,8 +227,11 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
     // non-trivial key state (bootstrap, replaced, removed, malformed-*,
     // base-malformed) is surfaced — only none/unchanged stays silent.
     if (ids.length === 0) {
-      const conclusion = deriveProvenanceConclusion({ intents: [], keyChange, audit });
-      const keyVisible = keyChange !== "none" && keyChange !== "unchanged";
+      const conclusion = deriveProvenanceConclusion({ intents: [], keyChange, keyringChange, audit });
+      const KEYRING_FAILING = new Set(["replaced", "removed", "malformed-bootstrap", "malformed-replacement", "base-malformed"]);
+      const keyVisible =
+        (keyChange !== "none" && keyChange !== "unchanged") ||
+        (keyringChange !== "none" && keyringChange !== "unchanged" && keyringChange !== "extended");
       if (keyVisible || integrityBroken) {
         const commentBody = summarizeIntents({
           owner,
@@ -274,8 +285,7 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
       ...(keyChange === "replaced" || keyChange === "removed" ? { keyChange } : {}),
       audit,
     });
-
-    const conclusion = deriveProvenanceConclusion({ intents, keyChange, audit });
+    const conclusion = deriveProvenanceConclusion({ intents, keyChange, keyringChange, audit });
 
     // dev --dry-run: build everything but write nothing.
     if (deps.readOnly) {

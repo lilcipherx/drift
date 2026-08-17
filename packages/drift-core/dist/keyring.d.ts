@@ -176,6 +176,35 @@ export declare function loadTrustSet(driftDir: string): TrustSet;
 export declare function writeKeyringFile(driftDir: string, keyring: KeyringFile): void;
 /** Look up a key entry (active or revoked) by fingerprint. */
 export declare function findKeyringEntry(keyring: KeyringFile, fingerprint: string): KeyringEntry | undefined;
+/**
+ * Base/head keyring relationship for the PR trust audit (the keyring
+ * analogue of `evaluateTrustRootChange`). The keyring is APPEND-ONLY: the
+ * only legitimate change is a strict EXTENSION of the audit log, so the
+ * history (every add/revoke/remove, including revocations) can never be
+ * deleted, edited, or replaced by a fresh file:
+ *
+ *   base absent,  head absent                 → none
+ *   base absent,  head valid                  → bootstrap          (neutral)
+ *   base absent,  head malformed              → malformed-bootstrap(failure)
+ *   base valid,   head valid, identical       → unchanged
+ *   base valid,   head valid, base is a strict
+ *                  prefix of head's audit log → extended           (additive, visible)
+ *   base valid,   head valid, NOT a prefix    → replaced           (failure)
+ *   base valid,   head absent                 → removed            (failure)
+ *   base valid,   head malformed              → malformed-replacement(failure)
+ *   base malformed (any head)                 → base-malformed     (failure)
+ *
+ * "replaced" covers every history attack: deleting a revoke entry (head is
+ * shorter or diverges), editing an entry (diverges), and replacing the whole
+ * file with a fresh bootstrap (base is not a prefix of the new log).
+ */
+export type KeyringChange = "none" | "unchanged" | "bootstrap" | "extended" | "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
+/**
+ * Evaluate a base/head keyring change. `raw` values are the raw file contents
+ * (or null); anchors are the corresponding `.drift/public/key.pem` contents.
+ * Fails closed on malformed input exactly like the trust-root evaluator.
+ */
+export declare function evaluateKeyringChange(baseRaw: string | null | undefined, headRaw: string | null | undefined, baseAnchor: string | null | undefined, headAnchor: string | null | undefined): KeyringChange;
 /** Re-export for convenience (avoids a second import site). */
 export { signingKeyIdForValidKey };
 //# sourceMappingURL=keyring.d.ts.map

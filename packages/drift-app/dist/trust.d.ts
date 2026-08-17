@@ -10,7 +10,7 @@
  *    to a Check Run conclusion. The App never reports unconditional success:
  *    invalid/untrusted/malformed/key-change provenance fails the check.
  */
-import { type TrustRootChange } from "@drift/core";
+import { type KeyringChange, type TrustRootChange } from "@drift/core";
 import type { IntentView } from "./intents.js";
 /** Comment marker version 2 — the App owns the app-specific marker and must
  * never edit the Action's comment (and vice versa). Legacy markers are
@@ -31,6 +31,15 @@ export declare const TRUST_ROOT_WARNING = "## \u26A0 Drift trust-root change det
  */
 export type KeyChange = TrustRootChange;
 export declare function evaluateKeyChange(baseKey: string | null | undefined, headKey: string | null | undefined): KeyChange;
+/**
+ * Keyring (multi-signer trust set) change between base and head. The keyring
+ * is append-only: the ONLY legitimate change is a strict extension of the
+ * audit log (add/revoke/remove signed by an active key). History can never be
+ * deleted, edited, or replaced by a fresh file — those are `replaced`/
+ * `removed`/`malformed-*` failures in the trust audit.
+ */
+export type KeyringChangeState = KeyringChange;
+export declare function evaluateKeyringChangeState(baseKeyring: string | null | undefined, headKeyring: string | null | undefined, baseKey: string | null | undefined, headKey: string | null | undefined): KeyringChangeState;
 /** A PR comment as returned by the GitHub API (ownership-relevant fields). */
 export interface CommentIdentity {
     body: string;
@@ -84,6 +93,7 @@ export declare const NO_AUDIT: ProvenanceAudit;
 export interface ConclusionInput {
     intents: Pick<IntentView, "signatureState">[];
     keyChange: KeyChange;
+    keyringChange?: KeyringChangeState;
     audit?: ProvenanceAudit;
 }
 export interface ConclusionResult {

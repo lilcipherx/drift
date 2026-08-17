@@ -590,5 +590,107 @@ export function findKeyringEntry(keyring: KeyringFile, fingerprint: string): Key
   return keyring.keys.find((k) => k.fingerprint === fingerprint);
 }
 
+/**
+ * Base/head keyring relationship for the PR trust audit (the keyring
+ * analogue of `evaluateTrustRootChange`). The keyring is APPEND-ONLY: the
+ * only legitimate change is a strict EXTENSION of the audit log, so the
+ * history (every add/revoke/remove, including revocations) can never be
+ * deleted, edited, or replaced by a fresh file:
+ *
+ *   base absent,  head absent                 → none
+ *   base absent,  head valid                  → bootstrap          (neutral)
+ *   base absent,  head malformed              → malformed-bootstrap(failure)
+ *   base valid,   head valid, identical       → unchanged
+ *   base valid,   head valid, base is a strict
+ *                  prefix of head's audit log → extended           (additive, visible)
+ *   base valid,   head valid, NOT a prefix    → replaced           (failure)
+ *   base valid,   head absent                 → removed            (failure)
+ *   base valid,   head malformed              → malformed-replacement(failure)
+ *   base malformed (any head)                 → base-malformed     (failure)
+ *
+ * "replaced" covers every history attack: deleting a revoke entry (head is
+ * shorter or diverges), editing an entry (diverges), and replacing the whole
+ * file with a fresh bootstrap (base is not a prefix of the new log).
+ */
+export type KeyringChange =
+  | "none"
+  | "unchanged"
+  | "bootstrap"
+  | "extended"
+  | "replaced"
+  | "removed"
+  | "malformed-bootstrap"
+  | "malformed-replacement"
+  | "base-malformed";
+
+function auditEntriesEqual(a: KeyringAuditEntry, b: KeyringAuditEntry): boolean {
+  return (
+    a.seq === b.seq &&
+    a.action === b.action &&
+    a.fingerprint === b.fingerprint &&
+    a.by === b.by &&
+    a.at === b.at &&
+    a.reason === b.reason &&
+    a.payload === b.payload &&
+    a.signature === b.signature
+  );
+}
+
+/** True when `base.audit` is a strict prefix of `head.audit` (base shorter). */
+function isStrictPrefix(base: KeyringFile, head: KeyringFile): boolean {
+  if (base.audit.length >= head.audit.length) return false;
+  for (let i = 0; i < base.audit.length; i++) {
+    if (!auditEntriesEqual(base.audit[i]!, head.audit[i]!)) return false;
+  }
+  return true;
+}
+
+/** True when two keyrings are byte-identical (after strict parse). */
+function keyringsEqual(a: KeyringFile, b: KeyringFile): boolean {
+  if (a.audit.length !== b.audit.length) return false;
+  for (let i = 0; i < a.audit.length; i++) {
+    if (!auditEntriesEqual(a.audit[i]!, b.audit[i]!)) return false;
+  }
+  return true;
+}
+
+/**
+ * Evaluate a base/head keyring change. `raw` values are the raw file contents
+ * (or null); anchors are the corresponding `.drift/public/key.pem` contents.
+ * Fails closed on malformed input exactly like the trust-root evaluator.
+ */
+export function evaluateKeyringChange(
+  baseRaw: string | null | undefined,
+  headRaw: string | null | undefined,
+  baseAnchor: string | null | undefined,
+  headAnchor: string | null | undefined,
+): KeyringChange {
+  const baseText = String(baseRaw ?? "");
+  const headText = String(headRaw ?? "");
+  const basePresent = baseText.trim().length > 0;
+  const headPresent = headText.trim().length > 0;
+  const baseAnchorText = String(baseAnchor ?? "");
+  const headAnchorText = String(headAnchor ?? "");
+  const baseAnchorPresent = baseAnchorText.trim().length > 0;
+  const headAnchorPresent = headAnchorText.trim().length > 0;
+
+  if (!basePresent && !headPresent) return "none";
+  if (!basePresent && headPresent) {
+    // A keyring cannot exist without an anchor; validate it for the verdict.
+    const head = validateKeyring(headText, headAnchorPresent ? headAnchorText : null);
+    if (!head.ok) return "malformed-bootstrap";
+    return "bootstrap";
+  }
+  const base = validateKeyring(baseText, baseAnchorPresent ? baseAnchorText : null);
+  if (!base.ok) return "base-malformed";
+  if (!headPresent) return "removed";
+  const head = validateKeyring(headText, headAnchorPresent ? headAnchorText : null);
+  if (!head.ok) return "malformed-replacement";
+  if (keyringsEqual(base.keyring, head.keyring)) return "unchanged";
+  // The only legitimate change is a strict append-only extension.
+  if (isStrictPrefix(base.keyring, head.keyring)) return "extended";
+  return "replaced";
+}
+
 /** Re-export for convenience (avoids a second import site). */
 export { signingKeyIdForValidKey };

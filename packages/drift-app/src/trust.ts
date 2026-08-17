@@ -11,7 +11,7 @@
  *    invalid/untrusted/malformed/key-change provenance fails the check.
  */
 
-import { evaluateTrustRootChange, type TrustRootChange } from "@drift/core";
+import { evaluateKeyringChange, evaluateTrustRootChange, type KeyringChange, type TrustRootChange } from "@drift/core";
 import type { IntentView } from "./intents.js";
 
 /** Comment marker version 2 — the App owns the app-specific marker and must
@@ -41,6 +41,24 @@ export function evaluateKeyChange(
   headKey: string | null | undefined,
 ): KeyChange {
   return evaluateTrustRootChange(baseKey, headKey);
+}
+
+/**
+ * Keyring (multi-signer trust set) change between base and head. The keyring
+ * is append-only: the ONLY legitimate change is a strict extension of the
+ * audit log (add/revoke/remove signed by an active key). History can never be
+ * deleted, edited, or replaced by a fresh file — those are `replaced`/
+ * `removed`/`malformed-*` failures in the trust audit.
+ */
+export type KeyringChangeState = KeyringChange;
+
+export function evaluateKeyringChangeState(
+  baseKeyring: string | null | undefined,
+  headKeyring: string | null | undefined,
+  baseKey: string | null | undefined,
+  headKey: string | null | undefined,
+): KeyringChangeState {
+  return evaluateKeyringChange(baseKeyring, headKeyring, baseKey, headKey);
 }
 
 /** A PR comment as returned by the GitHub API (ownership-relevant fields). */
@@ -132,6 +150,7 @@ export const NO_AUDIT: ProvenanceAudit = { violations: [], replayIds: [], ambigu
 export interface ConclusionInput {
   intents: Pick<IntentView, "signatureState">[];
   keyChange: KeyChange;
+  keyringChange?: KeyringChangeState;
   audit?: ProvenanceAudit;
 }
 
@@ -157,6 +176,7 @@ export interface ConclusionResult {
  */
 export function deriveProvenanceConclusion(input: ConclusionInput): ConclusionResult {
   const { intents, keyChange } = input;
+  const keyringChange = input.keyringChange ?? "none";
   const audit = input.audit ?? NO_AUDIT;
   const failing = intents.filter((i) => FAILING_STATES.has(i.signatureState));
   const validCount = intents.filter((i) => i.signatureState === "valid").length;
@@ -170,7 +190,17 @@ export function deriveProvenanceConclusion(input: ConclusionInput): ConclusionRe
     "malformed-replacement",
     "base-malformed",
   ]);
-  const blockingKeyChange = FAILING_KEY_STATES.has(keyChange);
+  // The keyring (multi-signer trust set) has the same failing states: a
+  // history rewrite or removal is a trust-set attack. `extended` (append-only
+  // add/revoke/remove) is legitimate and does NOT block.
+  const FAILING_KEYRING_STATES = new Set([
+    "replaced",
+    "removed",
+    "malformed-bootstrap",
+    "malformed-replacement",
+    "base-malformed",
+  ]);
+  const blockingKeyChange = FAILING_KEY_STATES.has(keyChange) || FAILING_KEYRING_STATES.has(keyringChange);
   const integrityBroken =
     audit.violations.length > 0 || audit.replayIds.length > 0 || audit.ambiguousIds.length > 0;
 
@@ -185,6 +215,7 @@ export function deriveProvenanceConclusion(input: ConclusionInput): ConclusionRe
     `Bootstrap: ${count("bootstrap")}`,
     `Missing manifests: ${count("missing")}`,
     `Trust-root change: ${keyChange}`,
+    `Trust-set (keyring) change: ${keyringChange}`,
     `Provenance violations: ${audit.violations.length + audit.replayIds.length + audit.ambiguousIds.length}`,
   ];
   const summary = parts.join(" · ");
@@ -192,17 +223,33 @@ export function deriveProvenanceConclusion(input: ConclusionInput): ConclusionRe
   if (failing.length > 0 || blockingKeyChange || integrityBroken) {
     const reasons: string[] = [];
     if (blockingKeyChange) {
-      reasons.push(
-        keyChange === "replaced"
-          ? "the pull request replaces .drift/public/key.pem (trust-root change)"
-          : keyChange === "removed"
-            ? "the pull request removes .drift/public/key.pem (trust-root change)"
-            : keyChange === "base-malformed"
-              ? "the base branch trust root (.drift/public/key.pem) is not a valid Drift public key — no trust root can be established"
-              : keyChange === "malformed-bootstrap"
-                ? "the pull request introduces a MALFORMED .drift/public/key.pem — a malformed initial key is not a bootstrap"
-                : "the pull request replaces .drift/public/key.pem with MALFORMED content that is not a valid Drift public key",
-      );
+      const keyringBlocking = FAILING_KEYRING_STATES.has(keyringChange);
+      if (keyringBlocking) {
+        reasons.push(
+          keyringChange === "replaced"
+            ? "the pull request REWRITES .drift/public/keyring.json (trust-set history can only be appended, never replaced)"
+            : keyringChange === "removed"
+              ? "the pull request REMOVES .drift/public/keyring.json (trust-set history can never be deleted)"
+              : keyringChange === "base-malformed"
+                ? "the base branch keyring (.drift/public/keyring.json) is malformed — no trust set can be established"
+                : keyringChange === "malformed-bootstrap"
+                  ? "the pull request introduces a MALFORMED .drift/public/keyring.json — a malformed initial keyring is not a bootstrap"
+                  : "the pull request replaces .drift/public/keyring.json with MALFORMED content",
+        );
+      }
+      if (FAILING_KEY_STATES.has(keyChange)) {
+        reasons.push(
+          keyChange === "replaced"
+            ? "the pull request replaces .drift/public/key.pem (trust-root change)"
+            : keyChange === "removed"
+              ? "the pull request removes .drift/public/key.pem (trust-root change)"
+              : keyChange === "base-malformed"
+                ? "the base branch trust root (.drift/public/key.pem) is not a valid Drift public key — no trust root can be established"
+                : keyChange === "malformed-bootstrap"
+                  ? "the pull request introduces a MALFORMED .drift/public/key.pem — a malformed initial key is not a bootstrap"
+                  : "the pull request replaces .drift/public/key.pem with MALFORMED content that is not a valid Drift public key",
+        );
+      }
     }
     for (const i of failing) {
       reasons.push(

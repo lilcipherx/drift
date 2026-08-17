@@ -252,8 +252,18 @@ async function post(port, raw, deliveryId) {
   return new SqliteQueue({ path: join(mkdtempSync(join(tmpdir(), "drift-e2e-")), "queue.db"), maxAttempts: 6 });
 }
 
+/** Each scenario needs an empty queue table (SQLite gets a fresh file). */
+async function resetQueueTable(pgUrl) {
+  if (!pgUrl) return;
+  const { Pool } = await import("pg");
+  const pool = new Pool({ connectionString: pgUrl });
+  await pool.query("DROP TABLE IF EXISTS webhook_jobs");
+  await pool.end();
+}
+
 async function runScenario(sc, pgUrl) {
   const dir = mkdtempSync(join(tmpdir(), "drift-e2e-"));
+  await resetQueueTable(pgUrl);
   const { createWebhookServer } = await mod("server.js");
   const { Worker } = await mod("worker.js");
   const mock = new MockGitHub(sc.faults, {});

@@ -45,6 +45,14 @@ try {
   const { PostgresQueue } = await mod("queue-pg.js");
   const { Worker } = await mod("worker.js");
   const { createMetrics } = await mod("metrics.js");
+  if (PG_URL) {
+    // Start from an empty queue table so leftover jobs from other runs (or
+    // the test suite) can never pollute the soak's drain assertions.
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: PG_URL });
+    await pool.query("DROP TABLE IF EXISTS webhook_jobs");
+    await pool.end();
+  }
 
   const queue = PG_URL
     ? new PostgresQueue({ url: PG_URL, maxAttempts: 6 })

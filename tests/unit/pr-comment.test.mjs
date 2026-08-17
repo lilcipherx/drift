@@ -21,6 +21,7 @@ import {
   signingKeyIdFor,
   parseTrustRootPem,
   hasProvenanceError,
+  evaluateKeyringChange,
 } from "../../scripts/pr-comment.mjs";
 import { generateKeyPair, newIntentId, PublicStore } from "@drift/core";
 
@@ -1077,9 +1078,48 @@ test("hasProvenanceError: trust/integrity state → workflow-failure mapping (is
   assert.equal(hasProvenanceError({ intents: [intent("missing")], keyChange: "unchanged", audit: emptyAudit() }), false);
   assert.equal(hasProvenanceError({ intents: [], keyChange: "none", audit: emptyAudit() }), false);
   assert.equal(hasProvenanceError({ intents: [intent("valid")], keyChange: "unchanged", audit: emptyAudit() }), false);
+  // keyring (multi-signer trust set) is append-only: failing states fail the
+  // workflow, a signed extension is neutral.
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", keyringChange: "replaced", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", keyringChange: "removed", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", keyringChange: "malformed-replacement", audit: emptyAudit() }), true);
+  assert.equal(hasProvenanceError({ intents: [intent("valid")], keyChange: "unchanged", keyringChange: "extended", audit: emptyAudit() }), false);
+  assert.equal(hasProvenanceError({ intents: [], keyChange: "unchanged", keyringChange: "none", audit: emptyAudit() }), false);
   function emptyAudit() {
     return { violations: [], replayIds: [], ambiguousIds: [] };
   }
+});
+
+test("evaluateKeyringChange (Action mirror): append-only trust-set history", () => {
+  const anchorPem = generateKeyPair().publicKeyPem.trim();
+  const fp = signingKeyIdFor(anchorPem);
+  const secondPem = generateKeyPair().publicKeyPem.trim();
+  const fp2 = signingKeyIdFor(secondPem);
+  const krBootstrap = JSON.stringify({
+    schemaVersion: 1,
+    keys: [{ fingerprint: fp, pem: anchorPem, status: "active", addedBy: fp, addedAt: 1, transitionedBy: null, transitionedAt: null, reason: null }],
+    audit: [{ seq: 1, action: "bootstrap", fingerprint: fp, by: fp, at: 1, reason: null, payload: "p", signature: "s" }],
+  });
+  const krExtended = JSON.stringify({
+    schemaVersion: 1,
+    keys: [
+      { fingerprint: fp, pem: anchorPem, status: "active", addedBy: fp, addedAt: 1, transitionedBy: null, transitionedAt: null, reason: null },
+      { fingerprint: fp2, pem: secondPem, status: "active", addedBy: fp, addedAt: 2, transitionedBy: null, transitionedAt: null, reason: null },
+    ],
+    audit: [
+      { seq: 1, action: "bootstrap", fingerprint: fp, by: fp, at: 1, reason: null, payload: "p", signature: "s" },
+      { seq: 2, action: "add", fingerprint: fp2, by: fp, at: 2, reason: null, payload: "p2", signature: "s2" },
+    ],
+  });
+  assert.equal(evaluateKeyringChange(null, null, anchorPem, anchorPem), "none");
+  assert.equal(evaluateKeyringChange(null, krBootstrap, null, anchorPem), "bootstrap");
+  assert.equal(evaluateKeyringChange(krBootstrap, krBootstrap, anchorPem, anchorPem), "unchanged");
+  assert.equal(evaluateKeyringChange(krBootstrap, krExtended, anchorPem, anchorPem), "extended");
+  // History attacks: truncation, rewrite, fresh-file replacement, removal.
+  assert.equal(evaluateKeyringChange(krExtended, krBootstrap, anchorPem, anchorPem), "replaced");
+  assert.equal(evaluateKeyringChange(krExtended, null, anchorPem, anchorPem), "removed");
+  assert.equal(evaluateKeyringChange(krBootstrap, "{bad", anchorPem, anchorPem), "malformed-replacement");
+  assert.equal(evaluateKeyringChange("{bad", krBootstrap, anchorPem, anchorPem), "base-malformed");
 });
 
 // --------------------------------------------- final completeness regressions

@@ -156,9 +156,30 @@ against the keyring:
 | no trusted key material at all        | `unverifiable`     |
 | keyring malformed (tampered)          | `unverifiable`     |
 
+## PR trust audit: history is append-only
+
+The App (`packages/drift-app/src/trust.ts` + `handler.ts`) and the GitHub
+Action (`scripts/pr-comment.mjs`) evaluate the base→head keyring change on
+**every PR** (`evaluateKeyringChange`): the ONLY legitimate change is a strict
+extension of the audit log (`bootstrap → … → extended`). History attacks fail
+the check run and the workflow:
+
+| base → head | verdict |
+|---|---|
+| absent → valid keyring | `bootstrap` (neutral, visible) |
+| identical | `unchanged` |
+| base is a strict prefix of head's audit log | `extended` (legitimate add/revoke/remove — does NOT block) |
+| head diverges, truncates, or replaces the log with a fresh bootstrap | `replaced` (blocking) |
+| head deletes the keyring | `removed` (blocking) |
+| malformed head / malformed base | `malformed-*` / `base-malformed` (blocking) |
+
+Deleting a revoke entry, editing an entry, or wiping the history with a new
+bootstrap file therefore cannot pass the trust audit — the summary states the
+append-only rule explicitly.
+
 ## Tests
 
-`tests/integration/keyring.test.mjs` (11 tests):
+`tests/integration/keyring.test.mjs` (12 tests):
 
 - backward compatibility (legacy repo untouched, single active key);
 - bootstrap (self-signed anchor, idempotent, anchor-holder-only);

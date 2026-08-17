@@ -57,6 +57,7 @@ export {
   KEYRING_PATH,
   applyKeyringChange,
   createKeyring,
+  evaluateKeyringChange,
   findKeyringEntry,
   keyringFingerprint,
   keyringPath,
@@ -69,6 +70,7 @@ export {
 export type {
   KeyringAction,
   KeyringAuditEntry,
+  KeyringChange,
   KeyringChangeAction,
   KeyringChangeResult,
   KeyringEntry,

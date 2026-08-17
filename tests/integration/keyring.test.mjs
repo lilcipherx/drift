@@ -34,6 +34,7 @@ import { generateKeyPairSync } from "node:crypto";
 import {
   applyKeyringChange,
   createKeyring,
+  evaluateKeyringChange,
   keyringPayload,
   loadTrustSet,
   parseKeyringKey,
@@ -477,6 +478,63 @@ test("keyring: loadTrustSet with a valid keyring reflects the full active set", 
   assert.equal(trust.keyring !== null, true);
   assert.equal(trust.active.length, 2);
   assert.equal(trust.malformed, null);
+});
+
+// --------------------------------------- history continuity (PR trust audit)
+
+test("evaluateKeyringChange: only a strict append-only extension of the audit log is legitimate", () => {
+  const alice = keyPair();
+  const bob = keyPair();
+  const created = createKeyring(alice.pub, alice.priv, 1000);
+  const kr0 = created.ok ? created.keyring : null;
+  assert.ok(kr0);
+  const kr1 = applyKeyringChange(kr0, alice.priv, "add", { pem: bob.pub }, null, 2000).keyring;
+  const kr2 = applyKeyringChange(kr1, alice.priv, "revoke", { fingerprint: fp(bob.pub) }, "compromise", 3000).keyring;
+
+  // both absent
+  assert.equal(evaluateKeyringChange(null, null, alice.pub, alice.pub), "none");
+  // base absent, head valid → bootstrap
+  assert.equal(evaluateKeyringChange(null, JSON.stringify(kr0), null, alice.pub), "bootstrap");
+  // base absent, head malformed → malformed-bootstrap
+  assert.equal(evaluateKeyringChange(null, "{not json", null, alice.pub), "malformed-bootstrap");
+  // identical → unchanged
+  assert.equal(evaluateKeyringChange(JSON.stringify(kr1), JSON.stringify(kr1), alice.pub, alice.pub), "unchanged");
+  // base is a strict prefix of head (append-only add) → extended
+  assert.equal(evaluateKeyringChange(JSON.stringify(kr0), JSON.stringify(kr1), alice.pub, alice.pub), "extended");
+  assert.equal(evaluateKeyringChange(JSON.stringify(kr1), JSON.stringify(kr2), alice.pub, alice.pub), "extended");
+
+  // HEAD rewrites history: replaces the add with a different key → replaced.
+  const mallory = keyPair();
+  const krM = applyKeyringChange(kr0, alice.priv, "add", { pem: mallory.pub }, null, 2000).keyring;
+  assert.equal(
+    evaluateKeyringChange(JSON.stringify(kr1), JSON.stringify(krM), alice.pub, alice.pub),
+    "replaced",
+    "an edited history entry is a rewrite",
+  );
+  // HEAD deletes the revoke entry (history truncation) → replaced.
+  assert.equal(
+    evaluateKeyringChange(JSON.stringify(kr2), JSON.stringify(kr1), alice.pub, alice.pub),
+    "replaced",
+    "deleting a revoke entry is a rewrite",
+  );
+  // HEAD replaces the whole file with a FRESH bootstrap → replaced.
+  assert.equal(
+    evaluateKeyringChange(JSON.stringify(kr2), JSON.stringify(kr0), alice.pub, alice.pub),
+    "replaced",
+    "replacing history with a fresh bootstrap is a rewrite",
+  );
+  // base present, head absent → removed (history deleted).
+  assert.equal(evaluateKeyringChange(JSON.stringify(kr1), null, alice.pub, alice.pub), "removed");
+  // base valid, head malformed → malformed-replacement.
+  assert.equal(evaluateKeyringChange(JSON.stringify(kr1), "garbage", alice.pub, alice.pub), "malformed-replacement");
+  // base malformed → base-malformed regardless of head.
+  assert.equal(evaluateKeyringChange("garbage", JSON.stringify(kr1), alice.pub, alice.pub), "base-malformed");
+  // A keyring whose bootstrap does not match the anchor fails closed.
+  assert.equal(
+    evaluateKeyringChange(JSON.stringify(kr0), JSON.stringify(kr1), bob.pub, bob.pub),
+    "base-malformed",
+    "base keyring must validate against the base anchor",
+  );
 });
 
 // ----------------------------------------------------------------- helpers
