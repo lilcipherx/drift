@@ -139,15 +139,15 @@ is bounded by manifest count and rebuilt incrementally.
 
 Measured on the benchmark box (Windows x64, Node 24; see PERFORMANCE_REPORT):
 
-| Command | 20k manifests | 40k manifests | Scaling | 100k (modeled) |
+| Command | 20k manifests | 40k manifests | Scaling | 100k manifests (measured) |
 |---|---|---|---|---|
-| `log --limit 20` warm | 1.25 s | 2.6 s | linear stat-walk | ~6.5 s |
-| `context` warm | 1.24 s | 2.6 s | linear | ~6.5 s |
-| `verify-intent` | 0.003 s | 0.014 s | flat | <0.05 s |
-| `status` (full audit) | 16.5 s | 34.2 s | linear parse | ~85 s |
-| `doctor` (full audit) | 12.2 s | 22.9 s | linear | ~57 s |
-| `export` (full dump) | 5.7 s | 11.2 s | linear | ~28 s |
-| `blame` (trailer scan) | 5.6 s | 11.3 s | linear w/ git log | ~28 s |
+| `log --limit 20` warm | 1.25 s | 2.6 s | stat-walk (no content reads) | 2.95 s |
+| `context` warm | 1.24 s | 2.6 s | linear | 3.08 s |
+| `verify-intent` | 0.003 s | 0.014 s | flat | 0.001 s |
+| `status` (full audit) | 16.5 s | 34.2 s | linear parse | 51.7 s |
+| `doctor` (full audit) | 12.2 s | 22.9 s | linear | 34.2 s |
+| `export` (full dump) | 5.7 s | 11.2 s | linear | 16.8 s |
+| `blame` (trailer scan) | 5.6 s | 11.3 s | per-file | 0.24 s |
 
 **Documented envelope:** bounded commands (`log --limit N`, `context`,
 `verify-intent`) keep memory O(limit) and are dominated by a stat walk over
@@ -157,10 +157,14 @@ reporting complete provenance; they are the documented cold path. The
 stat-validated manifest index (PRD §7) makes warm bounded commands ~10×
 faster than a full parse walk and keeps them memory-constant.
 
-The 100k-manifest column is a **modeled linear extrapolation** of the two
-measured points; it has not been executed on this box (generation is
-fast-import bound). The ARM64 self-hosted runner (SSD, Linux) is expected to
-be faster per file than this Windows dev box; final CI re-measures.
+The 100k-manifest column is **executed** on this box (2,000 commits each
+introducing 50 manifests — the manifest walk is the term being bounded; the
+git-log term scales with commit count separately and is measured at
+~666 ms per 20k commits). Bounded commands (`log --limit 20` warm 2.95 s,
+`context` 3.08 s, `blame` 0.24 s) stay under the 5 s SLO with O(limit) memory
+across warm runs; full audits are O(N) by design. The ARM64 self-hosted
+runner (SSD, Linux) re-measures the same profile in CI; artifacts in
+benchmarks/results/.
 
 ---
 
@@ -191,7 +195,9 @@ be faster per file than this Windows dev box; final CI re-measures.
 - The model does **not** claim that 1M users have been tested. It claims a
   documented, assumption-stated envelope whose binding constraints are
   measured (CLI) or bounded by arithmetic (intake, GitHub rate limits).
-- The 100k-manifest CLI column is modeled, not executed.
+- The 100k-manifest CLI column is executed with 2,000 commits introducing
+  100,000 manifests (multi-manifest commits); a 1:1 100k-commit profile adds
+  the measured git-log term (~3.3 s at 100k commits) to association scans.
 - Horizontal scaling beyond one node requires the shared-queue production
   adapter; the local SQLite adapter is single-node by design.
 - Multi-signer keyring is **not** implemented; single-signer operation is a

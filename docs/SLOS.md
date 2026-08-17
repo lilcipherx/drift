@@ -32,9 +32,12 @@ artifacts under `benchmarks/results/`.
 | Queue wait time p95 | < 30 s at ≤ 2× peak | queue drains at worker pace; near-zero steady state | soak workflow |
 | Worker throughput | ≥ 1 audit / 5 s per worker (API bound) | — | soak workflow |
 | CLI `log --limit 20` (20k manifests, warm) | < 5 s | **1.3 s** | `bench-large-20k.json` |
+| CLI `log --limit 20` (100k manifests, warm) | < 5 s | **2.95 s** | `bench-large-100k.json` |
 | CLI `verify-intent` (20k manifests) | < 100 ms | **2.6 ms** | same |
 | CLI `status` (20k manifests, full audit) | < 60 s | **16.5 s** | same |
-| CLI peak memory, bounded commands | < 64 MB delta | **+1.3 MB** (log --limit 20) | same |
+| CLI peak memory, bounded commands | < 64 MB delta | **+1.3 MB** (log --limit 20); warm deltas constant across runs at 100k | same |
+| App intake p99 (steady state) | < 100 ms | **37 ms** (1,452/s, 6.3× the 2×-peak target) | `app-intake-2000.json` |
+| App e2e audit (mock API, happy path) | p50 < 5 s | **15 ms** p50 / 32 ms p99 | `bench-app-e2e.json` |
 | Recovery: worker restart mid-job | job re-claimed, no loss | lease expiry re-claim (tested) | `tests/app/queue.test.mjs`, `tests/app/shutdown-live.test.mjs` |
 | Data-loss objective | **0** accepted deliveries lost without a dead-letter record | SQLite durable queue; crash-consistency tested | `tests/app/queue.test.mjs` |
 
@@ -42,8 +45,10 @@ artifacts under `benchmarks/results/`.
 
 ## 3. Measured vs. target status
 
-- **Met with margin:** intake latency, intake throughput (899/s vs. 232/s
-  2×-peak target), CLI bounded-command latency and memory, verify-intent.
+- **Met with margin:** intake latency (p99 37 ms steady-state), intake
+  throughput (899–1,452/s vs. 232/s 2×-peak target), CLI bounded-command
+  latency and memory at 20k/40k/100k manifests, verify-intent, e2e audit
+  latency (p99 32 ms against the mock API).
 - **Bound by GitHub API, tracked by soak:** end-to-end audit latency, worker
   throughput, queue wait under sustained load. These cannot be honestly
   measured against the live GitHub API in CI; the soak workflow exercises the

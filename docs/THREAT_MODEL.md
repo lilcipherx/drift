@@ -91,7 +91,9 @@ Trust boundaries and data surfaces are described in
 | Attack | Mitigation |
 |---|---|
 | Stale delivery audits a moved head | One audit = one immutable PR snapshot; head-SHA mismatch → skip/retry, fail closed on incomplete commit/file enumeration. |
-| Replayed/duplicate delivery | `X-GitHub-Delivery` idempotency (unique index); duplicates return 202 with no re-audit. |
+| Replayed/duplicate delivery | `X-GitHub-Delivery` idempotency (unique index); duplicates return 202 with no re-audit; a job is processed at most once per delivery id. |
+| Forged job injected into the queue DB | The intake server verifies the HMAC and persists the signature on the job; the worker RE-verifies the HMAC over the stored raw body before auditing — a forged or tampered queued delivery is rejected exactly like a forged webhook (fail closed). |
+| GitHub rate limits (429 and secondary 403) | Both are classified transient and retried with the server's Retry-After as the backoff floor; verified by the e2e fault-injection benchmark (rate-limit scenario). |
 | Partial API responses / pagination truncation | Commit/file enumeration compares returned count vs metadata; interruption → `incomplete-commit-audit` (failing check, never truncated success). |
 
 ### 2.8 Verification-command execution
@@ -115,7 +117,7 @@ shell commands.
 | Attack | Mitigation |
 |---|---|
 | Malicious npm dependency | Production dependency surface is minimal: `@modelcontextprotocol/sdk` + `zod` (MCP), `typescript` (drift-ast), internal `@drift/*` workspace packages; everything else is Node built-ins. `npm audit` = 0 vulnerabilities (checked at every CI run); dependencies pinned via lockfile; CI installs with `--no-audit --no-fund` from the lockfile. |
-| Malicious action versions | CI pins actions to major-version tags reviewed by the maintainer (`actions/checkout@v7`, `actions/setup-node@v7`); `persist-credentials: false`; minimal permissions. |
+| Malicious action versions | Every `uses:` reference across all workflows is pinned to an immutable commit SHA (resolved from the official release tags); a workflow self-audit fails if a mutable tag ever returns; `persist-credentials: false`; minimal permissions (`contents: read`; `security-events: write` only in CodeQL). |
 
 ---
 
@@ -126,4 +128,5 @@ shell commands.
 | R1 | Single-signer key model | Multi-maintainer rotation requires a keyring; documented as a release blocker for multi-maintainer production use. | Multi-signer/keyring model. |
 | R2 | Local manifest-index stat collision could hide a manifest from a bounded listing | Stat (mtime+size+ctime) freshness + re-read-on-selection makes trust divergence impossible; listing staleness is bounded and surfaced by status/doctor. | Content-addressed index (hashes) if ever needed. |
 | R3 | macOS not claimed as supported | No macOS CI runner or evidence. | State explicitly in README support policy. |
-| R4 | 100k-manifest CLI envelope is modeled, not executed, on the dev box | 20k/40k measured; linear scaling shown; CI benchmark job re-measures on ARM64. | Run 100k on the ARM64 runner. |
+| R4 | 100k-manifest CLI envelope | Executed end-to-end (docs/PERFORMANCE_REPORT.md) with the stat-validated index: cold build O(N) one time, bounded commands O(limit) memory thereafter. | Re-measured every CI benchmark run. |
+| R5 | Production shared durable queue not implemented | The App's durable queue is SQLite — correct, crash-safe, and measured locally, but a SINGLE-NODE adapter. Horizontal scaling of the App (multi-replica) requires a shared durable queue/storage adapter; this is a release blocker for multi-replica production deployments (see PRODUCTION_READINESS_REPORT.md). | Postgres (or equivalent) `QueueAdapter` with the same lease/claim/retry semantics. |

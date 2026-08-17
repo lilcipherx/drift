@@ -69,13 +69,48 @@ malformed. Committed artifacts: `benchmarks/results/bench-large-20k.json`,
 | log --limit 20 | 3,179 | 0 |
 | doctor | 12,618 | 0 |
 
-### 2.4 Scaling conclusions (two measured points)
+### 2.4 The 100,000-manifest point (executed, not modeled)
 
-- Bounded commands (`log --limit 20`, `context`) scale ~linearly with the
-  stat walk + git log and hold memory at O(limit). 20k→40k: 1.25 s→2.6 s.
+Generated as 2,000 commits each introducing 50 manifests (multi-manifest
+commits with per-manifest trailers — the manifest walk is the workload being
+measured; the 1:1 profile is covered by the 20k/40k points). Working tree:
+100,000 manifest files, checked out, Drift initialized. `benchmarks/results/bench-large-100k.json`.
+
+| command | wall (ms) | heap Δ (MB) |
+|---|---|---|
+| status (full audit) | 51,708 | +166 |
+| log --limit 20 (cold, index build) | 3,069 | +28 |
+| log --limit 20 (warm) | 2,951 | +29 |
+| context (warm) | 3,082 | — |
+| blame | 244 | +28 |
+| verify-intent | 1.3 | +0.1 |
+| doctor (full walk) | 34,217 | +37 |
+| export | 16,848 | +72 |
+| intentAssociations (14,285 ids) | 92 | +29 |
+
+CLI (cold spawned process): status 23,952 ms · log --limit 20 7,991 ms ·
+doctor 36,479 ms (all exit 0). Index: 100,000 rows / 98,001 valid.
+
+Cold-path verdict: the 100k test COMPLETES with no timeout. Bounded commands
+(`log --limit 20` warm 2.95 s, `context` 3.08 s, `blame` 244 ms) hold memory
+constant across warm runs — the cold/warm heap deltas are equal (the +28 MB
+is the one-time index build), so repeated bounded commands do not accumulate.
+Full audits (`status`, `doctor`, `export`) are O(N) by design and documented
+as such. The 5 s SLO for warm `log --limit 20` is met on this Windows dev box
+and re-gated in CI on the ARM64 runner.
+
+### 2.5 Scaling conclusions (three measured points)
+
+- Bounded commands (`log --limit 20`, `context`) hold memory at O(limit)
+  across warm runs; wall time is the stat walk (O(N) but no content reads) +
+  git log. 20k→40k→100k warm log: 1.25 s → 2.6 s → 2.95 s (the 100k repo has
+  only 2,000 commits, so the git-log term stays small — the manifest walk is
+  the bounded term).
 - Full audits (`status`, `doctor`, `export`) scale linearly with manifest
-  parses: 20k→40k ≈ 2×.
-- `verify-intent` is flat: one manifest read + one trailer scan.
+  parses: 20k→40k ≈ 2×; 100k status 51.7 s / doctor 34.2 s on this box.
+- `verify-intent` is flat: one manifest read + one trailer scan (1.3 ms at
+  100k manifests).
+- `blame` is per-file and fast (244 ms at 100k manifests).
 - The stat-validated index makes warm bounded commands **~10× faster and
   memory-constant** vs. the pre-index full walk (20k: log 3.7 s / 76 MB →
   1.3 s / 1.3 MB).
@@ -121,6 +156,28 @@ which is GitHub-API bound (~1 audit/s per worker). SLOs and the final soak +
 load numbers are tracked in [SLOS.md](./SLOS.md) and re-measured in CI on the
 final SHA.
 
+### 4.4 End-to-end benchmark with fault injection (scripts/bench-app-e2e.mjs)
+
+Exercises the FULL production path per delivery — real HTTP webhook (HMAC) →
+delivery-ID idempotency → durable SQLite queue → worker (re-verifies HMAC,
+bounded concurrency, lease/retry) → GitHub API mock → Check Run + comment.
+Results (all assertions PASS, zero dead letters):
+
+| scenario | deliveries | e2e p50 | e2e p99 | e2e max | check runs | dead |
+|---|---|---|---|---|---|---|
+| happy | 150 | 15 ms | 32 ms | 34 ms | 150/150 | 0 |
+| rate-limit (429 + 403-with-Retry-After) | 30 | 16 ms | 236 ms | 236 ms | 30/30 | 0 |
+| transient (network error + 500) | 30 | 16 ms | 31 ms | 31 ms | 30/30 | 0 |
+| duplicates (queued + redelivery after done) | 20 | 12 ms | 23 ms | 23 ms | 20/20 | 0 |
+| stale delivery (head moved) | 1 | — | — | — | 0/1 | 0 |
+| worker crash (lease re-claim) | 20 | 15 ms | 23 ms | 23 ms | 20/20 | 0 |
+| parallel workers (3 × 2 slots) | 60 | 15 ms | 41 ms | 41 ms | 60/60 | 0 |
+
+`benchmarks/results/bench-app-e2e.json` is the reproducible artifact. The
+rate-limit scenario's p99 (236 ms) is the measured retry-with-backoff cost;
+`stale` produces no check run (a stale delivery never yields a trust
+conclusion). The e2e benchmark runs in CI on every protected-branch push.
+
 ---
 
 ## 5. Latency distribution targets
@@ -150,8 +207,10 @@ for alerting; the CLI numbers above are measured single-run values from §2.
 
 ## 7. What is NOT measured here (honest gaps)
 
-- 100k-manifest runs on this box (generation is fast-import bound); modeled
-  linearly from the 20k/40k points (see CAPACITY_MODEL §6).
-- Final load/soak numbers for the App on `runner-arm64` — scheduled in CI
-  (`benchmark-large-repo` + soak workflow) and recorded on the final SHA.
+- The final numbers above are from the Windows dev box; the CI benchmark job
+  re-measures the same scenarios on the Oracle Ubuntu 24.04 ARM64 runner on
+  every protected-branch push (artifacts linked from the final report).
 - macOS: not claimed as a supported platform (see README support policy).
+- Horizontal multi-replica App deployment is NOT implemented or measured
+  (the queue is a single-node SQLite adapter) — this is a release blocker,
+  not a measurement gap (see PRODUCTION_READINESS_REPORT.md).
