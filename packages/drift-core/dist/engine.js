@@ -11,9 +11,9 @@ import { canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateK
 import { CONFIG_TEMPLATE, loadConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
 import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitExists, currentHead, discardIndexSnapshot, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, restoreIndexSnapshot, stageAll, stagedNameStatus, } from "./git.js";
-import { IntentStore } from "./store.js";
+import { IntentStore, PUBLIC_MANIFEST_INDEX_VERSION, } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
-import { buildPublicSummary, genericPublicSummary, PUBLIC_FILES_MAX, PublicStore, signingKeyIdFor, } from "./public.js";
+import { buildPublicSummary, genericPublicSummary, MANIFEST_MAX_BYTES, PUBLIC_FILES_MAX, PUBLIC_INTENTS_DIR, PublicStore, signingKeyIdFor, } from "./public.js";
 import { DRIFT_INTENT_ID_RE, extractDriftIntentIds, extractDriftIntentIdsRaw } from "./trailers.js";
 import { parseTrustRoot, tryParseTrustRoot } from "./trust-root.js";
 /** Default timeout for a `drift verify --run` verification command (ms). */
@@ -932,30 +932,49 @@ export class Drift {
         return toStage;
     }
     // -------------------------------------------------------------------- log
+    /**
+     * Bounded `log` (PRD §7): never walks or parses every manifest. Selects the
+     * top-L candidates from the stat-validated index (or a bounded heap on a
+     * fresh clone), re-reads only those manifest files, and resolves trailer
+     * associations for the candidate set only — memory O(limit), not O(repo).
+     */
     log(filters = {}) {
-        let entries = this.mergeIntents();
-        if (filters.author)
-            entries = entries.filter((e) => e.authorId === filters.author);
-        if (filters.model)
-            entries = entries.filter((e) => e.model === filters.model);
-        if (filters.file) {
-            // prefix semantics mirror the store's SQL LIKE (e.g. `--file src/auth`
-            // matches src/auth.ts)
-            entries = entries.filter((e) => e.files.some((f) => f.path.startsWith(filters.file)));
-        }
-        entries.sort((a, b) => b.timestamp - a.timestamp);
         const limit = filters.limit !== undefined ? safeClamp(filters.limit, 100) : 100;
-        return entries.slice(0, limit);
+        return this.mergeBounded({
+            limit,
+            author: filters.author,
+            model: filters.model,
+            file: filters.file,
+        });
     }
     /**
      * Tracked manifests that fail strict schema validation. Consumers render
      * only valid manifests; this surfaces the rest as an actionable diagnostic
-     * (never a crash, never a silent "valid").
+     * (never a crash, never a silent "valid"). Fast path: the stat-validated
+     * index knows which files are invalid, so only those files are re-read for
+     * the diagnostics (bounded); falls back to a full walk when no index exists
+     * (fresh clone) or the index is unavailable. Malformed manifests are always
+     * re-verified from the FILE here — the index is never a trust source.
      */
     publicManifestDiagnostics() {
+        if (this.store) {
+            try {
+                this.refreshPublicManifestIndex();
+                const invalid = this.store.publicManifestIndexInvalidIds();
+                const out = [];
+                for (const id of invalid) {
+                    const errors = this.publicStore.getDiagnostics(id) ??
+                        [{ field: "$file", message: "manifest file not found" }];
+                    out.push({ id, errors });
+                }
+                return out;
+            }
+            catch {
+                /* index unavailable — fall through to the authoritative full walk */
+            }
+        }
         return this.publicStore.listWithErrors().errors;
-    }
-    /**
+    } /**
      * Canonical provenance is the committed public manifest (ADR-009) — that is
      * what survives a fresh clone and what the Action/App consume. The private
      * store only enriches those entries with the local prompt; store-only
@@ -976,8 +995,13 @@ export class Drift {
      *
      * `byCommit` (commit → referenced ids, deduplicated) is still exposed for
      * consumers that map a commit to its intents (blame, context).
+     *
+     * When `onlyIds` is given, refs are collected for those ids only — bounded
+     * memory for commands that need associations for a candidate set (log,
+     * context). Absent ids are simply not in the returned map, matching the
+     * full scan (callers treat absence as `missing`).
      */
-    intentCommitIndex() {
+    intentCommitIndex(onlyIds) {
         const byId = new Map();
         const byCommit = new Map();
         const duplicateInCommit = new Map();
@@ -991,7 +1015,10 @@ export class Drift {
             const ids = extractDriftIntentIds(body);
             if (ids.length === 0 && raw.length === 0)
                 continue;
-            const distinct = [...new Set(raw)];
+            const distinctAll = [...new Set(raw)];
+            const distinct = onlyIds ? distinctAll.filter((x) => onlyIds.has(x)) : distinctAll;
+            if (distinct.length === 0)
+                continue;
             byCommit.set(sha, distinct);
             for (const id of distinct) {
                 const list = refs.get(id) ?? [];
@@ -1034,6 +1061,143 @@ export class Drift {
             }
         }
         return { byId, byCommit };
+    }
+    /**
+     * Bounded-memory provenance merge shared by `log` and `context` (PRD §7).
+     * Selects the top-L candidates from each source — the stat-validated index
+     * (or a bounded heap when no private store exists) for public manifests,
+     * SQL LIMIT for the private store — then merges exactly like the old full
+     * scan (prompt enrichment by id, store-only legacy entries kept) and
+     * resolves trailer associations for the candidate set only.
+     *
+     * Correctness: the union's top-L by timestamp is exactly the merge of each
+     * source's top-L (any member of the union's top-L is within its own
+     * source's top-L), so results are identical to a full scan while memory
+     * stays O(L). Malformed manifests are never selected here (valid=1 / the
+     * heap skips them); they are surfaced by status/doctor, which always
+     * re-read and re-verify every file.
+     */
+    mergeBounded(opts) {
+        const L = safeClamp(opts.limit, 100);
+        let publicIds = [];
+        const heapFallback = () => this.publicStore
+            .topNewest(L, {
+            filePrefix: opts.file,
+            fileExact: opts.fileExact,
+            author: opts.author,
+            model: opts.model,
+        })
+            .map((v) => v.id);
+        if (this.store) {
+            try {
+                this.refreshPublicManifestIndex();
+                publicIds = this.store.topPublicManifestIds(L, {
+                    file: opts.file ?? opts.fileExact,
+                    fileExact: opts.fileExact !== undefined,
+                    author: opts.author,
+                    model: opts.model,
+                });
+            }
+            catch {
+                // Index write unavailable (read-only FS / transient SQLite error):
+                // degrade to the in-memory bounded selection. Trust is unaffected —
+                // the index is never a trust source.
+                publicIds = heapFallback();
+            }
+        }
+        else {
+            publicIds = heapFallback();
+        }
+        let storeEntries = [];
+        if (this.store) {
+            storeEntries =
+                opts.fileExact !== undefined
+                    ? this.store.contextForFile(opts.fileExact, L)
+                    : this.store.listIntents({ author: opts.author, model: opts.model, file: opts.file, limit: L });
+        }
+        const mergedIds = new Set([...publicIds, ...storeEntries.map((e) => e.id)]);
+        const { byId: associations } = this.intentCommitIndex(mergedIds);
+        const byId = new Map();
+        for (const id of publicIds) {
+            // Re-read the actual file (never the cache) — the index only selects.
+            const view = this.publicStore.getById(id);
+            if (!view)
+                continue; // stale index row; status/doctor re-verify the tree
+            const assoc = associations.get(id);
+            const gitSha = this.commitFor(id, associations) ||
+                (view.schemaVersion === 1 && !assoc ? view.commit : null) ||
+                "";
+            byId.set(id, publicViewToLogEntry(view, gitSha, assoc));
+        }
+        for (const e of storeEntries) {
+            const existing = byId.get(e.id);
+            if (existing) {
+                existing.prompt = this.decryptText(e.prompt, e.id);
+                existing.summary = existing.summary || this.summaryFor(e.id, existing.prompt);
+            }
+            else {
+                const prompt = this.decryptText(e.prompt, e.id);
+                byId.set(e.id, { ...e, prompt, summary: this.summaryFor(e.id, prompt) });
+            }
+        }
+        return [...byId.values()].sort((a, b) => b.timestamp - a.timestamp).slice(0, L);
+    }
+    /**
+     * Stat-validated refresh of the public-manifest index (PRD §7). Walks the
+     * intents directory; files whose (mtime, size, ctime) match the cached row
+     * are kept without re-parsing; only new/changed files are strictly
+     * re-parsed. The index is selection metadata only — every trust decision
+     * re-reads the actual manifest file, so a stale or poisoned index can never
+     * alter trust states (status/doctor always re-verify the full tree).
+     */
+    refreshPublicManifestIndex() {
+        if (!this.store)
+            return;
+        const store = this.store;
+        if (store.getMeta("public_index_version") !== PUBLIC_MANIFEST_INDEX_VERSION) {
+            store.dropAllPublicManifestIndex();
+            store.setMeta("public_index_version", PUBLIC_MANIFEST_INDEX_VERSION);
+        }
+        const dir = join(this.driftDir, PUBLIC_INTENTS_DIR);
+        if (!existsSync(dir)) {
+            store.dropAllPublicManifestIndex();
+            return;
+        }
+        const seen = new Set();
+        store.publicManifestIndexBatch(() => {
+            for (const name of readdirSync(dir)) {
+                if (!name.endsWith(".json"))
+                    continue;
+                const id = name.slice(0, -".json".length);
+                if (!DRIFT_INTENT_ID_RE.test(id))
+                    continue;
+                seen.add(id);
+                let st;
+                try {
+                    st = statSync(join(dir, name));
+                }
+                catch {
+                    continue; // vanished mid-walk; dropPublicManifestMissing prunes it
+                }
+                if (st.size > MANIFEST_MAX_BYTES) {
+                    // Oversized: never parse (bounded input); record invalid so it is
+                    // never selected — status/doctor surface it as a diagnostic.
+                    store.upsertPublicManifest(id, st, 0, false, null, null, []);
+                    continue;
+                }
+                if (store.publicManifestRowMatches(id, st))
+                    continue;
+                const result = this.publicStore.parseFor(id);
+                if (result.ok) {
+                    const v = result.value;
+                    store.upsertPublicManifest(id, st, v.timestamp, true, v.agent?.identifier ?? "unknown", v.model ?? null, (v.files ?? []).map((f) => f.path));
+                }
+                else {
+                    store.upsertPublicManifest(id, st, 0, false, null, null, []);
+                }
+            }
+            store.dropPublicManifestMissing(seen);
+        });
     }
     /** Structured association for one intent id (unique/missing/duplicate-in-commit/ambiguous/replayed). */
     intentCommitAssociation(id) {
@@ -1301,9 +1465,9 @@ export class Drift {
         if (!isInsideRepo(this.repoRoot, file)) {
             throw new DriftError(`Path escapes the repository root: ${filePath}`);
         }
-        const entries = this.mergeIntents().filter((e) => e.files.some((f) => f.path === relative));
-        entries.sort((a, b) => b.timestamp - a.timestamp);
-        return entries.slice(0, safeClamp(limit, 5));
+        // Bounded: exact-file selection from the index / heap + SQL LIMIT, never
+        // a walk of every manifest.
+        return this.mergeBounded({ limit: safeClamp(limit, 5), fileExact: relative });
     }
     // ---------------------------------------------------------------- verify
     /**

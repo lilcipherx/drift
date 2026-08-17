@@ -306,6 +306,12 @@ export declare class Drift {
      *                                  along in the whole-index commit.
      */
     private stagePublicFiles;
+    /**
+     * Bounded `log` (PRD §7): never walks or parses every manifest. Selects the
+     * top-L candidates from the stat-validated index (or a bounded heap on a
+     * fresh clone), re-reads only those manifest files, and resolves trailer
+     * associations for the candidate set only — memory O(limit), not O(repo).
+     */
     log(filters?: {
         author?: string;
         model?: string;
@@ -315,13 +321,16 @@ export declare class Drift {
     /**
      * Tracked manifests that fail strict schema validation. Consumers render
      * only valid manifests; this surfaces the rest as an actionable diagnostic
-     * (never a crash, never a silent "valid").
+     * (never a crash, never a silent "valid"). Fast path: the stat-validated
+     * index knows which files are invalid, so only those files are re-read for
+     * the diagnostics (bounded); falls back to a full walk when no index exists
+     * (fresh clone) or the index is unavailable. Malformed manifests are always
+     * re-verified from the FILE here — the index is never a trust source.
      */
     publicManifestDiagnostics(): {
         id: string;
         errors: ManifestValidationError[];
-    }[];
-    /**
+    }[]; /**
      * Canonical provenance is the committed public manifest (ADR-009) — that is
      * what survives a fresh clone and what the Action/App consume. The private
      * store only enriches those entries with the local prompt; store-only
@@ -342,8 +351,38 @@ export declare class Drift {
      *
      * `byCommit` (commit → referenced ids, deduplicated) is still exposed for
      * consumers that map a commit to its intents (blame, context).
+     *
+     * When `onlyIds` is given, refs are collected for those ids only — bounded
+     * memory for commands that need associations for a candidate set (log,
+     * context). Absent ids are simply not in the returned map, matching the
+     * full scan (callers treat absence as `missing`).
      */
     private intentCommitIndex;
+    /**
+     * Bounded-memory provenance merge shared by `log` and `context` (PRD §7).
+     * Selects the top-L candidates from each source — the stat-validated index
+     * (or a bounded heap when no private store exists) for public manifests,
+     * SQL LIMIT for the private store — then merges exactly like the old full
+     * scan (prompt enrichment by id, store-only legacy entries kept) and
+     * resolves trailer associations for the candidate set only.
+     *
+     * Correctness: the union's top-L by timestamp is exactly the merge of each
+     * source's top-L (any member of the union's top-L is within its own
+     * source's top-L), so results are identical to a full scan while memory
+     * stays O(L). Malformed manifests are never selected here (valid=1 / the
+     * heap skips them); they are surfaced by status/doctor, which always
+     * re-read and re-verify every file.
+     */
+    private mergeBounded;
+    /**
+     * Stat-validated refresh of the public-manifest index (PRD §7). Walks the
+     * intents directory; files whose (mtime, size, ctime) match the cached row
+     * are kept without re-parsing; only new/changed files are strictly
+     * re-parsed. The index is selection metadata only — every trust decision
+     * re-reads the actual manifest file, so a stale or poisoned index can never
+     * alter trust states (status/doctor always re-verify the full tree).
+     */
+    private refreshPublicManifestIndex;
     /** Structured association for one intent id (unique/missing/duplicate-in-commit/ambiguous/replayed). */
     intentCommitAssociation(id: string): IntentCommitAssociation;
     /**

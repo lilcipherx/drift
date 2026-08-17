@@ -592,11 +592,63 @@ export class PublicStore {
     return result.ok ? null : result.errors;
   }
 
-  /** Parse one manifest strictly (id must match its filename). */
-  private parseFor(id: string): ManifestParseResult {
+  /**
+   * Parse one manifest strictly (id must match its filename). Public so the
+   * engine's stat-validated index refresh can re-parse only changed files
+   * (PRD §7 — bounded commands must not re-parse every manifest on every run).
+   */
+  parseFor(id: string): ManifestParseResult {
     const path = this.manifestPath(id);
     if (!existsSync(path)) return { ok: false, errors: [{ field: "$file", message: "manifest file not found" }] };
     return parseManifestFileFor(id, path);
+  }
+
+  /**
+   * Bounded-memory top-N selection (fresh-clone fallback when no private
+   * store exists to host the stat-validated index): walks the intents
+   * directory once but keeps only the newest `limit` VALID manifests,
+   * never materializing the full tree. Same filtering semantics as
+   * `topPublicManifestIds` (file prefix for `log --file`, exact for
+   * `context`, plus author/model). Malformed manifests are excluded here and
+   * surfaced by status/doctor, which re-read every file.
+   */
+  topNewest(
+    limit: number,
+    filters: { filePrefix?: string; fileExact?: string; author?: string; model?: string } = {},
+  ): PublicIntentView[] {
+    const dir = join(this.driftDir, PUBLIC_INTENTS_DIR);
+    if (!existsSync(dir)) return [];
+    const L = Math.max(1, Math.min(Number.isFinite(limit) ? Math.floor(limit) : 100, 1_000));
+    // Descending by timestamp, STABLE for equal timestamps (matches list()'s
+    // readdir-order tie behavior) so bounded and full scans select the same
+    // set. Binary-insert keeps the window sorted without O(L log L) re-sorts.
+    const kept: PublicIntentView[] = [];
+    const insert = (v: PublicIntentView) => {
+      let lo = 0;
+      let hi = kept.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (kept[mid]!.timestamp < v.timestamp) hi = mid; // strictly older goes after
+        else lo = mid + 1;
+      }
+      kept.splice(lo, 0, v);
+      if (kept.length > L) kept.length = L; // drop the oldest (tail)
+    };
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.slice(0, -".json".length);
+      if (!INTENT_ID_RE.test(id)) continue;
+      const result = this.parseFor(id);
+      if (!result.ok) continue;
+      const v = result.value;
+      if (filters.author !== undefined && (v.agent?.identifier ?? "unknown") !== filters.author) continue;
+      if (filters.model !== undefined && (v.model ?? null) !== filters.model) continue;
+      const files = (v.files ?? []).map((f) => f.path);
+      if (filters.filePrefix !== undefined && !files.some((p) => p.startsWith(filters.filePrefix!))) continue;
+      if (filters.fileExact !== undefined && !files.some((p) => p === filters.fileExact)) continue;
+      insert(v);
+    }
+    return kept;
   }
 
   /**

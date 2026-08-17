@@ -182,8 +182,27 @@ export declare class PublicStore {
      * or be reported as valid).
      */
     getDiagnostics(id: string): ManifestValidationError[] | null;
-    /** Parse one manifest strictly (id must match its filename). */
-    private parseFor;
+    /**
+     * Parse one manifest strictly (id must match its filename). Public so the
+     * engine's stat-validated index refresh can re-parse only changed files
+     * (PRD §7 — bounded commands must not re-parse every manifest on every run).
+     */
+    parseFor(id: string): ManifestParseResult;
+    /**
+     * Bounded-memory top-N selection (fresh-clone fallback when no private
+     * store exists to host the stat-validated index): walks the intents
+     * directory once but keeps only the newest `limit` VALID manifests,
+     * never materializing the full tree. Same filtering semantics as
+     * `topPublicManifestIds` (file prefix for `log --file`, exact for
+     * `context`, plus author/model). Malformed manifests are excluded here and
+     * surfaced by status/doctor, which re-read every file.
+     */
+    topNewest(limit: number, filters?: {
+        filePrefix?: string;
+        fileExact?: string;
+        author?: string;
+        model?: string;
+    }): PublicIntentView[];
     /**
      * Every VALID manifest, newest first (timestamp desc). Malformed manifests
      * are excluded from rendering but surfaced through `listWithErrors` so
