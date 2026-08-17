@@ -21,6 +21,29 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Portable npm CLI resolution. `npm` is a shell shim on Windows and a symlink
+ * elsewhere; the hosted-runners' node layouts differ (bin/node_modules/npm vs
+ * lib/node_modules/npm). Try the known layouts, then fall back to spawning
+ * `npm` through a shell.
+ */
+function npmCliPath() {
+  const candidates = [
+    join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+    join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+function runNpm(args, opts = {}) {
+  const cli = npmCliPath();
+  if (cli) return execFileSync(process.execPath, [cli, ...args], opts);
+  return execFileSync("npm", args, { ...opts, shell: true });
+}
 const args = process.argv.slice(2);
 const runSecrets = args.includes("--secrets") || args.length === 0;
 const runLicenses = args.includes("--licenses") || args.length === 0;
@@ -164,8 +187,7 @@ if (runPackages) {
   try {
     for (const pkg of ["drift-ast", "drift-core", "drift-cli", "drift-mcp", "drift-app"]) {
       const dir = join(ROOT, "packages", pkg);
-      const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-      const tarball = execFileSync(process.execPath, [npmCli, "pack", "--pack-destination", tmp, "--json"], {
+      const tarball = runNpm(["pack", "--pack-destination", tmp, "--json"], {
         cwd: dir,
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
@@ -214,10 +236,8 @@ if (runPackages) {
 // ---------------------------------------------------------------------------
 if (sbomOut) {
   console.error(`[security-checks] generating SPDX SBOM → ${sbomOut}`);
-  // npm is a shell shim on Windows — invoke the CLI JS directly.
-  const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
   try {
-    const sbom = execFileSync(process.execPath, [npmCli, "sbom", "--sbom-format", "spdx"], { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const sbom = runNpm(["sbom", "--sbom-format", "spdx"], { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     const parsed = JSON.parse(sbom);
     if (parsed.spdxVersion !== "SPDX-2.3") fail(`unexpected SPDX version: ${parsed.spdxVersion}`);
     const pkgs = parsed.packages ?? [];
