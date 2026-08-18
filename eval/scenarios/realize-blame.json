@@ -5,7 +5,8 @@
     {
       "tool": "drift_realize",
       "input": {
-        "prompt": "Fix race condition in token refresh",
+        "prompt": "Fix the race condition in token refresh by de-duplicating in-flight refreshes; rotate the vault key in the background.",
+        "summary": "Fix race condition in token refresh",
         "files": ["src/auth.ts"],
         "model": "claude-3-5-sonnet"
       },

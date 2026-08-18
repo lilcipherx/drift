@@ -1,0 +1,45 @@
+{
+  "scenario": {
+    "uniqueJobs": 3000,
+    "duplicateDeliveries": 499,
+    "transientRate": 0.02,
+    "concurrency": 16,
+    "machine": "win32 x64"
+  },
+  "drainMs": 11764,
+  "throughputPerSec": 212.6,
+  "queue": {
+    "pending": 0,
+    "done": 2501,
+    "dead": 0
+  },
+  "metrics": {
+    "auditMs": {
+      "count": 2541,
+      "p50": 64,
+      "p95": 128,
+      "p99": 128,
+      "max": 94,
+      "mean": 56.71231798504526
+    },
+    "queueDepth": {
+      "max": 0,
+      "last": 0
+    },
+    "jobs": {
+      "acked": 2501,
+      "retried": 40,
+      "permanent": 0,
+      "deadLettered": 0,
+      "nackFailed": 0
+    }
+  },
+  "asserts": {
+    "allDrained": true,
+    "doneMatchesUnique": true,
+    "zeroDeadLetters": true,
+    "zeroNackFailures": true,
+    "retriesAbsorbed": true
+  },
+  "pass": true
+}

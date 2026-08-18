@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 2,
+  "id": "did_6bb505af2d826c8ecf922f28e6f64e01",
+  "summary": "Fix race condition in token refresh",
+  "model": "claude-3-5-sonnet",
+  "agent": {
+    "type": "AGENT",
+    "identifier": "Drift Demo"
+  },
+  "files": [
+    {
+      "path": "src/auth.ts",
+      "mutationType": "MOVED",
+      "summary": "function \"verifyToken\" moved from line 6 to 8"
+    },
+    {
+      "path": "src/auth.ts",
+      "mutationType": "ADDED",
+      "summary": "function \"refreshToken\" added (line 12)"
+    }
+  ],
+  "timestamp": 1786879991635,
+  "signingKeyId": "89031c64758b09f8",
+  "signature": "lAQ6DBkqUf/iEE010LEgf2IzAdTgCDNXYWaWjH2zJ2uomklMXIwcQFwFdAhkTLJmhaO4Brz5FLJKLOlVFePyCQ=="
+}

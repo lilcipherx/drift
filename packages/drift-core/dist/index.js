@@ -1,4 +1,8 @@
-export { Drift } from "./engine.js";
+export { Drift, ensureDriftGitignore, sanitizedVerifyEnv, VERIFY_ENV_ALLOWLIST } from "./engine.js";
+export { PublicStore, buildPublicSummary, genericPublicSummary, parsePublicIntentManifest, readManifestFile, sanitizePublicText, signingKeyIdFor, signingKeyIdForValidKey, INTENT_ID_RE, MANIFEST_FILES_MAX, MANIFEST_MAX_BYTES, MANIFEST_SUMMARY_MAX, PUBLIC_FILES_MAX, PUBLIC_SUMMARY_MAX, } from "./public.js";
+export { DRIFT_INTENT_ID_RE, extractDriftIntentIds, extractDriftIntentIdsRaw, parseGitTrailers, } from "./trailers.js";
+export { TRUST_ROOT_MAX_BYTES, evaluateTrustRootChange, isUsableTrustRoot, parseTrustRoot, tryParseTrustRoot, } from "./trust-root.js";
+export { KEYRING_MAX_BYTES, KEYRING_PATH, applyKeyringChange, createKeyring, evaluateKeyringChange, findKeyringEntry, keyringFingerprint, keyringPath, keyringPayload, loadTrustSet, parseKeyringKey, validateKeyring, writeKeyringFile, } from "./keyring.js";
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export { ENCRYPTION_MARKER, canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";
 export { DEFAULT_CONFIG, loadConfig, parseToml } from "./config.js";

@@ -1,1 +1,6 @@
-keys/
+# Drift private state — never commit
+*
+!.gitignore
+!config.toml
+!public/
+!public/**

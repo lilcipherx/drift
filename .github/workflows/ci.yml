@@ -4,27 +4,65 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Least privilege: CI only reads the repository. No write tokens are granted.
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  test:
-    name: test (${{ matrix.os }}, node ${{ matrix.node }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
-    steps:
-      - uses: actions/checkout@v4
+# ---------------------------------------------------------------------------
+# Trust boundary (docs/SELF_HOSTED_ARM64_AUDIT.md, scripts/ci-trust-policy.mjs):
+#
+# The `test-linux-arm64` job runs on a PERSISTENT self-hosted Oracle Cloud
+# runner (Ubuntu 24.04, ARM64, 2 OCPU / 12 GB). Persistent runners are not
+# ephemeral, so untrusted code must never execute there. A same-repository
+# condition alone is NOT sufficient: Dependabot / Renovate / other bot PRs and
+# untrusted author associations would slip through. The gate therefore allows:
+#   - push to trusted protected branches;
+#   - workflow_dispatch (requires write access to dispatch);
+#   - same-repository pull_request authored by a real User (not a bot) whose
+#     author_association is OWNER | MEMBER | COLLABORATOR and whose login is
+#     not a known bot.
+# Everything else (external forks, Dependabot, other bots, untrusted same-repo
+# PRs) runs the IDENTICAL validation on an ephemeral GitHub-hosted Linux
+# runner (`test-linux-untrusted`), so dependency PRs never silently skip
+# validation. Windows coverage stays on GitHub-hosted runners. `pull_request_target`
+# is NEVER used to execute untrusted code.
+# ---------------------------------------------------------------------------
 
-      - uses: actions/setup-node@v4
+jobs:
+  test-linux-arm64:
+    name: test (Linux ARM64, node 24)
+    runs-on: [self-hosted, Linux, ARM64]
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User' &&
+       (github.event.pull_request.author_association == 'OWNER' ||
+        github.event.pull_request.author_association == 'MEMBER' ||
+        github.event.pull_request.author_association == 'COLLABORATOR') &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.event.pull_request.user.login != 'renovate[bot]' &&
+       github.event.pull_request.user.login != 'github-actions[bot]')
+    timeout-minutes: 30
+    steps:
+      # checkout/setup-node v7 run on the Node 24 action runtime (Node 20 was
+      # deprecated on GitHub Actions in 2026) and support linux-arm64.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          node-version: ${{ matrix.node }}
-          cache: npm
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          # No `cache: npm` here on purpose: the npm cache key does not include
+          # the CPU architecture, so an ARM64 job must not write (or restore) a
+          # cache that a later x64 job could consume. `npm ci` on this pure-JS
+          # toolchain is fast enough without caching.
 
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
@@ -32,7 +70,7 @@ jobs:
       - name: Build + typecheck (tsc -b)
         run: npm run build
 
-      - name: Run the full test suite
+      - name: Run the full test suite (incl. storage-privacy + fresh-clone)
         run: npm test
 
       - name: Eval harness regression gate
@@ -60,3 +98,296 @@ jobs:
           test -x node_modules/.bin/drift
           test -x node_modules/.bin/drift-mcp
           node_modules/.bin/drift version
+
+      - name: Docs-command test (every documented command runs)
+        shell: bash
+        run: node scripts/docs-commands-test.mjs
+
+  # Untrusted-PR fallback: identical validation on an ephemeral GitHub-hosted
+  # runner so external forks, Dependabot and other bot PRs, and untrusted
+  # same-repo author associations still get full CI. Never runs on the
+  # persistent self-hosted machine. This is the exact De Morgan negation of
+  # the ARM64 gate (scripts/ci-trust-policy.mjs).
+  test-linux-untrusted:
+    name: test (Linux x64, node 24, untrusted PR)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.pull_request.head.repo.full_name != github.repository ||
+       github.event.pull_request.user.type != 'User' ||
+       (github.event.pull_request.author_association != 'OWNER' &&
+        github.event.pull_request.author_association != 'MEMBER' &&
+        github.event.pull_request.author_association != 'COLLABORATOR') ||
+       github.event.pull_request.user.login == 'dependabot[bot]' ||
+       github.event.pull_request.user.login == 'renovate[bot]' ||
+       github.event.pull_request.user.login == 'github-actions[bot]')
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Run the full test suite (incl. storage-privacy + fresh-clone)
+        run: npm test
+
+      - name: Eval harness regression gate
+        run: npm run eval
+
+      - name: MVS acceptance (PRD §4.2)
+        shell: bash
+        run: bash scripts/acceptance-mvs.sh
+
+      - name: Package smoke test (npm pack chain, no registry)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          for p in drift-ast drift-core drift-cli drift-mcp; do
+            (cd "packages/$p" && npm pack --pack-destination "$tmp" >/dev/null)
+          done
+          mkdir -p "$tmp/app" && cd "$tmp/app"
+          npm init -y >/dev/null
+          npm install \
+            "$tmp"/drift-ast-*.tgz \
+            "$tmp"/drift-core-*.tgz \
+            "$tmp"/drift-cli-*.tgz \
+            "$tmp"/drift-mcp-*.tgz >/dev/null
+          test -x node_modules/.bin/drift
+          test -x node_modules/.bin/drift-mcp
+          node_modules/.bin/drift version
+
+      - name: Docs-command test (every documented command runs)
+        shell: bash
+        run: node scripts/docs-commands-test.mjs
+
+  # Stable aggregate gate for branch protection: exactly ONE of the two Linux
+  # routing jobs must have run (the other must have been skipped), proving the
+  # trust boundary routed the event correctly. Runs on GitHub-hosted
+  # infrastructure and NEVER checks out or executes PR code.
+  test-linux:
+    name: test-linux (aggregate gate)
+    runs-on: ubuntu-latest
+    needs: [test-linux-arm64, test-linux-untrusted]
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Verify exactly one Linux job ran and one was skipped
+        shell: bash
+        run: |
+          set -euo pipefail
+          arm64="${{ needs.test-linux-arm64.result }}"
+          hosted="${{ needs.test-linux-untrusted.result }}"
+          ran=0
+          skipped=0
+          for r in "$arm64" "$hosted"; do
+            case "$r" in
+              success) ran=$((ran + 1)) ;;
+              skipped) skipped=$((skipped + 1)) ;;
+              *) ;;
+            esac
+          done
+          echo "arm64=$arm64 hosted=$hosted"
+          if [ "$ran" -ne 1 ] || [ "$skipped" -ne 1 ]; then
+            echo "::error::Linux routing is broken: expected exactly one success and one skip (arm64=$arm64, hosted=$hosted)"
+            exit 1
+          fi
+          echo "Linux trust-boundary routing verified: exactly one job ran, one was skipped."
+
+  # Windows coverage stays on GitHub-hosted runners: the project has no
+  # Windows self-hosted runner, and ephemeral hosted runners are safe for
+  # untrusted fork code (the exact opposite of the persistent ARM64 box).
+  test-windows:
+    name: test (Windows, node 24)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Run the full test suite (incl. storage-privacy + fresh-clone)
+        run: npm test
+
+      - name: Eval harness regression gate
+        run: npm run eval
+
+      - name: MVS acceptance (PRD §4.2)
+        shell: bash
+        run: bash scripts/acceptance-mvs.sh
+
+      - name: Package smoke test (npm pack chain, no registry)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          for p in drift-ast drift-core drift-cli drift-mcp; do
+            (cd "packages/$p" && npm pack --pack-destination "$tmp" >/dev/null)
+          done
+          mkdir -p "$tmp/app" && cd "$tmp/app"
+          npm init -y >/dev/null
+          npm install \
+            "$tmp"/drift-ast-*.tgz \
+            "$tmp"/drift-core-*.tgz \
+            "$tmp"/drift-cli-*.tgz \
+            "$tmp"/drift-mcp-*.tgz >/dev/null
+          test -x node_modules/.bin/drift
+          test -x node_modules/.bin/drift-mcp
+          node_modules/.bin/drift version
+
+      - name: Docs-command test (every documented command runs)
+        shell: bash
+        run: node scripts/docs-commands-test.mjs
+
+  # Production distributed-queue gate: the FULL queue test suite, e2e fault
+  # scenarios (incl. the multi-instance scenario), and the worker soak run
+  # against a REAL shared Postgres database (service container). This is the
+  # evidence that the Postgres adapter provides the same semantics as SQLite
+  # plus horizontal scaling (claim/lease/retry/idempotency/dead-letter across
+  # multiple replicas).
+  queue-postgres:
+    name: queue (Postgres 16, node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: drift
+          POSTGRES_PASSWORD: drift-test
+          POSTGRES_DB: drift_queue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U drift -d drift_queue"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DRIFT_TEST_PG_URL: postgres://drift:drift-test@127.0.0.1:5432/drift_queue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Full test suite against Postgres (queue + app + core)
+        run: npm test
+
+      - name: E2E fault scenarios over Postgres (incl. multi-instance)
+        run: node scripts/bench-app-e2e.mjs --scenario all --pg "$DRIFT_TEST_PG_URL" --json
+
+      - name: Worker soak over Postgres (multi-worker, retries, 0 dead letters)
+        run: node scripts/soak-app.mjs --jobs 5000 --pg "$DRIFT_TEST_PG_URL" --json
+
+      - name: Multi-process worker benchmark (real processes, exactly-once, crash + tenant isolation)
+        run: node scripts/bench-workers-multiprocess.mjs --pg "$DRIFT_TEST_PG_URL" --workers 5 --jobs 2000 --tenants 8 --kill --faults 40 --json
+
+  # Performance evidence (PRD §6/§7): large-repo CLI benchmark + App intake
+  # load + worker soak. Runs ONLY on trusted protected-branch pushes to the
+  # self-hosted ARM64 runner (never on PRs/forks). Generates fresh artifacts
+  # that docs/PERFORMANCE_REPORT.md and docs/SLOS.md reference; the job fails
+  # if a benchmark regresses past the documented SLOs.
+  benchmark:
+    name: benchmark (large-repo + app intake + e2e + soak)
+    runs-on: [self-hosted, Linux, ARM64]
+    # Protected-branch pushes run automatically; workflow_dispatch lets a
+    # maintainer re-run the full benchmark suite on any SHA (the trust gate
+    # for dispatch is write access, the same level as a protected push).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build + typecheck (tsc -b)
+        run: npm run build
+
+      - name: Large-repo CLI benchmark (20k commits / manifests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/bench-large-repo.mjs --commits 20000 --json > /tmp/bench-large-20k.json
+          node -e '
+            const j = require("/tmp/bench-large-20k.json");
+            const m = Object.fromEntries(j.engineMeasurements.map((x) => [x.label, x.wallMsMs]));
+            console.log(JSON.stringify(m, null, 1));
+            // SLO regression gate (docs/SLOS.md): warm log --limit 20 must stay
+            // well under the 5 s SLO on this hardware.
+            const warm = m["log --limit 20 (warm)"] ?? Infinity;
+            if (warm > 5000) { console.error("SLO regression: warm log --limit 20 = " + warm + " ms"); process.exit(1); }
+            const verify = m["verify-intent"] ?? Infinity;
+            if (verify > 200) { console.error("SLO regression: verify-intent = " + verify + " ms"); process.exit(1); }
+          '
+
+      - name: Large-repo CLI benchmark (100k manifests, cold path must not blow up)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/bench-large-repo.mjs --commits 2000 --manifests 100000 --json > /tmp/bench-large-100k.json
+          node -e '
+            const j = require("/tmp/bench-large-100k.json");
+            const m = Object.fromEntries(j.engineMeasurements.map((x) => [x.label, x.wallMsMs]));
+            const idx = j.indexStats;
+            console.log(JSON.stringify({ manifests: j.scenario.manifests, warmLogMs: m["log --limit 20 (warm)"], coldLogMs: m["log --limit 20 (cold, index build)"], indexRows: idx.rows, validRows: idx.validRows }, null, 1));
+            if (idx.rows !== 100000) { console.error("index did not reach 100000 rows: " + idx.rows); process.exit(1); }
+            const warm = m["log --limit 20 (warm)"] ?? Infinity;
+            if (warm > 5000) { console.error("SLO regression: 100k warm log --limit 20 = " + warm + " ms"); process.exit(1); }
+          '
+
+      - name: App webhook intake load benchmark
+        shell: bash
+        run: |
+          node scripts/bench-app-intake.mjs --deliveries 2000 --json
+
+      - name: App end-to-end benchmark (fault injection, exactly-once, crash recovery)
+        shell: bash
+        run: |
+          node scripts/bench-app-e2e.mjs --json
+
+      - name: Worker soak (2% transient failures, duplicates, 0 data loss)
+        shell: bash
+        run: |
+          node scripts/soak-app.mjs --jobs 3000 --json

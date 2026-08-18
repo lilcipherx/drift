@@ -1,0 +1,88 @@
+{
+  "scenario": {
+    "commits": 2000,
+    "manifests": 100000,
+    "malformedRate": 0.02,
+    "generator": "git fast-import",
+    "machine": "win32 x64"
+  },
+  "engineMeasurements": [
+    {
+      "label": "status",
+      "wallMsMs": 51708.48,
+      "heapDeltaMB": 166.31,
+      "result": true
+    },
+    {
+      "label": "log --limit 20 (cold, index build)",
+      "wallMsMs": 3068.58,
+      "heapDeltaMB": 28.08,
+      "result": 20
+    },
+    {
+      "label": "log --limit 20 (warm)",
+      "wallMsMs": 2951.47,
+      "heapDeltaMB": 29.2,
+      "result": 20
+    },
+    {
+      "label": "context (warm)",
+      "wallMsMs": 3082,
+      "heapDeltaMB": -186.06,
+      "result": 5
+    },
+    {
+      "label": "blame",
+      "wallMsMs": 244.13,
+      "heapDeltaMB": 27.81,
+      "result": true
+    },
+    {
+      "label": "verify-intent",
+      "wallMsMs": 1.27,
+      "heapDeltaMB": 0.06,
+      "result": "invalid"
+    },
+    {
+      "label": "doctor",
+      "wallMsMs": 34216.51,
+      "heapDeltaMB": 36.85,
+      "result": 10
+    },
+    {
+      "label": "export",
+      "wallMsMs": 16848.14,
+      "heapDeltaMB": 71.69,
+      "result": true
+    },
+    {
+      "label": "intentAssociations",
+      "wallMsMs": 91.63,
+      "heapDeltaMB": 28.79,
+      "result": 14285
+    }
+  ],
+  "cliMeasurements": [
+    {
+      "label": "status (cli)",
+      "wallMsMs": 23952.13,
+      "exit": 0
+    },
+    {
+      "label": "log --limit 20 (cli)",
+      "wallMsMs": 7991.05,
+      "exit": 0
+    },
+    {
+      "label": "doctor (cli)",
+      "wallMsMs": 36479.17,
+      "exit": 0
+    }
+  ],
+  "indexStats": {
+    "rows": 100000,
+    "validRows": 98001
+  },
+  "manifestBytes": 544,
+  "repo": "C:/Users/charl/AppData/Local/Temp/drift-bench-repo-I2vwfh/repo"
+}

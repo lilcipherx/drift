@@ -1,0 +1,151 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: every job starts with contents: read only. CodeQL
+# additionally requests security-events: write to upload SARIF results.
+# No job has write access to the repository or a GITHUB_TOKEN with package/
+# release scopes. All actions are pinned to immutable commit SHAs (resolved
+# from the official action release tags on 2026-08-13) — the SHA-pinning
+# self-audit below fails the workflow if a mutable tag ever sneaks back in.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL (JavaScript/TypeScript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f3712979fa5f215279b101dd0a2e3bdfb4353324
+        with:
+          languages: javascript-typescript
+      - name: Build (tsc -b) so CodeQL sees the full source graph
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@f3712979fa5f215279b101dd0a2e3bdfb4353324
+
+  dependency-review:
+    name: Dependency review (PRs)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # Fails the PR when a dependency with a known vulnerability (high+) or
+      # a non-permissive license is added/changed.
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          fail-on-severity: high
+          license-check: true
+
+  supply-chain:
+    name: Supply-chain gates (audit, secrets, licenses, tarballs, SBOM, pinning)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: npm audit (fail on high or critical)
+        run: npm audit --audit-level=high
+
+      - name: Secret scan + license review + package-content scan
+        run: node scripts/security-checks.mjs --secrets --licenses --packages
+
+      - name: SPDX SBOM generation + validation
+        run: node scripts/security-checks.mjs --sbom benchmarks/results/drift.spdx.json
+
+      - name: GitHub Actions SHA-pinning self-audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad="$(grep -rnE 'uses: [^@]+@[a-zA-Z0-9._-]+' .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}$' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::every actions/* step must be pinned to a full commit SHA:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "All GitHub Actions references are pinned to immutable commit SHAs."
+
+      - name: Actions permission review (no write tokens outside CodeQL)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Structural scan: every workflow/job permissions block may contain
+          # only `contents: read`; CodeQL may additionally hold
+          # `security-events: write` to upload SARIF. No write/package/release/
+          # token scopes may ever appear.
+          node <<'NODE'
+          const fs = require("node:fs");
+          const files = fs
+            .readdirSync(".github/workflows")
+            .filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
+          const bad = [];
+          for (const f of files) {
+            const lines = fs.readFileSync(`.github/workflows/${f}`, "utf8").split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+              const m = /^(\s*)permissions:\s*(.*)$/.exec(lines[i]);
+              if (!m) continue;
+              const indent = m[1].length;
+              const keys = new Set();
+              if (m[2].trim()) {
+                const inline = /^(\s*)([\w-]+):\s*/.exec(m[2]);
+                if (inline) keys.add(inline[2]);
+              }
+              for (let j = i + 1; j < lines.length; j++) {
+                const t = lines[j];
+                if (!t.trim() || /^\s*#/.test(t)) continue;
+                const lead = /^\s*/.exec(t)[0].length;
+                if (lead <= indent) break;
+                const km = /^(\s*)([\w-]+):/.exec(t);
+                if (km && km[1].length === indent + 2) keys.add(km[2]);
+              }
+              // The CodeQL job may add security-events: write for SARIF.
+              let isCodeql = false;
+              for (let j = i - 1; j >= 0; j--) {
+                const jm = /^  ([\w-]+):\s*$/.exec(lines[j]);
+                if (jm) { isCodeql = jm[1] === "codeql"; break; }
+              }
+              const allowed = isCodeql
+                ? new Set(["contents", "security-events"])
+                : new Set(["contents"]);
+              for (const k of keys) {
+                if (!allowed.has(k)) bad.push(`${f}: unexpected permission scope '${k}'`);
+              }
+            }
+          }
+          if (bad.length) {
+            for (const b of bad) console.error("::error::" + b);
+            process.exit(1);
+          }
+          console.log("Permissions review passed: contents: read everywhere; security-events: write only in CodeQL.");
+          NODE

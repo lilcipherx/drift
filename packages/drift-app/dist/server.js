@@ -1,9 +1,32 @@
 /**
- * HTTP webhook server (PRD §16.3 "drift-app dev"): receives GitHub deliveries
- * on POST /webhook, verifies the HMAC signature, and delegates to the handler.
+ * HTTP webhook server (PRD §16.3): receives GitHub deliveries on POST
+ * /webhook, verifies the HMAC signature over the RAW body, checks
+ * delivery-ID idempotency, parses JSON, and EITHER enqueues the delivery for
+ * the durable worker (production mode, `queue` option) OR processes it
+ * inline (legacy/dev single-process mode when no queue is passed).
+ *
+ * The long GitHub API audit NEVER runs in the webhook request thread when a
+ * queue is configured: the request path is bounded body → HMAC → idempotency
+ * → JSON parse → enqueue → fast 2xx response.
  */
 import { createServer } from "node:http";
-import { handleWebhook } from "./handler.js";
+import { handleWebhook, verifyWebhookSignature } from "./handler.js";
+import { nullLogger } from "./logger.js";
+import { nullMetrics } from "./metrics.js";
+/**
+ * Fail-closed startup: a production webhook endpoint MUST authenticate
+ * deliveries. `DRIFT_APP_INSECURE_DEV_MODE` (exactly "true") is the only
+ * way to run without a secret and it must be explicit and loud.
+ */
+export function assertWebhookAuthConfigured(webhookSecret, insecureDevMode) {
+    if (webhookSecret)
+        return { webhookSecret, insecureDevMode: false };
+    if (insecureDevMode === "true") {
+        console.error("[drift-app] ⚠ DRIFT_APP_INSECURE_DEV_MODE=true — webhook signatures are NOT verified. Local development only; never use in production.");
+        return { webhookSecret: undefined, insecureDevMode: true };
+    }
+    throw new Error("GITHUB_WEBHOOK_SECRET is required: a public webhook endpoint without HMAC verification lets anyone forge pull_request events. For local development only, set DRIFT_APP_INSECURE_DEV_MODE=true explicitly.");
+}
 // GitHub webhook payloads can reach several MB on busy PRs — keep a bounded
 // but realistic cap (8 MB) instead of rejecting legitimate large deliveries.
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -60,6 +83,9 @@ function sendJson(res, status, body) {
 }
 export async function createWebhookServer(opts) {
     const log = opts.log ?? (() => { });
+    const logger = opts.logger ?? nullLogger;
+    const metrics = opts.metrics ?? nullMetrics;
+    const queue = opts.queue;
     const server = createServer(async (req, res) => {
         // Bound slow/abandoned connections so idle sockets never hold the server.
         req.setTimeout(30_000, () => {
@@ -71,8 +97,31 @@ export async function createWebhookServer(opts) {
             res.end(JSON.stringify({ error: "request timeout" }));
             req.destroy();
         });
+        // --- Liveness: the process is up and the HTTP listener accepts. --------
         if (req.method === "GET" && req.url === "/health") {
             sendJson(res, 200, { status: "ok" });
+            return;
+        }
+        // --- Readiness: the queue is reachable and the data dir is writable. ---
+        // Only meaningful in queue mode; inline mode reports ready when alive.
+        if (req.method === "GET" && req.url === "/ready") {
+            if (!queue) {
+                sendJson(res, 200, { status: "ready", mode: "inline" });
+                return;
+            }
+            try {
+                const depth = await queue.depth();
+                sendJson(res, 200, { status: "ready", mode: "queued", queueDepth: depth });
+            }
+            catch (err) {
+                logger.error({
+                    op: "readiness",
+                    result: "not-ready",
+                    errorCode: "queue-unavailable",
+                    msg: err instanceof Error ? err.message : String(err),
+                });
+                sendJson(res, 503, { status: "not-ready", error: "queue unavailable" });
+            }
             return;
         }
         if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== "/webhook") {
@@ -80,14 +129,117 @@ export async function createWebhookServer(opts) {
             return;
         }
         try {
+            const started = Date.now();
             const rawBody = await readBody(req, opts.maxBodyBytes ?? MAX_BODY_BYTES);
+            const signature = req.headers["x-hub-signature-256"];
+            const deliveryId = req.headers["x-github-delivery"] ?? "";
+            // --- Authenticate BEFORE parsing any JSON -----------------------------
+            // Production requires a webhook secret and a valid X-Hub-Signature-256
+            // over the RAW body. Untrusted JSON is never parsed before the HMAC
+            // check passes. Fail closed: missing secret → 403, missing/invalid
+            // signature → 401 (never 200). Only an explicit
+            // DRIFT_APP_INSECURE_DEV_MODE=true allows unsigned requests.
+            const secret = opts.webhookSecret;
+            if (!secret) {
+                if (opts.insecureDevMode !== true) {
+                    logger.error({
+                        deliveryId,
+                        op: "webhook.receive",
+                        result: "rejected",
+                        errorCode: "missing-secret",
+                        msg: "webhook rejected: no webhook secret configured",
+                    });
+                    sendJson(res, 403, {
+                        error: "webhook secret missing — production requires authenticated webhooks (local development: set DRIFT_APP_INSECURE_DEV_MODE=true explicitly)",
+                    });
+                    return;
+                }
+                console.error("[drift-app] ⚠ DRIFT_APP_INSECURE_DEV_MODE=true — webhook signatures are NOT verified. Local development only; never enable this in production.");
+            }
+            else if (!verifyWebhookSignature(rawBody, signature, secret)) {
+                logger.warn({
+                    deliveryId,
+                    op: "webhook.receive",
+                    result: "rejected",
+                    errorCode: "bad-signature",
+                    msg: "webhook rejected: invalid or missing signature",
+                });
+                sendJson(res, 401, { error: "invalid or missing webhook signature" });
+                return;
+            }
+            let payload;
+            try {
+                payload = rawBody ? JSON.parse(rawBody) : {};
+            }
+            catch {
+                sendJson(res, 400, { error: "malformed JSON body" });
+                return;
+            }
+            // --- Delivery-ID idempotency + durable enqueue ------------------------
+            // Queue mode: the audit runs on the worker, never in this thread. The
+            // response is a fast 202 regardless of how long the audit takes.
+            if (queue) {
+                metrics.observeIntake(Date.now() - started);
+                if (!deliveryId) {
+                    logger.warn({
+                        op: "webhook.receive",
+                        result: "rejected",
+                        errorCode: "missing-delivery-id",
+                        msg: "webhook rejected: X-GitHub-Delivery header missing — cannot enforce idempotency",
+                    });
+                    sendJson(res, 400, { error: "missing X-GitHub-Delivery header — required for idempotent processing" });
+                    return;
+                }
+                let enqueued;
+                try {
+                    enqueued = await queue.enqueue(deliveryId, req.headers["x-github-event"] ?? "", rawBody, payload, signature);
+                }
+                catch (err) {
+                    logger.error({
+                        deliveryId,
+                        op: "webhook.enqueue",
+                        result: "failed",
+                        errorCode: "enqueue-failed",
+                        msg: err instanceof Error ? err.message : String(err),
+                    });
+                    sendJson(res, 500, { error: "internal error" });
+                    return;
+                }
+                if (enqueued.accepted) {
+                    metrics.deliveryReceived(deliveryId);
+                    const queueDepth = await queue.depth().catch(() => -1);
+                    logger.info({
+                        deliveryId,
+                        op: "webhook.receive",
+                        durationMs: Date.now() - started,
+                        result: "accepted",
+                        queueDepth,
+                        msg: "delivery enqueued",
+                    });
+                    sendJson(res, 202, { accepted: true, deliveryId, duplicate: false });
+                }
+                else {
+                    metrics.deliveryDeduplicated();
+                    logger.info({
+                        deliveryId,
+                        op: "webhook.receive",
+                        durationMs: Date.now() - started,
+                        result: "deduplicated",
+                        msg: enqueued.alreadyProcessed ? "duplicate delivery — already processed" : "duplicate delivery — already queued",
+                    });
+                    sendJson(res, 202, { accepted: false, deliveryId, duplicate: true, alreadyProcessed: enqueued.alreadyProcessed });
+                }
+                return;
+            }
+            // --- Legacy inline mode (tests, local dev without a queue) -------------
             const event = {
                 event: req.headers["x-github-event"] ?? "",
-                signature: req.headers["x-hub-signature-256"],
-                payload: rawBody ? JSON.parse(rawBody) : {},
+                signature,
+                payload,
                 rawBody,
             };
             const result = await handleWebhook(event, opts);
+            metrics.observeAudit(Date.now() - started);
             log(`[webhook] ${result.action} (${result.intentsFound} intents)${result.error ? ` — ${result.error}` : ""}`);
             // Client-side errors (bad signature, malformed payload) are not
             // retryable — ack with 200 so GitHub stops redelivering. Only transient

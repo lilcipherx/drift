@@ -30,9 +30,13 @@ drift realize -p "<prompt: what and why>" --agent --model <model>
 - Exit 3 means there was nothing to commit (`E_NO_CHANGES`).
 - `--verify-cmd "<cmd>"` records a verification command re-run by `drift verify`.
 - **Prompt storage** is controlled by `[prompts] mode` in `.drift/config.toml`:
-  `commit-summary` (default — full prompt only in local `.drift/`, git commit
-  carries a safe `Intent:`/`Model:`/`Verification:` summary), `full` (prompt
-  also in the commit message), `none` (prompt stored nowhere).
+  `commit-summary` (default — the raw prompt stays in the private, gitignored
+  `.drift/` store), `full` (prompt also in the commit message — legacy,
+  unsafe), `none` (prompt stored nowhere). The **public summary is never
+  derived from the prompt** (ADR-009): pass `--summary "safe public text"`
+  or get a generic `Drift intent did_…` fallback. `drift log`/`blame` return
+  the safe public `summary` by default; the private prompt needs
+  `--include-private-prompt`.
 
 ## blame / context — trace intent
 
@@ -47,15 +51,21 @@ edit of a pre-Drift function reports "pre-Drift baseline".
 ## verify / replay
 
 ```bash
-drift verify <intent-id>         # re-run the recorded --verify-cmd
-drift replay --checkout          # restore a prior cognitive state (agentState)
+drift verify <intent-id>         # INFORMATION ONLY — shows the recorded
+                                 # --verify-cmd + signature state, never runs it
+drift verify <intent-id> --run   # execute the recorded command (only when the
+                                 # manifest is validly signed by the repo key)
+drift replay <intent-id> --checkout  # restore a prior cognitive state (agentState)
 ```
 
 ## doctor / export
 
 ```bash
 drift doctor                     # health check; detects corrupt .drift store (exit 5)
-drift export                     # portable JSON export of all intents
+drift export                     # portable PUBLIC-ONLY JSON export
+                                 # (--include-private-prompt for local prompts,
+                                 # refuses to write inside the repo)
+drift key import --file <path>   # restore the repo signing key in a read-only clone
 ```
 
 If `doctor` reports corruption, never edit `.drift/` by hand — re-run
@@ -78,9 +88,10 @@ Add `--json` for machine-readable output. Successful commands print
 `{ "status": "ok", ... }` to stdout; errors print
 `{ "status": "error", "type", "message", "exitCode" }` (thrown errors go to
 stderr, usage errors to stdout; MCP merges both). `log --json` returns
-intents with `authorType` (`"AGENT"`/`"HUMAN"`, uppercase), `model`, `prompt`,
+intents with `authorType` (`"AGENT"`/`"HUMAN"`, uppercase), `model`, `summary`,
 `gitSha`; `verify --json` returns
-`verifyStatus: "pass"|"fail"|"no-command"`.
+`verifyStatus: "pass"|"fail"|"timeout"|"no-command"|"not-executed"|"refused"`
+plus `signature` (never executes without `--run`).
 
 ## Environment
 

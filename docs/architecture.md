@@ -14,10 +14,11 @@ Agent / Developer
 │ drift-cli (Node)                                     │
 │  ├── drift-ast    syntax check + AST delta           │
 │  ├── drift-core   realize/log/blame/verify/replay    │
-│  │    ├── SQLite DAG (.drift/drift.db, WAL)          │
-│  │    ├── content-addressed objects (.drift/objects) │
-│  │    ├── Ed25519 signing + AES-256-GCM encryption   │
-│  │    └── secret redaction                           │
+│  │    ├── SQLite DAG (.drift/drift.db, WAL, private)│
+│  │    ├── content-addressed objects (.drift/objects, private)│
+│  │    ├── signed public manifests (.drift/public, committed)│
+│  │    ├── Ed25519 signing + AES-256-GCM encryption  │
+│  │    └── secret redaction                          │
 │  └── git CLI    stage · commit · blame               │
 └──────────────────────────────────────────────────────┘
    │  Drift-Intent: did_… trailer            │ MCP over stdio
@@ -41,44 +42,76 @@ drift-app (webhook server) ── PR commits ─────┘
 
 ## The realize pipeline
 
+One atomic transaction — the source change, the signed public manifest, the
+public key (first introduction) and the `Drift-Intent:` trailer all land in
+**one git commit**; no second manual commit is needed.
+
 ```
-parse pre-state (HEAD) → stage → parse post-state
+parse pre-state (HEAD) → stage source (never .drift private paths)
+   → parse post-state
    → validate syntax (TS via tsc transpile, Python via ast)   [fail ⇒ exit 2, no commit]
    → compute AST delta (ADDED/MODIFIED/DELETED/MOVED/RENAMED)
    → redact secrets from prompt & state
    → build intent → canonical JSON → SHA-256 → Ed25519 signature
-   → write object to .drift/objects/aa/bb….json (atomic write-rename)
-   → git commit -m "<prompt>\n\nDrift-Intent: <id>"
-   → insert DAG rows → update head
+   → write object to .drift/objects/aa/bb….json (private, atomic write-rename)
+   → build V2 public manifest (schemaVersion 2, signingKeyId) — NO containing
+     commit SHA (a self-referential cycle), the association comes from the
+     Drift-Intent trailer in the commit message
+   → write + sign the public manifest to .drift/public/intents/<id>.json
+   → explicitly stage ONLY the approved public paths (.drift/.gitignore,
+     config.toml, public/key.pem, public/intents/<id>.json)
+   → git commit -m "<public summary>\n\nModel: … / Verification: … / Drift-Intent: <id>"
+   → insert DAG rows (git SHA recorded only in the local private DB) → update head
 ```
+
+If ANY step before the commit lands fails (staging, AST/syntax analysis,
+redaction, private-object writing, signing, manifest writing, public-file
+staging, `git commit` itself — e.g. missing identity or a failing
+pre-commit hook) the byte-for-byte index snapshot taken at the start is
+RESTORED EXACTLY: partially staged hunks, intent-to-add, staged renames /
+deletions and index flags all survive, and only the files this operation
+generated are removed. A successful commit is never rolled back; a
+post-commit local-DB failure leaves the commit and its manifest in place and
+reports the recoverable indexing problem (`drift doctor` reindexes).
 
 ## Storage
 
 | Layer | Technology | Purpose |
 | :--- | :--- | :--- |
 | Code | git | blobs, commits, blame — untouched semantics |
-| Intents | JSON, content-addressed | `.drift/objects/<sha2>/<sha…>.json` — tamper-evident |
-| DAG | SQLite (WAL) | `intents`, `intent_files`, `drift_meta` — fast queries |
-| Keys | PEM file | `.drift/keys/ed25519.pem` (0600, gitignored) |
+| Public provenance | JSON, signed (committed) | `.drift/public/intents/<id>.json` — safe summary + metadata, verifiable with `.drift/public/key.pem` (ADR-009) |
+| Intents | JSON, content-addressed (private, gitignored) | `.drift/objects/<sha2>/<sha…>.json` — full (redacted) record, tamper-evident |
+| DAG | SQLite (WAL, private, gitignored) | `intents`, `intent_files`, `drift_meta` — fast queries |
+| Keys | PEM file (private, gitignored) | `.drift/keys/ed25519.pem` (0600) — never committed |
 
-Signature verification uses the intent's **object file** as the source of truth
-(the canonical JSON it was signed over), so verification is byte-exact.
+`.drift/.gitignore` (written by `drift init`) ignores **everything except**
+`config.toml`, `.gitignore` and `.drift/public/`, so `git add .` can never
+stage the database, objects, keys or any future `private/` state.
+
+Signature verification uses the intent's **object file** locally (the
+canonical JSON it was signed over, byte-exact — ADR-007). After a fresh clone
+(no private store), public manifest signatures are verified against the
+committed `.drift/public/key.pem`.
 
 ## Prompt storage modes
 
 What lands in public git history is configurable per-repo
 (`[prompts] mode` in `.drift/config.toml`):
 
-| Mode | `.drift` store | Git commit message |
-| :--- | :--- | :--- |
-| `commit-summary` (**default**) | full (redacted) prompt | `Intent:` first line (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers — the full prompt never enters git history automatically |
-| `full` | full (redacted) prompt | full (redacted) prompt (legacy behaviour) |
-| `none` | nothing | generic `Intent recorded` subject + trailers only |
+| Mode | `.drift` store (private) | Git commit message | Public manifest (`public/intents/<id>.json`) |
+| :--- | :--- | :--- | :--- |
+| `commit-summary` (**default**) | full (redacted) prompt | `Intent:` <public summary> (≤72 chars) + `Model:` / `Verification:` / `Drift-Intent:` trailers | explicit summary (or generic fallback) + model/agent/files/verification, signed |
+| `full` | full (redacted) prompt | full (redacted) prompt (legacy behaviour — visibly unsafe, opt-in) | same as above |
+| `none` | nothing | generic `Intent recorded` subject + trailers only | generic non-prompt fallback (never empty — `none` means "do not persist the raw prompt", not "no public summary") |
 
-The summary is computed **after** secret redaction, so a secret in the first
-line is redacted before it can reach the commit message. Encryption at rest
-applies on top of any mode. The mode affects only new intents — history is
-never rewritten. `drift status` reports the active mode.
+The public summary is **never derived from the prompt** (ADR-009): it comes
+from an explicit `drift realize --summary "…"` (redacted, sanitized,
+truncated) or a generic non-prompt fallback like `Drift intent did_… (2
+files)`. A public manifest with an empty/whitespace summary is **malformed**
+— the validator rejects it, so blank PR comments / check-run lines are
+impossible. Encryption at rest applies on top of any mode.
+The mode affects only new intents — history is never rewritten. `drift
+status` reports the active mode.
 
 ## Encryption at rest (v0.2.0)
 
@@ -105,19 +138,126 @@ text, so agents can parse them.
 
 ## The GitHub App (drift-app)
 
-`drift-app start` runs a small HTTP server (`POST /webhook`) that verifies the
-GitHub HMAC signature, then on `pull_request` `opened` / `synchronize` /
+`drift-app start` runs a small HTTP server (`POST /webhook`) that **fails
+closed**: production REQUIRES `GITHUB_WEBHOOK_SECRET`, and the raw body's
+`X-Hub-Signature-256` HMAC is verified BEFORE any JSON is parsed (missing /
+invalid signature → `401`, missing secret → `403`, oversized body → `413`,
+malformed authenticated JSON → `400`). Only an explicit
+`DRIFT_APP_INSECURE_DEV_MODE=true` (loudly warned, local development only)
+allows unsigned requests. On `pull_request` `opened` / `synchronize` /
 `reopened`:
 
-1. Reads `Drift-Intent: <id>` trailers from the PR commits (paginated).
-2. Hydrates the intent objects from `.drift/objects/` at the PR head.
-3. Posts a **semantic summary comment** (marker `<!-- drift:summary -->`) plus
-   a check run.
+1. Evaluates the trust root (base vs head `.drift/public/key.pem`) with the
+   SHARED strict parser (`evaluateTrustRootChange`: absent / valid /
+   malformed, canonical SPKI-DER fingerprints; malformed initial keys,
+   malformed replacements and a malformed base root are explicit failures)
+   and runs a public-provenance **integrity audit** (append-only: modified /
+   deleted / renamed / orphan manifests, replayed or ambiguously-referenced
+   intents, new trailers without their manifest, incomplete commit listings)
+   BEFORE any "no intents" early return — a key-only or tampering PR is never
+   invisible. The audit is PR-scoped (paginated changed-files API) and never
+   enumerates unchanged historical manifests.
+2. Reads `Drift-Intent: <id>` trailers from the PR commits and hydrates the
+   **public manifests** from `.drift/public/intents/<id>.json` at the PR
+   head. Commit enumeration carries a completeness proof (the REST commits
+   endpoint caps at 250): a truncated list is an `incomplete-commit-audit`
+   failure, and the introduction commit is never guessed from the head SHA.
+   A NEW trailer (its commit is ahead of base via `compare base...head`)
+   with no manifest anywhere is a `trailer-without-manifest` failure; only a
+   reference carried in from base history (legacy pre-V2 intent) stays a
+   neutral missing state. When a manifest is missing, rendering uses a
+   generic non-prompt fallback (`Drift intent <id>`) — the commit subject is
+   NEVER used, because legacy `full`-mode subjects may contain a complete
+   private prompt. Never touches private objects or prompts.
+3. Creates the **Check Run** (derived from the shared trust policy — never
+   unconditional success; any integrity violation fails it) INDEPENDENTLY of
+   the comment: a comment failure never suppresses the check result and vice
+   versa. Write outcomes are STRUCTURED (`GitHubWriteResult`): a failed Check
+   Run is never hidden by a successful comment — transient failures
+   (network / 5xx / 429) make the webhook retryable (500 → GitHub
+   redelivers), permanent 4xx failures are acknowledged.
+4. Posts/updates a **privacy-safe summary comment** (marker
+   `<!-- drift:app-summary:v2 -->`, sanitized, `summary` only).
 
-The summary is **idempotent**: if a Drift comment already exists on the PR it
-is updated in place (PATCH), so repeated deliveries and force-pushes never
-stack duplicate comments. Oversized payloads get `413` (no endless GitHub
-retries); client-side errors are acked with `200`.
+The summary is **idempotent**: the App PATCHes its own marker comment in
+place — a comment is updated ONLY when GitHub attests this App authored it
+(`performed_via_github_app.id` must equal the configured Drift App id; an
+arbitrary positive id is never accepted, and an absent configured App id
+means no comment is treated as owned). User-authored spoofed markers are
+never touched, and the App never edits the Action's
+`<!-- drift:action-summary:v2 -->` comment. The Action posts as
+`github-actions[bot]` and follows the same ownership rule in reverse.
+
+### Queue adapters (durable webhook pipeline)
+
+Every webhook goes through a durable queue: bounded raw body → HMAC
+verification → delivery-ID idempotency → enqueue → fast `202`; the long
+GitHub API audit runs on a worker that re-verifies the stored HMAC before
+acting. The `QueueAdapter` contract is async and identical across adapters:
+
+| Adapter | Mode | Use |
+|---|---|---|
+| `SqliteQueue` | `DRIFT_APP_QUEUE=sqlite` (default) | single-node durable (WAL, `BEGIN IMMEDIATE` claims); local/dev default, also fine for a single-replica deployment |
+| `PostgresQueue` | `DRIFT_APP_QUEUE=postgres` + `DRIFT_QUEUE_URL` | production shared queue: any number of replicas/workers across hosts claim from one database (`SELECT … FOR UPDATE SKIP LOCKED`), same lease/retry/idempotency/dead-letter semantics |
+| `MemoryQueue` | `DRIFT_APP_QUEUE=memory` | non-durable local development |
+| inline | `DRIFT_APP_QUEUE=inline` | legacy single-process debugging (audit in the request thread) |
+
+`DRIFT_APP_MAX_ATTEMPTS` (default 8), `DRIFT_APP_WORKER_CONCURRENCY`
+(default 4) and `DRIFT_APP_POLL_INTERVAL_MS` tune the worker; readiness
+(`/ready`) reports queue depth and fails 503 when the queue is unreachable.
+
+The GitHub **Action** (`scripts/pr-comment.mjs`) uses the same public-manifest
+source and integrity audit but is scoped to **only the PR's commits**
+(`merge-base(base,head)..head`) and degrades gracefully on forks (step
+summary + warning, no `pull_request_target`). By default the composite
+Action **fails the workflow** on invalid/tampered provenance
+(`fail-on-provenance-error`, default `true`) — the safe step summary and PR
+comment are always generated before the non-zero exit; neutral states
+(valid bootstrap, unsigned/unverifiable/legacy-missing manifests, no intents)
+never fail. The failure policy applies even when `GITHUB_TOKEN` is absent
+and is independent of comment failures.
+
+## Cross-component trust contract (Core ⇄ Action ⇄ App)
+
+One canonical implementation of public-key identity, manifest validation and
+provenance-integrity semantics is shared by every consumer:
+
+- **Key identity** — `signingKeyIdFor` hashes the canonical **SPKI DER** bytes
+  of the Ed25519 public key (SHA-256, first 16 hex chars). PEM text is never
+  hashed, so LF/CRLF line endings and harmless surrounding whitespace can
+  never change a key's identity. The same function drives V2 `signingKeyId`,
+  signature-state checks, base/head trust-root comparison, key import and
+  signer status in Core, the Action and the App.
+- **Strict bounded validation** — one schema for V1/V2 with the exact allowed
+  fields enumerated: unknown top-level / `agent` / `files` fields are
+  REJECTED (a field that is not in the schema can never silently join the
+  signed payload). Raw byte size is enforced BEFORE `JSON.parse`
+  (`MANIFEST_MAX_BYTES` = 256 KiB; public key bounded). The App audit is
+  PR-scoped via the paginated changed-files API: limits apply ONLY to public
+  provenance CHANGED by the current PR (200 files / 50 MiB changed content),
+  never to accumulated history — a repository with millions of unchanged
+  historical manifests still allows an ordinary source-only PR, and an
+  incomplete changed-files listing is reported as an incomplete audit.
+  Signature verification runs over the canonical original payload;
+  sanitization only affects rendering.
+- **Immutable PR trust inputs (Action)** — base key from
+  `pull_request.base.sha`, head key + head manifests from
+  `pull_request.head.sha` (`git show <sha>:<path>`). `HEAD` and the working
+  tree are NEVER used for trust: a synthetic merge checkout, a mutated
+  worktree or an earlier workflow step cannot influence the result, and
+  missing history fails safely with a `fetch-depth: 0` message.
+- **Append-only manifests with atomic introduction** — an existing manifest
+  may never be modified, deleted or renamed. A new manifest is legitimate
+  only when its introducing commit (the first PR commit containing the file)
+  carries exactly one matching `Drift-Intent:` trailer, the id was not
+  already present on the base branch (replay), the id is referenced by
+  exactly one commit (ambiguous otherwise), and the PR-head blob is
+  byte-identical to the introduced blob (added-then-modified is a
+  violation). Both integrations evaluate the manifest at the immutable
+  introduction/head commits.
+- **Trust conclusions** — one shared policy maps manifest states and
+  integrity violations to `success` / `neutral` / `failure` for the Check
+  Run and the Action's exit code.
 
 ## Git compatibility contract
 
@@ -129,7 +269,12 @@ retries); client-side errors are acked with `200`.
 
 ## Security model
 
+- **Private data is never stageable:** `.drift/.gitignore` (written by `drift
+  init`) allows only `.drift/public/` + `config.toml` + `.gitignore`; proven
+  with `git check-ignore` / `git add -A` in the test suite.
 - **Tampering:** content-addressed objects; any edit breaks the hash chain.
+  Public manifests are independently Ed25519-signed and verifiable after a
+  fresh clone.
 - **Repudiation:** Ed25519 signatures tied to the per-repo key.
 - **Secrets:** regex redaction before any storage (configurable in
   `.drift/config.toml`).
@@ -137,9 +282,39 @@ retries); client-side errors are acked with `200`.
   enabled; GCM authentication detects tampering.
 - **Prompt injection:** reviewer/merge LLM templates ignore code comments;
   LLM merge output is re-validated before acceptance.
-- **Shell execution:** `drift verify` / `--verify-cmd` re-runs the recorded
-  command with your shell — only run `verify` on intents you trust (local or
-  from a trusted upstream).
+- **Public rendering:** PR comments / step summaries render only the safe
+  public `summary`; all strings are sanitized (control chars, ANSI, HTML
+  comments, mention spam) and length-limited.
+- **PR trust root:** manifests in a pull request are verified against the
+  BASE-branch `.drift/public/key.pem`. A PR that replaces the key is flagged
+  prominently and its provenance marked unverified — the replacement key is
+  never silently trusted. Base/head key comparison uses the canonical SPKI
+  fingerprint, so formatting-only PEM differences never register as a key
+  replacement.
+- **Index safety:** `drift realize` snapshots the real git index file
+  byte-for-byte before touching anything and restores it exactly on ANY
+  failure before the commit lands — including a failed `git commit` (missing
+  identity, failing pre-commit hooks) — so partial hunks, intent-to-add,
+  renames, deletions and assume-unchanged/skip-worktree flags survive.
+  Generated public files are rolled back to their pre-operation state;
+  successful commits and post-commit local-DB failures are never rolled
+  back. The snapshot is discarded on success and never leaks: no
+  `drift-idx-*` backup remains after success, failure, or repeated runs on a
+  persistent self-hosted runner.
+- **Immutable PR inputs (Action):** trust decisions use ONLY
+  `pull_request.base.sha` / `pull_request.head.sha` git objects — never
+  `HEAD` or the working tree, so a synthetic merge checkout, a mutated
+  worktree or an earlier workflow step cannot influence the result; missing
+  history fails safely with a `fetch-depth: 0` message. An initial
+  trust-root bootstrap is visible and neutral; replacement/removal are
+  blocking failures.
+- **Shell execution (opt-in):** `drift verify <id>` is informational by
+  default — it validates the manifest, reports the signature/trust state and
+  shows the recorded command WITHOUT executing it. A recorded verification
+  string is code, so it runs only with an explicit `drift verify <id> --run`,
+  and only when the manifest is validly signed by the repository key
+  (`--allow-untrusted-command` forces it, with a prominent warning). Never
+  enabled by the GitHub Action, the App, or default MCP tools.
 - **Path containment:** `drift blame` / `drift context` reject paths that
   escape the repository root (`../`, absolute/cross-drive paths, symlinks via
   realpath) before any filesystem read.

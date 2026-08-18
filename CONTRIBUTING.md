@@ -78,6 +78,11 @@ scripts/               seed-demo, acceptance, publish, app-verify helpers
   `docs/adrs.md`.
 - **Security defaults are non-negotiable:** secrets are redacted before any
   storage; paths are contained to the repo root; telemetry stays off.
+- **Privacy invariants (ADR-009):** the raw prompt is private — default CLI
+  JSON and PR comments render only the public `summary`; private data must
+  stay gitignored (`.drift/.gitignore` allow-list); read commands must work
+  on a fresh clone without the private DB; the Action/App select intents
+  only from the PR's commits and never render `prompt`.
 - **Contracts:**
   - `drift-core` never shells out to git for reads when a pure SQLite query
     works.

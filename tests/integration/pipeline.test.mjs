@@ -84,6 +84,8 @@ export function refreshToken(expired: string): string {
     "realize",
     "-p",
     "Fix race condition in token refresh",
+    "--summary",
+    "Fix race condition in token refresh",
     "--agent",
     "--model",
     "claude-3-5-sonnet",
@@ -102,21 +104,26 @@ export function refreshToken(expired: string): string {
   const lastMessage = git(repo, ["log", "-1", "--format=%B"]);
   assert.ok(lastMessage.includes(`Drift-Intent: ${realizeOut.intentId}`));
 
-  // 3. log
+  // 3. log — safe by default: public summary, NO private prompt in JSON
   const log = run(repo, ["log", "--json"]);
   assert.equal(log.status, 0, log.stderr);
   const logOut = parseJson(log.stdout);
   assert.equal(logOut.status, "ok");
   assert.equal(logOut.intents.length, 1);
-  assert.equal(logOut.intents[0].prompt, "Fix race condition in token refresh");
+  assert.equal(logOut.intents[0].summary, "Fix race condition in token refresh");
+  assert.ok(!("prompt" in logOut.intents[0]), "default log JSON must not expose the private prompt");
   assert.equal(logOut.intents[0].authorType, "AGENT");
+  // explicit opt-in restores the local prompt
+  const logPrivate = parseJson(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
+  assert.equal(logPrivate.intents[0].prompt, "Fix race condition in token refresh");
 
   // 4. blame by function
   const blame = run(repo, ["blame", "src/auth.ts", "--function", "refreshToken", "--json"]);
   assert.equal(blame.status, 0, blame.stderr);
   const blameOut = parseJson(blame.stdout);
   assert.equal(blameOut.status, "ok");
-  assert.equal(blameOut.intent.prompt, "Fix race condition in token refresh");
+  assert.equal(blameOut.intent.summary, "Fix race condition in token refresh");
+  assert.ok(!("prompt" in blameOut.intent), "default blame JSON must not expose the private prompt");
   assert.equal(blameOut.intent.author.model, "claude-3-5-sonnet");
   assert.equal(blameOut.intent.signatureValid, true);
 
@@ -126,11 +133,15 @@ export function refreshToken(expired: string): string {
   assert.equal(baselineOut.status, "ok");
   assert.equal(baselineOut.baseline, true);
 
-  // 5. verify
+  // 5. verify — INFORMATION by default (never executes repository code);
+  // execution requires an explicit --run and a validly signed manifest.
   const verify = run(repo, ["verify", realizeOut.intentId, "--json"]);
   assert.equal(verify.status, 0, verify.stderr);
   assert.equal(parseJson(verify.stdout).status, "ok");
-  assert.equal(parseJson(verify.stdout).verifyStatus, "pass");
+  assert.equal(parseJson(verify.stdout).verifyStatus, "not-executed");
+  assert.equal(parseJson(verify.stdout).signature, "valid");
+  const verifyRun = run(repo, ["verify", realizeOut.intentId, "--run", "--json"]);
+  assert.equal(parseJson(verifyRun.stdout).verifyStatus, "pass");
 
   // 6. context
   const ctx = run(repo, ["context", "src/auth.ts", "--json"]);
@@ -166,7 +177,17 @@ test("blame --function on a body-modified function resolves to the intent (PRD �
 }
 `,
   );
-  const realize = run(repo, ["realize", "-p", "Fix race condition in token refresh", "--agent", "--model", "claude-3-5-sonnet", "--json"]);
+  const realize = run(repo, [
+    "realize",
+    "-p",
+    "Fix race condition in token refresh",
+    "--summary",
+    "Fix race condition in token refresh",
+    "--agent",
+    "--model",
+    "claude-3-5-sonnet",
+    "--json",
+  ]);
   assert.equal(realize.status, 0, realize.stderr);
 
   // the function existed before Drift, so its SIGNATURE line is baseline —
@@ -175,7 +196,7 @@ test("blame --function on a body-modified function resolves to the intent (PRD �
   assert.equal(blame.status, "ok");
   assert.equal(blame.baseline, false, JSON.stringify(blame));
   assert.ok(blame.intent, "intent must be resolved, got baseline: " + JSON.stringify(blame));
-  assert.equal(blame.intent.prompt, "Fix race condition in token refresh");
+  assert.equal(blame.intent.summary, "Fix race condition in token refresh");
   assert.equal(blame.intent.author.model, "claude-3-5-sonnet");
   assert.equal(blame.intent.signatureValid, true);
   // the resolved line is inside the function body (where the change landed)
@@ -310,19 +331,26 @@ test("fuzz: special chars in paths/prompts and unknown-command stay machine-read
     const realize = run(repo, ["realize", "-p", prompt, "--json"]);
     assert.equal(realize.status, 0, realize.stderr);
     assert.ok(JSON.parse(realize.stdout).intentId);
+    // no explicit summary: the public summary is a GENERIC non-prompt fallback
+    // (ADR-009) — never prompt text, whatever its shape; the full prompt is
+    // reachable only via the explicit private flag
     const log = parseJson(run(repo, ["log", "--limit", "1", "--json"]).stdout);
-    assert.equal(log.intents[0].prompt, prompt.trim());
+    assert.ok(log.intents[0].summary.startsWith("Drift intent "), `generic fallback expected, got ${log.intents[0].summary}`);
+    assert.ok(!log.intents[0].summary.includes(prompt.trim().split("\n")[0]), "fallback must not contain prompt text");
+    assert.ok(!("prompt" in log.intents[0]));
+    const logFull = parseJson(run(repo, ["log", "--limit", "1", "--json", "--include-private-prompt"]).stdout);
+    assert.equal(logFull.intents[0].prompt, prompt.trim());
   }
 
   // --- special file names: blame/context/log --file work ---
   const weird = join(repo, "src", "weird name $(x) 🚀 unicode.ts");
   writeFileSync(weird, "export function weirdFn() { return 1; }\n");
   const rel = "src/weird name $(x) 🚀 unicode.ts";
-  assert.equal(run(repo, ["realize", "-p", "add weird file", "--json"]).status, 0);
+  assert.equal(run(repo, ["realize", "-p", "add weird file", "--summary", "add weird file", "--json"]).status, 0);
   const blame = parseJson(
     run(repo, ["blame", rel, "--function", "weirdFn", "--json"]).stdout,
   );
-  assert.equal(blame.intent.prompt, "add weird file");
+  assert.equal(blame.intent.summary, "add weird file");
   const ctx = parseJson(run(repo, ["context", rel, "--json"]).stdout);
   assert.equal(ctx.intents.length, 1);
   const logF = parseJson(run(repo, ["log", "--file", rel, "--json"]).stdout);
@@ -353,11 +381,22 @@ test("redaction: secrets in prompts never hit git history", () => {
   const repo = makeRepo();
   run(repo, ["init"]);
   writeFileSync(join(repo, "src", "auth.ts"), "export const a = 1;\n");
-  const realize = run(repo, ["realize", "-p", "use sk-abc123DEF456ghi789JKL0123456789 in config", "--json"]);
+  const realize = run(repo, [
+    "realize",
+    "-p",
+    "use sk-abc123DEF456ghi789JKL0123456789 in config",
+    "--summary",
+    "use sk-abc123DEF456ghi789JKL0123456789 in config",
+    "--json",
+  ]);
   assert.equal(realize.status, 0, realize.stderr);
-  const log = parseJson(run(repo, ["log", "--json"]).stdout);
+  const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
   assert.ok(!log.intents[0].prompt.includes("sk-abc123"));
   assert.ok(log.intents[0].prompt.includes("[REDACTED]"));
+  // the PUBLIC summary is redacted too (a secret in --summary can never
+  // reach git history, manifests or PR comments)
+  assert.ok(!log.intents[0].summary.includes("sk-abc123"));
+  assert.ok(log.intents[0].summary.includes("[REDACTED]"), "public summary must be redacted");
 });
 
 test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY without key", () => {
@@ -378,7 +417,7 @@ test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY with
   const state = Buffer.from(JSON.stringify({ step: 1, goal: "top secret" })).toString("base64");
   const realize = run(
     repo,
-    ["realize", "-p", "super secret prompt: rotate the token", "--agent", "--state", state, "--json"],
+    ["realize", "-p", "super secret prompt: rotate the token", "--summary", "super secret prompt: rotate the token", "--agent", "--state", state, "--json"],
     env,
   );
   assert.equal(realize.status, 0, realize.stderr);
@@ -395,12 +434,16 @@ test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY with
     assert.ok(!content.includes("top secret"), `plaintext state leaked into ${f}`);
   }
 
-  // read paths decrypt with the key
-  const log = parseJson(run(repo, ["log", "--json"], env).stdout);
+  // read paths decrypt with the key (explicit opt-in only)
+  const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"], env).stdout);
   assert.equal(log.intents[0].prompt, "super secret prompt: rotate the token");
+  // default JSON stays safe (public summary only)
+  const logSafe = parseJson(run(repo, ["log", "--json"], env).stdout);
+  assert.equal(logSafe.intents[0].summary, "super secret prompt: rotate the token");
+  assert.ok(!("prompt" in logSafe.intents[0]));
 
   const blame = parseJson(
-    run(repo, ["blame", "src/auth.ts", "--function", "encrypted", "--json"], env).stdout,
+    run(repo, ["blame", "src/auth.ts", "--function", "encrypted", "--json", "--include-private-prompt"], env).stdout,
   );
   assert.equal(blame.intent.prompt, "super secret prompt: rotate the token");
   assert.equal(blame.intent.signatureValid, true);
@@ -423,9 +466,12 @@ test("encryption (v0.2.0): prompt+state encrypted at rest, roundtrip, E_KEY with
   assert.equal(noKeyReplay.status, 4, noKeyReplay.stderr);
 
   // read paths degrade gracefully without a key: prompt placeholder, exit 0
-  const noKeyLog = parseJson(run(repo, ["log", "--json"], NO_KEY).stdout);
+  const noKeyLog = parseJson(run(repo, ["log", "--json", "--include-private-prompt"], NO_KEY).stdout);
   assert.equal(noKeyLog.status, "ok");
   assert.equal(noKeyLog.intents[0].prompt, "[encrypted]");
+  // the public summary stays visible without the key (it is not encrypted)
+  const noKeySafe = parseJson(run(repo, ["log", "--json"], NO_KEY).stdout);
+  assert.equal(noKeySafe.intents[0].summary, "super secret prompt: rotate the token");
 
   // doctor reports the missing key
   const noKeyDoctor = parseJson(run(repo, ["doctor", "--json"], NO_KEY).stdout);
@@ -455,13 +501,13 @@ test("encryption: legacy plaintext intents pass through untouched (backward comp
   writeFileSync(join(repo, "src", "auth.ts"), "export const legacy = () => 0;\nexport const fresh = () => 1;\n");
   run(repo, ["realize", "-p", "new encrypted prompt", "--json"], env);
 
-  const log = parseJson(run(repo, ["log", "--json"], env).stdout);
+  const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"], env).stdout);
   assert.equal(log.intents.length, 2);
   const prompts = log.intents.map((i) => i.prompt);
   assert.ok(prompts.includes("legacy plaintext prompt"));
   assert.ok(prompts.includes("new encrypted prompt"));
 
-  const noKeyLog = parseJson(run(repo, ["log", "--json"], { DRIFT_MASTER_KEY: "" }).stdout);
+  const noKeyLog = parseJson(run(repo, ["log", "--json", "--include-private-prompt"], { DRIFT_MASTER_KEY: "" }).stdout);
   const byPrompt = Object.fromEntries(noKeyLog.intents.map((i) => [i.prompt, i.id]));
   assert.ok(byPrompt["legacy plaintext prompt"], "legacy prompt must stay visible without a key");
   assert.ok(byPrompt["[encrypted]"], "new prompt must degrade to placeholder without a key");
@@ -506,10 +552,10 @@ test("log --file filters intents touching a file", () => {
   writeFileSync(join(repo, "src", "auth.ts"), "export const a = () => 1;\n");
   run(repo, ["realize", "-p", "touch auth"]);
   writeFileSync(join(repo, "src", "other.ts"), "export const o = () => 2;\n");
-  run(repo, ["realize", "-p", "touch other"]);
+  run(repo, ["realize", "-p", "touch other", "--summary", "touch other"]);
   const filtered = parseJson(run(repo, ["log", "--file", "src/other.ts", "--json"]).stdout);
   assert.equal(filtered.intents.length, 1);
-  assert.equal(filtered.intents[0].prompt, "touch other");
+  assert.equal(filtered.intents[0].summary, "touch other");
 });
 
 test("corrupted .drift/drift.db → exit 5 (CORRUPT), not a generic error", () => {
@@ -534,6 +580,8 @@ test("prompt modes: default commit-summary keeps the full prompt out of git hist
     "realize",
     "-p",
     prompt,
+    "--summary",
+    "Fix race condition in token refresh",
     "--agent",
     "--model",
     "claude-3-5-sonnet",
@@ -548,9 +596,20 @@ test("prompt modes: default commit-summary keeps the full prompt out of git hist
   assert.ok(msg.includes("Drift-Intent: "), msg);
   assert.ok(!msg.includes("rotate keys via the vault"), "full prompt leaked into the commit message");
 
-  // the full prompt is still available locally through drift (.drift store)
-  const log = parseJson(run(repo, ["log", "--json"]).stdout);
+  // the full prompt is still available locally, but only via the explicit flag
+  const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
   assert.equal(log.intents[0].prompt, prompt);
+  const logSafe = parseJson(run(repo, ["log", "--json"]).stdout);
+  assert.equal(logSafe.intents[0].summary, "Fix race condition in token refresh");
+  assert.ok(!("prompt" in logSafe.intents[0]));
+  // and the committed public manifest carries the explicit public summary
+  const manifestDir = join(repo, ".drift", "public", "intents");
+  const manifestFiles = readdirSync(manifestDir).filter((f) => f.endsWith(".json"));
+  assert.equal(manifestFiles.length, 1);
+  const manifest = JSON.parse(readFileSync(join(manifestDir, manifestFiles[0]), "utf8"));
+  assert.ok(!JSON.stringify(manifest).includes("rotate keys via the vault"), "full prompt must not be in the public manifest");
+  assert.equal(manifest.summary, "Fix race condition in token refresh");
+  assert.ok(manifest.signature, "manifest must be signed");
 });
 
 test("prompt modes: full mode restores prompt-in-commit-message (legacy opt-in)", () => {
@@ -577,7 +636,15 @@ test("prompt modes: none stores no prompt anywhere (db, objects, commit)", () =>
   const msg = git(repo, ["log", "-1", "--format=%B"]);
   assert.ok(!msg.includes("top secret prompt"), msg);
 
-  const log = parseJson(run(repo, ["log", "--json"]).stdout);
+  // none mode: nothing derived from the prompt anywhere — the public summary
+  // is the generic NON-PROMPT fallback (never empty, never prompt text)
+  const logSafe = parseJson(run(repo, ["log", "--json"]).stdout);
+  assert.ok(
+    logSafe.intents[0].summary.startsWith("Drift intent "),
+    `none mode must use the generic non-prompt summary, got: ${logSafe.intents[0].summary}`,
+  );
+  assert.ok(!logSafe.intents[0].summary.includes("top secret"), logSafe.intents[0].summary);
+  const log = parseJson(run(repo, ["log", "--json", "--include-private-prompt"]).stdout);
   assert.equal(log.intents[0].prompt, "");
 
   const objectsDir = join(repo, ".drift", "objects");
@@ -585,15 +652,28 @@ test("prompt modes: none stores no prompt anywhere (db, objects, commit)", () =>
     const content = readFileSync(join(objectsDir, f), "utf8");
     assert.ok(!content.includes("top secret prompt"), `prompt leaked into ${f}`);
   }
+  const manifestDir = join(repo, ".drift", "public", "intents");
+  const manifestFiles = readdirSync(manifestDir).filter((f) => f.endsWith(".json"));
+  const manifest = JSON.parse(readFileSync(join(manifestDir, manifestFiles[0]), "utf8"));
+  assert.ok(
+    manifest.summary.startsWith("Drift intent "),
+    `none mode persists a generic non-prompt summary, got: ${manifest.summary}`,
+  );
+  assert.ok(!manifest.summary.includes("top secret"), manifest.summary);
 });
 
 test("prompt modes: secrets are redacted before the summary reaches the commit message", () => {
   const repo = makeRepo();
   run(repo, ["init"]);
   writeFileSync(join(repo, "src", "auth.ts"), "export const d = () => 4;\n");
+  // a secret placed in the PUBLIC summary must be redacted before it reaches
+  // the commit message — the explicit summary is the ONLY prompt-adjacent text
+  // that may appear publicly, and even that is redacted + sanitized (ADR-009)
   const realize = run(repo, [
     "realize",
     "-p",
+    "Use key sk-abc123DEF456ghi789JKL0123456789 in the config now",
+    "--summary",
     "Use key sk-abc123DEF456ghi789JKL0123456789 in the config now",
     "--json",
   ]);
@@ -619,14 +699,15 @@ test("drift status: friendly state report and graceful degradation before init",
   // initialized
   run(repo, ["init"]);
   writeFileSync(join(repo, "src", "auth.ts"), "export const e = () => 5;\n");
-  assert.equal(run(repo, ["realize", "-p", "first intent", "--json"]).status, 0);
+  assert.equal(run(repo, ["realize", "-p", "first intent", "--summary", "first intent", "--json"]).status, 0);
   const st = parseJson(run(repo, ["status", "--json"]).stdout);
   assert.equal(st.status, "ok");
   assert.equal(st.initialized, true);
   assert.equal(st.intents, 1);
   assert.equal(st.promptMode, "commit-summary");
   assert.equal(st.encryption, false);
-  assert.equal(st.lastIntent.prompt, "first intent");
+  assert.equal(st.lastIntent.summary, "first intent");
+  assert.ok(!("prompt" in st.lastIntent), "status JSON must not expose the private prompt");
 
   // human output explains the next step
   const human = run(repo, ["status"]);
@@ -642,6 +723,8 @@ test("blame human output is self-explanatory (Why / Generated by / Intent / Comm
     "realize",
     "-p",
     "Add the why function",
+    "--summary",
+    "Add the why function",
     "--agent",
     "--model",
     "claude-3-5-sonnet",
@@ -653,7 +736,7 @@ test("blame human output is self-explanatory (Why / Generated by / Intent / Comm
   const out = run(repo, ["blame", "src/auth.ts", "--function", "why"]);
   assert.equal(out.status, 0, out.stderr);
   assert.ok(out.stdout.includes("Why:"), out.stdout);
-  assert.ok(out.stdout.includes("Add the why function"), out.stdout);
+  assert.ok(out.stdout.includes("Add the why function"), out.stdout); // public summary shown by default
   assert.ok(out.stdout.includes("Generated by:"), out.stdout);
   assert.ok(out.stdout.includes("model: claude-3-5-sonnet"), out.stdout);
   assert.ok(out.stdout.includes("Verification:"), out.stdout);

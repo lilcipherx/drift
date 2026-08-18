@@ -152,9 +152,12 @@ console.log("STEP 4: C1 happy-path webhook");
   if (r.intentsFound !== 1) throw new Error(`C1: expected 1 intent, got ${r.intentsFound}`);
   if (state.posted !== 1) throw new Error(`C1: comment not posted (posted=${state.posted})`);
   if (state.checkRuns !== 1) throw new Error("C1: check run not created");
-  if (!comments[0].body.includes("behavior-verify intent prompt")) throw new Error("C1: comment body missing prompt");
+  // ADR-009: the app renders ONLY the safe public summary — the private
+  // prompt must never appear in a comment (the marker proves the comment is
+  // Drift's own idempotent summary).
+  if (comments[0].body.includes("behavior-verify intent prompt")) throw new Error("C1: comment must never render the private prompt");
   if (!comments[0].body.includes("<!-- drift:summary -->")) throw new Error("C1: comment body missing marker");
-  console.log("C1 OK: comment landed with prompt + marker, check run created\n");
+  console.log("C1 OK: comment landed with marker (prompt never rendered), check run created\n");
 }
 
 // ---------------------------------------------------------------- check 2

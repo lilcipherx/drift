@@ -9,10 +9,15 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import { GitHubAppClient } from "./github.js";
 import { handleWebhook, type WebhookEvent } from "./handler.js";
-import { createWebhookServer } from "./server.js";
+import { assertWebhookAuthConfigured, createWebhookServer } from "./server.js";
+import { SqliteQueue, MemoryQueue, type QueueAdapter } from "./queue.js";
+import { PostgresQueue } from "./queue-pg.js";
+import { Worker } from "./worker.js";
+import { createLogger } from "./logger.js";
+import { createMetrics } from "./metrics.js";
 
 const USAGE = `Drift GitHub App
 
@@ -21,10 +26,41 @@ Usage:
                                  Env: GITHUB_APP_ID, GITHUB_PRIVATE_KEY (path or PEM),
                                       GITHUB_WEBHOOK_SECRET, DRIFT_MASTER_KEY (optional),
                                       GITHUB_API_BASE_URL (optional, e.g. local mock),
-                                      PORT
+                                      PORT, DRIFT_APP_QUEUE (sqlite|memory|inline),
+                                      DRIFT_APP_DATA_DIR, DRIFT_APP_MAX_ATTEMPTS,
+                                      DRIFT_APP_WORKER_CONCURRENCY, DRIFT_APP_POLL_INTERVAL_MS
   drift-app dev <payload.json>   Process one webhook payload against the GitHub API
                                  (--dry-run: build the summary without posting)
 `;
+
+/**
+ * Build the durable queue (see CAPACITY_MODEL / docs/ARCHITECTURE):
+ *   sqlite   — single-node durable default (WAL, shared by local replicas).
+ *   postgres — production shared queue: any number of replicas/workers across
+ *              hosts claim from one Postgres database (DRIFT_QUEUE_URL).
+ *   memory   — non-durable local development queue.
+ *   inline   — legacy single-process behavior (audit in the request thread).
+ */
+function createQueue(env: NodeJS.ProcessEnv = process.env): QueueAdapter {
+  const mode = env.DRIFT_APP_QUEUE ?? "sqlite";
+  if (mode === "inline") return null as unknown as QueueAdapter;
+  if (mode === "memory") return new MemoryQueue({ maxAttempts: parsePositiveInt(env.DRIFT_APP_MAX_ATTEMPTS, 8) });
+  if (mode === "postgres") {
+    const url = env.DRIFT_QUEUE_URL ?? "";
+    if (!url) throw new Error("DRIFT_APP_QUEUE=postgres requires DRIFT_QUEUE_URL (postgres://...)");
+    return new PostgresQueue({ url, maxAttempts: parsePositiveInt(env.DRIFT_APP_MAX_ATTEMPTS, 8) });
+  }
+  const dataDir = env.DRIFT_APP_DATA_DIR || join(process.cwd(), ".drift-app-data");
+  return new SqliteQueue({
+    path: join(dataDir, "queue.db"),
+    maxAttempts: parsePositiveInt(env.DRIFT_APP_MAX_ATTEMPTS, 8),
+  });
+}
+
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 ? n : fallback;
+}
 
 function loadPrivateKey(): string {
   const raw = process.env.GITHUB_PRIVATE_KEY ?? "";
@@ -54,8 +90,8 @@ async function runDev(payloadPath: string, dryRun: boolean): Promise<void> {
   const result = await handleWebhook(event, {
     github,
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
-    masterKey: process.env.DRIFT_MASTER_KEY,
     readOnly: dryRun,
+    appId: process.env.GITHUB_APP_ID,
   });
   if (dryRun && result.commentBody) {
     console.log(result.commentBody);
@@ -67,12 +103,13 @@ async function runDev(payloadPath: string, dryRun: boolean): Promise<void> {
 }
 
 async function runStart(): Promise<void> {
-  // A public webhook endpoint with HMAC verification disabled lets anyone
-  // forge pull_request events — require the secret in server mode (dev mode
-  // stays permissive because it processes a local file).
-  if (!process.env.GITHUB_WEBHOOK_SECRET) {
-    throw new Error("GITHUB_WEBHOOK_SECRET is required for drift-app start");
-  }
+  // Fail closed: a public webhook endpoint without HMAC verification lets
+  // anyone forge pull_request events. The only escape hatch is an explicit
+  // DRIFT_APP_INSECURE_DEV_MODE=true (loudly warned, local development only).
+  const { webhookSecret, insecureDevMode } = assertWebhookAuthConfigured(
+    process.env.GITHUB_WEBHOOK_SECRET,
+    process.env.DRIFT_APP_INSECURE_DEV_MODE,
+  );
   const github = new GitHubAppClient({
     appId: process.env.GITHUB_APP_ID ?? "",
     privateKeyPem: loadPrivateKey(),
@@ -82,17 +119,47 @@ async function runStart(): Promise<void> {
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error(`invalid PORT: ${process.env.PORT ?? ""}`);
   }
-  const { close, port: actualPort } = await createWebhookServer({
+  const logger = createLogger({ level: (process.env.DRIFT_APP_LOG_LEVEL as never) ?? "info" });
+  const metrics = createMetrics();
+  const queue = createQueue();
+  let worker: Worker | null = null;
+  const queueMode = queue !== null;
+
+  const webhookDeps = {
     github,
-    webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
-    masterKey: process.env.DRIFT_MASTER_KEY,
+    webhookSecret,
+    insecureDevMode,
+    appId: process.env.GITHUB_APP_ID,
+  };
+  const { close, port: actualPort } = await createWebhookServer({
+    ...webhookDeps,
     port,
+    logger,
+    metrics,
+    queue: queueMode ? queue : undefined,
     log: (line) => console.log(line),
   });
-  console.log(`drift-app listening on http://127.0.0.1:${actualPort}/webhook`);
-  console.log("  point your GitHub App webhook URL here (or use scripts/webhook-proxy.sh with smee.io)");
+  if (queueMode) {
+    worker = new Worker({
+      queue: queue as QueueAdapter,
+      deps: webhookDeps,
+      log: logger,
+      metrics,
+      concurrency: parsePositiveInt(process.env.DRIFT_APP_WORKER_CONCURRENCY, 4),
+      pollIntervalMs: parsePositiveInt(process.env.DRIFT_APP_POLL_INTERVAL_MS, 500),
+    });
+    worker.start();
+    console.log(`drift-app listening on http://127.0.0.1:${actualPort}/webhook (queue=${process.env.DRIFT_APP_QUEUE ?? "sqlite"}, concurrency=${parsePositiveInt(process.env.DRIFT_APP_WORKER_CONCURRENCY, 4)})`);
+    console.log("  point your GitHub App webhook URL here (or use scripts/webhook-proxy.sh with smee.io)");
+    console.log("  endpoints: POST /webhook · GET /health · GET /ready");
+  } else {
+    console.log(`drift-app listening on http://127.0.0.1:${actualPort}/webhook (inline mode — audits run in the request thread; set DRIFT_APP_QUEUE=sqlite for production)`);
+    console.log("  point your GitHub App webhook URL here (or use scripts/webhook-proxy.sh with smee.io)");
+  }
   const shutdown = async () => {
+    if (worker) await worker.stop();
     await close();
+    if (queueMode) queue.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

@@ -45,7 +45,46 @@ CREATE TABLE IF NOT EXISTS intent_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_intent_files_path ON intent_files(file_path);
+
+-- Stat-validated performance index over the committed public manifests
+-- (PRD §7 / docs/PERFORMANCE_REPORT.md). NEVER a trust source: it stores only
+-- selection/ordering metadata (existence, mtime/size/ctime, manifest
+-- timestamp, author/model, file paths) so bounded commands like
+-- drift log --limit N and drift context can avoid walking and parsing
+-- every manifest on every run. Every trust decision still re-reads the actual
+-- manifest file; status/doctor re-verify the full tree from files. Rows are
+-- invalidated by stat mismatch (mtime+size+ctime), the same class of
+-- freshness discipline git's own index uses.
+CREATE TABLE IF NOT EXISTS public_manifest_index (
+  id           TEXT PRIMARY KEY,
+  mtime_ms     INTEGER NOT NULL,
+  size         INTEGER NOT NULL,
+  ctime_ms     INTEGER NOT NULL,
+  timestamp_ms INTEGER NOT NULL,
+  valid        INTEGER NOT NULL,
+  author_id    TEXT,
+  model        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pmi_timestamp ON public_manifest_index(timestamp_ms);
+
+CREATE TABLE IF NOT EXISTS public_manifest_files (
+  manifest_id TEXT NOT NULL,
+  file_path   TEXT NOT NULL,
+  PRIMARY KEY (manifest_id, file_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pmf_path ON public_manifest_files(file_path);
 `;
+
+/** Bump when the public-manifest index schema or derivation changes. */
+export const PUBLIC_MANIFEST_INDEX_VERSION = "1";
+
+export interface PublicManifestStat {
+  mtimeMs: number;
+  size: number;
+  ctimeMs: number;
+}
 
 const MUTATION_TO_INT: Record<MutationType, number> = {
   ADDED: 0,
@@ -104,15 +143,41 @@ export interface LogFilters {
   limit?: number;
 }
 
+/**
+ * Deterministic intent → commit association, derived ONLY from
+ * `Drift-Intent:` git trailers (never from an unverified manifest field):
+ *
+ *   unique    — referenced by exactly one commit.
+ *   missing   — referenced by no commit.
+ *   ambiguous — referenced by multiple commits and no committed public
+ *               manifest establishes an introduction (orphan provenance).
+ *   replayed  — referenced by multiple commits AND a committed public
+ *               manifest exists: the oldest reference is the introduction,
+ *               later references are replays.
+ *   duplicate — the same id appears more than once in a single commit's
+ *               trailer block (malformed/duplicate metadata).
+ */
+export type IntentCommitAssociation =
+  | { state: "unique"; commit: string }
+  | { state: "missing" }
+  | { state: "duplicate-in-commit"; commit: string; occurrences: number }
+  | { state: "replayed"; originalCommit: string; laterCommits: string[] }
+  | { state: "ambiguous"; commits: string[] };
+
 export interface LogEntry {
   id: string;
   gitSha: string;
   authorType: "HUMAN" | "AGENT";
   authorId: string;
   model: string | null;
+  /** Full (redacted) prompt. Private: only surfaced with an explicit opt-in flag. */
   prompt: string;
+  /** Safe public summary (ADR-009) — safe to commit, clone, and render. */
+  summary?: string;
   timestamp: number;
   files: { path: string; mutationType: MutationType; summary: string | null }[];
+  /** Structured trailer-derived association (unique/missing/ambiguous/replayed/duplicate). */
+  association?: IntentCommitAssociation;
 }
 
 interface LogRow {
@@ -128,6 +193,7 @@ interface LogRow {
 
 export class IntentStore {
   private db: DatabaseSync;
+  private inBatch = 0;
 
   private constructor(private readonly dbPath: string) {
     this.db = new DatabaseSync(dbPath);
@@ -376,6 +442,184 @@ export class IntentStore {
       this.db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  // ------------------------------------------------- public-manifest index
+  // Selection/ordering cache over `.drift/public/intents/*.json`. NEVER a
+  // trust source — see the table comment and docs/PERFORMANCE_REPORT.md.
+
+  /** True when the cached stat matches the file's current stat (fresh). */
+  publicManifestRowMatches(id: string, st: PublicManifestStat): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT mtime_ms, size, ctime_ms FROM public_manifest_index WHERE id = ?",
+      )
+      .get(id) as { mtime_ms: number; size: number; ctime_ms: number } | undefined;
+    return (
+      row !== undefined &&
+      row.mtime_ms === Math.trunc(st.mtimeMs) &&
+      row.size === st.size &&
+      row.ctime_ms === Math.trunc(st.ctimeMs)
+    );
+  }
+
+  /**
+   * Wrap a batch of `upsertPublicManifest` calls in ONE transaction (cold
+   * index build). Outside a batch each upsert commits independently so a
+   * crash never leaves a half-written row.
+   */
+  publicManifestIndexBatch<T>(fn: () => T): T {
+    this.inBatch++;
+    this.db.exec("BEGIN");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    } finally {
+      this.inBatch--;
+    }
+  }
+
+  /** Upsert one manifest row + its file-path rows. Caller re-parses first. */
+  upsertPublicManifest(
+    id: string,
+    st: PublicManifestStat,
+    timestampMs: number,
+    valid: boolean,
+    authorId: string | null,
+    model: string | null,
+    files: string[],
+  ): void {
+    const outer = this.inBatch === 0;
+    if (outer) this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO public_manifest_index
+             (id, mtime_ms, size, ctime_ms, timestamp_ms, valid, author_id, model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             mtime_ms = excluded.mtime_ms,
+             size = excluded.size,
+             ctime_ms = excluded.ctime_ms,
+             timestamp_ms = excluded.timestamp_ms,
+             valid = excluded.valid,
+             author_id = excluded.author_id,
+             model = excluded.model`,
+        )
+        .run(
+          id,
+          Math.trunc(st.mtimeMs),
+          st.size,
+          Math.trunc(st.ctimeMs),
+          timestampMs,
+          valid ? 1 : 0,
+          authorId,
+          model,
+        );
+      this.db.prepare("DELETE FROM public_manifest_files WHERE manifest_id = ?").run(id);
+      for (const path of files) {
+        this.db.prepare("INSERT OR IGNORE INTO public_manifest_files (manifest_id, file_path) VALUES (?, ?)").run(id, path);
+      }
+      if (outer) this.db.exec("COMMIT");
+    } catch (err) {
+      if (outer) this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** Drop rows whose manifest file no longer exists in the working tree. */
+  dropPublicManifestMissing(seen: Set<string>): void {
+    const all = this.db
+      .prepare("SELECT id FROM public_manifest_index")
+      .all() as unknown as { id: string }[];
+    const toDelete = all.filter((r) => !seen.has(r.id)).map((r) => r.id);
+    if (toDelete.length === 0) return;
+    const chunk = 400;
+    for (let i = 0; i < toDelete.length; i += chunk) {
+      const slice = toDelete.slice(i, i + chunk);
+      const marks = slice.map(() => "?").join(",");
+      this.db.prepare(`DELETE FROM public_manifest_index WHERE id IN (${marks})`).run(...slice);
+      this.db
+        .prepare(`DELETE FROM public_manifest_files WHERE manifest_id IN (${marks})`)
+        .run(...slice);
+    }
+  }
+
+  dropAllPublicManifestIndex(): void {
+    this.db.prepare("DELETE FROM public_manifest_files").run();
+    this.db.prepare("DELETE FROM public_manifest_index").run();
+  }
+
+  /** Total indexed manifest rows (benchmark/observability). */
+  publicManifestIndexRows(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS c FROM public_manifest_index").get() as { c: number };
+    return row.c;
+  }
+
+  /** Valid (selectable) indexed manifest rows (benchmark/observability). */
+  publicManifestIndexValidRows(): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS c FROM public_manifest_index WHERE valid = 1")
+      .get() as { c: number };
+    return row.c;
+  }
+
+  /** Ids of indexed-but-invalid manifests (fast diagnostics path). */
+  publicManifestIndexInvalidIds(): string[] {
+    const rows = this.db
+      .prepare("SELECT id FROM public_manifest_index WHERE valid = 0 ORDER BY id ASC")
+      .all() as unknown as { id: string }[];
+    return rows.map((r) => r.id);
+  }
+
+  /**
+   * Bounded top-N manifest ids (timestamp desc, id asc tiebreak), optionally
+   * filtered by file (prefix for `log --file`, exact for `context`) and by
+   * author/model. Only VALID manifests are selectable — malformed manifests
+   * are surfaced by status/doctor (which always re-read every file), never
+   * silently rendered by log/context.
+   */
+  topPublicManifestIds(
+    limit: number,
+    opts: { file?: string; fileExact?: boolean; author?: string; model?: string } = {},
+  ): string[] {
+    const joins: string[] = [];
+    const where: string[] = ["m.valid = 1"];
+    const params: (string | number)[] = [];
+    if (opts.file !== undefined) {
+      joins.push("JOIN public_manifest_files f ON f.manifest_id = m.id");
+      if (opts.fileExact) {
+        where.push("f.file_path = ?");
+        params.push(opts.file);
+      } else {
+        where.push("f.file_path LIKE ? || '%'");
+        params.push(opts.file);
+      }
+    }
+    if (opts.author !== undefined) {
+      where.push("m.author_id = ?");
+      params.push(opts.author);
+    }
+    if (opts.model !== undefined) {
+      where.push("m.model = ?");
+      params.push(opts.model);
+    }
+    const sql = `
+      SELECT DISTINCT m.id
+      FROM public_manifest_index m
+      ${joins.join("\n")}
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY m.timestamp_ms DESC, m.id ASC
+      LIMIT ?
+    `;
+    const rows = this.db.prepare(sql).all(...params, safeLimit(limit, 100)) as unknown as {
+      id: string;
+    }[];
+    return rows.map((r) => r.id);
   }
 }
 

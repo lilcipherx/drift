@@ -24,7 +24,14 @@
     "url": "https://github.com/lilcipherx/drift/issues"
   },
   "homepage": "https://github.com/lilcipherx/drift",
-  "keywords": ["drift", "intent", "versioning", "github", "app", "webhook"],
+  "keywords": [
+    "drift",
+    "intent",
+    "versioning",
+    "github",
+    "app",
+    "webhook"
+  ],
   "publishConfig": {
     "access": "public"
   },
@@ -32,6 +39,8 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@drift/core": "0.1.1"
+    "@drift/core": "0.1.1",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.0"
   }
 }

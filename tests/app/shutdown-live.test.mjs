@@ -148,7 +148,15 @@ describe("close() in-flight and force-grace semantics", () => {
         }
         if (req.method === "GET" && /\/pulls\/\d+$/.test(path)) {
           res.writeHead(200, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ head: { sha: HEAD }, title: "feat: add login" }));
+          return res.end(JSON.stringify({ head: { sha: HEAD }, base: { sha: "0".repeat(40) }, commits: 1, changed_files: 0, title: "feat: add login" }));
+        }
+        if (req.method === "GET" && path.includes("/compare/")) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ total_commits: 1, commits: [{ sha: "d".repeat(40) }] }));
+        }
+        if (req.method === "GET" && path.match(/\/pulls\/\d+\/files$/)) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify([]));
         }
         // the hook under test: slow (ms) or never-finishing commits listing
         if (req.method === "GET" && path.match(/\/pulls\/\d+\/commits$/)) {

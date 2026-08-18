@@ -1,22 +1,56 @@
 #!/usr/bin/env bash
-# Publish the @drift package chain to npm and verify the MCP handshake via npx.
+# Publish the Drift package chain to npm and verify the MCP handshake via npx.
 #
-#   bash scripts/publish-npm.sh
+#   bash scripts/publish-npm.sh            # publish (after approval)
+#   bash scripts/publish-npm.sh --dry-run  # plan + npm publish --dry-run only
 #
-# Run this from a terminal where `npm whoami` works (i.e. where you ran
-# `npm adduser`). It publishes in dependency order (@drift/ast → @drift/core →
-# @drift/cli → @drift/mcp), confirms each version on the registry, then
-# launches `npx -y @drift/mcp` from an empty directory and checks the JSON-RPC
-# handshake (initialize + tools/list).
+# SAFETY PREFLIGHT (do not remove):
+#   1. prints the target package names;
+#   2. verifies `npm whoami` (authenticated session);
+#   3. verifies the registry is the public npmjs registry;
+#   4. refuses to publish unless the configured scope is approved:
+#        DRIFT_NPM_SCOPE_APPROVED=1 bash scripts/publish-npm.sh
+#      Approval is a manual, explicit step — see docs/NPM_SCOPE_DECISION.md.
+#   5. --dry-run runs `npm publish --dry-run` and never touches the registry.
+# Never prints npm tokens. Run from a terminal where `npm whoami` works.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-echo "==> npm identity: $(npm whoami)"
-echo "==> registry:     $(npm config get registry)"
+DRY_RUN=false
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=true
+  echo "==> DRY-RUN mode: builds, packs and runs npm publish --dry-run only."
+fi
 
-# 1. Fresh build so dist/ matches src/ (dist is committed).
+# 1. Preflight: identity + registry (never print credentials/tokens).
+echo "==> npm identity: $(npm whoami)"
+REGISTRY="$(npm config get registry)"
+echo "==> registry:     ${REGISTRY}"
+case "$REGISTRY" in
+  https://registry.npmjs.org/|https://registry.npmjs.org)
+    ;;
+  *)
+    echo "ERROR: refusing to publish to a non-public registry: ${REGISTRY}" >&2
+    exit 1
+    ;;
+esac
+
+# 2. Preflight: scope approval gate (see docs/NPM_SCOPE_DECISION.md).
+echo "==> target packages:"
+for pkg in ast core cli mcp; do
+  echo "    @drift/${pkg}  ($(node -p "require('./packages/drift-${pkg}/package.json').version"))"
+done
+if [ "${DRIFT_NPM_SCOPE_APPROVED:-}" != "1" ]; then
+  echo "ERROR: publishing is blocked until the npm scope is approved." >&2
+  echo "  The @drift/* scope ownership is UNVERIFIED (see docs/NPM_SCOPE_DECISION.md)." >&2
+  echo "  When the scope is confirmed, re-run with:" >&2
+  echo "    DRIFT_NPM_SCOPE_APPROVED=1 bash scripts/publish-npm.sh [--dry-run]" >&2
+  exit 1
+fi
+
+# 3. Fresh build so dist/ matches src/ (dist is committed).
 echo "==> npm run build"
 npm run build
 
@@ -26,6 +60,11 @@ publish_pkg () {
   local v got
   v="$(node -p "require('./${dir}/package.json').version")"
   echo "==> publishing ${pkg}@${v}"
+  if [ "$DRY_RUN" = true ]; then
+    (cd "${dir}" && npm publish --access public --dry-run)
+    echo "    dry-run ok: ${pkg}@${v}"
+    return 0
+  fi
   (cd "${dir}" && npm publish --access public)
   echo "==> waiting for the registry to confirm ${pkg}@${v}"
   for _ in $(seq 1 15); do
@@ -44,6 +83,12 @@ publish_pkg "@drift/ast"  "packages/drift-ast"
 publish_pkg "@drift/core" "packages/drift-core"
 publish_pkg "@drift/cli"  "packages/drift-cli"
 publish_pkg "@drift/mcp"  "packages/drift-mcp"
+
+if [ "$DRY_RUN" = true ]; then
+  echo
+  echo "==> DRY-RUN complete — nothing was published."
+  exit 0
+fi
 
 echo
 echo "==> handshake: npx -y @drift/mcp from an empty directory"

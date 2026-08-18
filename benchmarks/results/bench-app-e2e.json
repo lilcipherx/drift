@@ -1,0 +1,288 @@
+{
+  "scenario": "all",
+  "machine": "win32 x64",
+  "results": [
+    {
+      "name": "happy",
+      "deliveries": 150,
+      "intakeMs": {
+        "count": 150,
+        "p50": 14.373699999999872,
+        "p95": 18.273299999999836,
+        "p99": 47.849899999999934,
+        "max": 507.7273,
+        "mean": 16.4
+      },
+      "e2eMs": {
+        "count": 150,
+        "p50": 17,
+        "p95": 31,
+        "p99": 507,
+        "max": 509,
+        "mean": 26.5
+      },
+      "postWallMs": 2482,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 150,
+        "dead": 0,
+        "total": 150
+      },
+      "checkRuns": 150,
+      "comments": 150,
+      "commentUpdates": 0,
+      "duplicateResponses": 0,
+      "redeliveredDeduped": 0,
+      "mockCalls": {},
+      "assertions": {
+        "all-done": true,
+        "no-dead": true,
+        "check-runs": true,
+        "comments": true
+      }
+    },
+    {
+      "name": "rate-limit",
+      "deliveries": 30,
+      "intakeMs": {
+        "count": 30,
+        "p50": 14.847599999999602,
+        "p95": 20.4070999999999,
+        "p99": 23.901299999999992,
+        "max": 23.901299999999992,
+        "mean": 13.9
+      },
+      "e2eMs": {
+        "count": 30,
+        "p50": 28,
+        "p95": 244,
+        "p99": 254,
+        "max": 254,
+        "mean": 45.5
+      },
+      "postWallMs": 422,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 30,
+        "dead": 0,
+        "total": 30
+      },
+      "checkRuns": 30,
+      "comments": 30,
+      "commentUpdates": 0,
+      "duplicateResponses": 0,
+      "redeliveredDeduped": 0,
+      "mockCalls": {
+        "getPullRequest": 33,
+        "getPullCommits": 32
+      },
+      "assertions": {
+        "all-done": true,
+        "no-dead": true,
+        "check-runs": true,
+        "retried": true
+      }
+    },
+    {
+      "name": "transient",
+      "deliveries": 30,
+      "intakeMs": {
+        "count": 30,
+        "p50": 14.690200000000004,
+        "p95": 17.015200000000732,
+        "p99": 19.05410000000029,
+        "max": 19.05410000000029,
+        "mean": 12.6
+      },
+      "e2eMs": {
+        "count": 30,
+        "p50": 20,
+        "p95": 34,
+        "p99": 65,
+        "max": 65,
+        "mean": 24.3
+      },
+      "postWallMs": 381,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 30,
+        "dead": 0,
+        "total": 30
+      },
+      "checkRuns": 30,
+      "comments": 30,
+      "commentUpdates": 0,
+      "duplicateResponses": 0,
+      "redeliveredDeduped": 0,
+      "mockCalls": {
+        "getPullFiles": 31
+      },
+      "assertions": {
+        "all-done": true,
+        "no-dead": true,
+        "check-runs": true,
+        "retried": true
+      }
+    },
+    {
+      "name": "duplicates",
+      "deliveries": 20,
+      "intakeMs": {
+        "count": 20,
+        "p50": 15.96810000000005,
+        "p95": 16.92909999999938,
+        "p99": 18.187600000000202,
+        "max": 18.187600000000202,
+        "mean": 13.8
+      },
+      "e2eMs": {
+        "count": 20,
+        "p50": 29,
+        "p95": 30,
+        "p99": 59,
+        "max": 59,
+        "mean": 27.6
+      },
+      "postWallMs": 564,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 20,
+        "dead": 0,
+        "total": 20
+      },
+      "checkRuns": 20,
+      "comments": 20,
+      "commentUpdates": 0,
+      "duplicateResponses": 20,
+      "redeliveredDeduped": 20,
+      "mockCalls": {},
+      "assertions": {
+        "all-done": true,
+        "no-dead": true,
+        "one-check-run-per-delivery": true,
+        "queued-dupes-detected": true
+      }
+    },
+    {
+      "name": "stale",
+      "deliveries": 1,
+      "intakeMs": {
+        "count": 1,
+        "p50": 1.7247999999999593,
+        "p95": 1.7247999999999593,
+        "p99": 1.7247999999999593,
+        "max": 1.7247999999999593,
+        "mean": 1.7
+      },
+      "e2eMs": {
+        "count": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0,
+        "max": 0,
+        "mean": 0
+      },
+      "postWallMs": 2,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 1,
+        "dead": 0,
+        "total": 1
+      },
+      "checkRuns": 0,
+      "comments": 0,
+      "commentUpdates": 0,
+      "duplicateResponses": 0,
+      "redeliveredDeduped": 0,
+      "mockCalls": {},
+      "assertions": {
+        "all-done": true,
+        "no-check-run": true
+      }
+    },
+    {
+      "name": "worker-crash",
+      "deliveries": 20,
+      "intakeMs": {
+        "count": 20,
+        "p50": 14.086600000000544,
+        "p95": 16.448099999999613,
+        "p99": 17.992200000000594,
+        "max": 17.992200000000594,
+        "mean": 10.6
+      },
+      "e2eMs": {
+        "count": 20,
+        "p50": 17,
+        "p95": 30,
+        "p99": 31,
+        "max": 31,
+        "mean": 19.8
+      },
+      "postWallMs": 214,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 20,
+        "dead": 0,
+        "total": 20
+      },
+      "checkRuns": 20,
+      "comments": 20,
+      "commentUpdates": 0,
+      "duplicateResponses": 0,
+      "redeliveredDeduped": 0,
+      "mockCalls": {},
+      "assertions": {
+        "all-done": true,
+        "no-dead": true,
+        "crashed-job-recovered": true
+      }
+    },
+    {
+      "name": "parallel-workers",
+      "deliveries": 60,
+      "intakeMs": {
+        "count": 60,
+        "p50": 14.55580000000009,
+        "p95": 17.743499999998676,
+        "p99": 80.2512999999999,
+        "max": 80.2512999999999,
+        "mean": 14.5
+      },
+      "e2eMs": {
+        "count": 60,
+        "p50": 23,
+        "p95": 32,
+        "p99": 93,
+        "max": 93,
+        "mean": 24.6
+      },
+      "postWallMs": 878,
+      "stats": {
+        "pending": 0,
+        "inProgress": 0,
+        "done": 60,
+        "dead": 0,
+        "total": 60
+      },
+      "checkRuns": 60,
+      "comments": 60,
+      "commentUpdates": 0,
+      "duplicateResponses": 0,
+      "redeliveredDeduped": 0,
+      "mockCalls": {},
+      "assertions": {
+        "all-done": true,
+        "no-dead": true,
+        "exactly-once": true
+      }
+    }
+  ],
+  "passed": true
+}

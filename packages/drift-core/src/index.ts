@@ -1,4 +1,4 @@
-export { Drift } from "./engine.js";
+export { Drift, ensureDriftGitignore, sanitizedVerifyEnv, VERIFY_ENV_ALLOWLIST } from "./engine.js";
 export type {
   BlameResult,
   DoctorCheck,
@@ -7,8 +7,77 @@ export type {
   RealizeOptions,
   RealizeResult,
   ReplayResult,
+  SignatureState,
+  SignerState,
   VerifyResult,
 } from "./engine.js";
+export {
+  PublicStore,
+  buildPublicSummary,
+  genericPublicSummary,
+  parsePublicIntentManifest,
+  readManifestFile,
+  sanitizePublicText,
+  signingKeyIdFor,
+  signingKeyIdForValidKey,
+  INTENT_ID_RE,
+  MANIFEST_FILES_MAX,
+  MANIFEST_MAX_BYTES,
+  MANIFEST_SUMMARY_MAX,
+  PUBLIC_FILES_MAX,
+  PUBLIC_SUMMARY_MAX,
+} from "./public.js";
+export type {
+  ManifestParseResult,
+  ManifestValidationError,
+  PublicAgent,
+  PublicIntentFile,
+  PublicIntentManifestBase,
+  PublicIntentManifestV1,
+  PublicIntentManifestV2,
+  PublicIntentView,
+  UnsignedPublicIntentView,
+} from "./public.js";
+export {
+  DRIFT_INTENT_ID_RE,
+  extractDriftIntentIds,
+  extractDriftIntentIdsRaw,
+  parseGitTrailers,
+} from "./trailers.js";
+export {
+  TRUST_ROOT_MAX_BYTES,
+  evaluateTrustRootChange,
+  isUsableTrustRoot,
+  parseTrustRoot,
+  tryParseTrustRoot,
+} from "./trust-root.js";
+export type { ParsedTrustRoot, TrustRootChange, TrustRootMalformedCode } from "./trust-root.js";
+export {
+  KEYRING_MAX_BYTES,
+  KEYRING_PATH,
+  applyKeyringChange,
+  createKeyring,
+  evaluateKeyringChange,
+  findKeyringEntry,
+  keyringFingerprint,
+  keyringPath,
+  keyringPayload,
+  loadTrustSet,
+  parseKeyringKey,
+  validateKeyring,
+  writeKeyringFile,
+} from "./keyring.js";
+export type {
+  KeyringAction,
+  KeyringAuditEntry,
+  KeyringChange,
+  KeyringChangeAction,
+  KeyringChangeResult,
+  KeyringEntry,
+  KeyringFile,
+  TrustSet,
+} from "./keyring.js";
+export type { GitTrailer } from "./trailers.js";
 export { DriftError, EXIT, NotInitializedError } from "./errors.js";
 export type { ExitCode } from "./errors.js";
 export {

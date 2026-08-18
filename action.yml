@@ -1,12 +1,26 @@
 name: "Drift Intent Check"
-description: "Validate and summarize Drift intents on this pull request (PRD §14.4)."
+description: "Validate Drift and post a privacy-safe intent summary for THIS pull request's commits only (ADR-009: public manifests, never the full prompt). Informational operations only — provenance-recorded verification commands are never executed in CI."
 author: "Drift"
 inputs:
-  command:
-    description: "drift subcommand to run against the repo (log | doctor | verify <intent-id>)"
+  operation:
+    description: "Safe Drift operation to run. Allowlist: log | doctor | status | verify-intent. Command execution (verify --run), private prompt export, replay, realize, and key operations are never available through the Action."
+    required: false
     default: "log"
+  intent-id:
+    description: "Intent ID for informational verification (used with operation: verify-intent or verify)."
+    required: false
+  command:
+    description: "DEPRECATED: legacy free-form Drift command (log | doctor | status | verify-intent <id>). Parsed with a strict allowlist and a real tokenizer — unsafe operations and flags are rejected before the CLI is invoked. Prefer `operation` + `intent-id`."
+    required: false
+    deprecationMessage: "Use `operation` (and `intent-id` for verify-intent) instead of a free-form `command` string."
   comment:
-    description: "Post (or update in place) a Drift intent-summary comment on the PR. Requires GITHUB_TOKEN; skipped automatically on non-PR runs or repos without Drift intents."
+    description: "Post (or update in place) a Drift intent-summary comment on the PR. Requires GITHUB_TOKEN and `pull-requests: write`; skipped automatically on non-PR runs or repos without Drift intents. On forks with a read-only token the summary is written to the step summary instead. The summary is always written to the step summary first, even when no token is available."
+    default: "true"
+  fail-on-comment-error:
+    description: "When true, the job fails if the PR comment cannot be posted/updated (e.g. a fork's read-only token). Default false: warn and fall back to the step summary."
+    default: "false"
+  fail-on-provenance-error:
+    description: "When true (default), the job fails when Drift detects invalid or tampered provenance: invalid signature, untrusted-key, malformed manifest, signingKeyId mismatch, trust-root replacement/removal or ANY malformed key state (malformed initial key / malformed replacement / malformed base root), modified/deleted/renamed/orphan manifest, a NEW Drift-Intent trailer without its public manifest, manifest/trailer commit mismatch, post-introduction modification, intent replay, or ambiguous intent association. Neutral states (valid bootstrap, unsigned/unverifiable/legacy-missing manifests, no intents) never fail. The step summary and PR comment are still generated before the non-zero exit, and the failure applies even when GITHUB_TOKEN is absent."
     default: "true"
 runs:
   using: "composite"
@@ -18,25 +32,27 @@ runs:
       shell: bash
       working-directory: ${{ github.action_path }}
       run: npm ci --no-audit --no-fund
-    - name: "Run drift ${{ inputs.command }}"
+    # Informational, allowlisted Drift operations. The command string is
+    # parsed by scripts/action-run.mjs with a real tokenizer against an
+    # explicit allowlist — never shell word-splitting, never free-form args.
+    - name: "Run drift (allowlisted operations)"
       shell: bash
-      run: |
-        set +e
-        DRIFT_OUTPUT="$(node "$GITHUB_ACTION_PATH/packages/drift-cli/dist/cli.js" $DRIFT_COMMAND --json 2>&1)"
-        DRIFT_EXIT=$?
-        echo "::group::drift output"
-        echo "$DRIFT_OUTPUT"
-        echo "::endgroup::"
-        echo "drift_exit=$DRIFT_EXIT" >> "$GITHUB_ENV"
-        exit $DRIFT_EXIT
       env:
+        DRIFT_OPERATION: ${{ inputs.operation }}
+        DRIFT_INTENT_ID: ${{ inputs.intent-id }}
         DRIFT_COMMAND: ${{ inputs.command }}
-    # Idempotent provenance summary: posts once, then PATCHes the same
-    # marker comment on every synchronize/force-push. Never spams.
+        DRIFT_WORKSPACE: ${{ github.workspace }}
+      run: node "$GITHUB_ACTION_PATH/scripts/action-run.mjs"
+    # Privacy-safe, PR-scoped, idempotent provenance summary: reads only
+    # Drift-Intent trailers from THIS PR's commits + `.drift/public/`
+    # manifests. Never renders the full prompt. Writes the step summary
+    # BEFORE the token check, then posts once and PATCHes the same owned
+    # marker comment on every synchronize/force-push.
     - name: "Post Drift PR summary comment"
       if: ${{ inputs.comment == 'true' }}
       shell: bash
       env:
         GITHUB_TOKEN: ${{ github.token }}
-        DRIFT_CLI: ${{ github.action_path }}/packages/drift-cli/dist/cli.js
+        FAIL_ON_COMMENT_ERROR: ${{ inputs.fail-on-comment-error }}
+        FAIL_ON_PROVENANCE_ERROR: ${{ inputs.fail-on-provenance-error }}
       run: node "$GITHUB_ACTION_PATH/scripts/pr-comment.mjs"

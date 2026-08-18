@@ -95,6 +95,7 @@ function cliArgsFor(tool, input) {
   const args = [cmd];
   if (cmd === "realize") {
     args.push("-p", String(input.prompt));
+    if (input.summary) args.push("--summary", String(input.summary));
     for (const f of input.files ?? []) args.push(f);
     if (input.model) args.push("--agent", "--model", String(input.model));
     if (input.agentState) args.push("--state", String(input.agentState));
@@ -139,9 +140,9 @@ function runScenario(scenario) {
   const failures = [];
   let syntaxExpected = 0;
   let syntaxRejected = 0;
-  let lastRealizePrompt = null;
-  let blamePromptHits = 0;
-  let blamePromptTotal = 0;
+  let lastRealizeSummary = null;
+  let blameSummaryHits = 0;
+  let blameSummaryTotal = 0;
 
   for (const step of scenario.steps) {
     // apply mock file state to the working tree
@@ -150,7 +151,7 @@ function runScenario(scenario) {
       mkdirSync(dirname(abs), { recursive: true });
       writeFileSync(abs, content);
     }
-    if (step.tool === "drift_realize") lastRealizePrompt = step.input.prompt;
+    if (step.tool === "drift_realize") lastRealizeSummary = step.input.summary ?? null;
 
     const args = cliArgsFor(step.tool, step.input);
     const actual = drift(repo, args);
@@ -162,9 +163,16 @@ function runScenario(scenario) {
       if (ok && actual.json?.type === "syntax") syntaxRejected++;
     }
     if (step.tool === "drift_blame" && step.expect.baseline === false) {
-      blamePromptTotal++;
-      if (ok && actual.json?.intent && lastRealizePrompt !== null && actual.json.intent.prompt === lastRealizePrompt) {
-        blamePromptHits++;
+      blameSummaryTotal++;
+      // ADR-009: blame exposes the safe public `summary` (the explicit
+      // `--summary` passed to realize), never the private prompt.
+      if (
+        ok &&
+        actual.json?.intent &&
+        lastRealizeSummary !== null &&
+        actual.json.intent.summary === lastRealizeSummary
+      ) {
+        blameSummaryHits++;
       }
     }
     if (!ok) failures.push({ step, actual });
@@ -177,8 +185,8 @@ function runScenario(scenario) {
     failures,
     syntaxExpected,
     syntaxRejected,
-    blamePromptHits,
-    blamePromptTotal,
+    blameSummaryHits,
+    blameSummaryTotal,
   };
 }
 
@@ -231,8 +239,8 @@ const overhead = measureRealizeOverhead();
 
 const syntaxTotal = scenarioResults.reduce((s, r) => s + r.syntaxExpected, 0);
 const syntaxOk = scenarioResults.reduce((s, r) => s + r.syntaxRejected, 0);
-const blameTotal = scenarioResults.reduce((s, r) => s + r.blamePromptTotal, 0);
-const blameOk = scenarioResults.reduce((s, r) => s + r.blamePromptHits, 0);
+const blameTotal = scenarioResults.reduce((s, r) => s + r.blameSummaryTotal, 0);
+const blameOk = scenarioResults.reduce((s, r) => s + r.blameSummaryHits, 0);
 
 const metrics = {
   syntaxRejectionRate: syntaxTotal > 0 ? syntaxOk / syntaxTotal : 1,

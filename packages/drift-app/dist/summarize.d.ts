@@ -1,14 +1,11 @@
 /**
- * Build the semantic PR summary comment from intents (PRD §16.2, §26.3):
- * "Review intent, not 2,000 lines of diff."
+ * Build the semantic PR summary comment from SAFE public intent views
+ * (ADR-009). Never receives or renders `prompt` — the full prompt is private
+ * and must never appear in a PR comment or check-run summary.
  */
 import type { IntentView } from "./intents.js";
-/**
- * Invisible marker embedded in every Drift summary comment. The webhook
- * handler uses it to find an existing comment and update it in place, so
- * comments never accumulate across `synchronize` deliveries.
- */
-export declare const SUMMARY_MARKER = "<!-- drift:summary -->";
+import { SUMMARY_MARKER, type ProvenanceAudit } from "./trust.js";
+export { SUMMARY_MARKER };
 export interface SummaryInput {
     owner: string;
     repo: string;
@@ -16,6 +13,15 @@ export interface SummaryInput {
     prTitle: string;
     intents: IntentView[];
     repoUrl?: string;
+    /** Trust-root warning is prepended when the PR modifies key.pem. A malformed
+     *  key state (malformed bootstrap / malformed replacement / malformed base
+     *  root) renders its own blocking warning — never a neutral bootstrap. */
+    keyChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
+    /** Multi-signer keyring change (append-only trust set). Blocking states
+     *  render their own warning — never silent. */
+    keyringChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
+    /** Public-provenance integrity violations (append-only rules). */
+    audit?: ProvenanceAudit;
 }
 export declare function summarizeIntents(input: SummaryInput): string;
 //# sourceMappingURL=summarize.d.ts.map

@@ -1,0 +1,22 @@
+{
+  "scenario": {
+    "deliveries": 2000,
+    "duplicatePass": 400,
+    "pool": 16,
+    "machine": "win32 x64"
+  },
+  "intakeMs": {
+    "count": 2400,
+    "p50": 8.113599999999906,
+    "p95": 19.394300000000044,
+    "p99": 26.987999999999943,
+    "max": 47.5219,
+    "mean": 10.247429291666673
+  },
+  "accepted": 2000,
+  "duplicatesDetected": 79,
+  "badSignatures": 0,
+  "throughputPerSec": 1469,
+  "modeledPeakPerSec": 116,
+  "modeled2xPeakPerSec": 232
+}

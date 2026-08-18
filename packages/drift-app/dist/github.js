@@ -5,17 +5,108 @@
  * The interface `GitHubClientLike` is what the webhook handler depends on, so
  * tests can inject a fake with zero network access.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createAppJwt } from "./jwt.js";
+/**
+ * Per-delivery installation scope. The worker processes deliveries for MANY
+ * installations concurrently on one shared client; a single mutable
+ * `installationId` field would let one delivery's setInstallation overwrite
+ * another's between awaits, swapping the installation token used for a repo
+ * (a cross-tenant token leak). AsyncLocalStorage binds the installation to
+ * the delivery's OWN async chain, so interleaved jobs never observe each
+ * other's scope.
+ */
+const installationScope = new AsyncLocalStorage();
+/** Thrown for GitHub rate-limit responses (429 or secondary 403 with
+ *  Retry-After). The handler treats these as transient (retryable). */
+export class RateLimitError extends Error {
+    retryAfterMs;
+    status;
+    constructor(message, retryAfterMs, status) {
+        super(message);
+        this.retryAfterMs = retryAfterMs;
+        this.status = status;
+        this.name = "RateLimitError";
+    }
+}
+/** Parse X-RateLimit-* headers defensively (untrusted network input). */
+function parseRateLimitHeaders(headers) {
+    const remaining = Number(headers.get("x-ratelimit-remaining"));
+    const limit = Number(headers.get("x-ratelimit-limit"));
+    const reset = Number(headers.get("x-ratelimit-reset"));
+    if (!Number.isFinite(remaining) || !Number.isFinite(limit) || !Number.isFinite(reset))
+        return null;
+    return { remaining, limit, reset };
+}
+function retryAfterMs(headers) {
+    const raw = headers.get("retry-after");
+    if (!raw)
+        return null;
+    const secs = Number(raw);
+    if (Number.isFinite(secs) && secs >= 0)
+        return secs * 1000;
+    const date = Date.parse(raw);
+    if (Number.isFinite(date))
+        return Math.max(0, date - Date.now());
+    return null;
+}
 export class GitHubAppClient {
     opts;
     baseUrl;
     fetchImpl;
     /** Installation-scoped token cache (multi-tenant safe). */
     installationTokens = new Map();
+    requestTimeoutMs;
+    breakerThreshold;
+    breakerResetMs;
+    /** Rate-limit snapshot from the most recent response (per client). */
+    rateLimit = { remaining: -1, limit: -1, resetEpochSec: 0, throttled: 0 };
+    /** Installation-token circuit breaker state. */
+    breakerFailures = 0;
+    breakerOpenUntil = 0;
     constructor(opts) {
         this.opts = opts;
         this.baseUrl = (opts.baseUrl ?? "https://api.github.com").replace(/\/+$/, "");
         this.fetchImpl = opts.fetchImpl ?? fetch;
+        this.requestTimeoutMs =
+            Number.isFinite(opts.requestTimeoutMs) && (opts.requestTimeoutMs ?? 0) > 0
+                ? opts.requestTimeoutMs
+                : 30_000;
+        this.breakerThreshold = Number.isFinite(opts.breakerThreshold) && (opts.breakerThreshold ?? 0) > 0 ? opts.breakerThreshold : 5;
+        this.breakerResetMs = Number.isFinite(opts.breakerResetMs) && (opts.breakerResetMs ?? 0) > 0 ? opts.breakerResetMs : 15_000;
+    }
+    /** Latest observed GitHub rate-limit status for this client. */
+    getRateLimitStatus() {
+        return { ...this.rateLimit };
+    }
+    /** Record rate-limit headers from a response (defensive parsing). */
+    trackRateLimit(headers) {
+        const parsed = parseRateLimitHeaders(headers);
+        if (parsed) {
+            this.rateLimit = {
+                remaining: parsed.remaining,
+                limit: parsed.limit,
+                resetEpochSec: parsed.reset,
+                throttled: this.rateLimit.throttled,
+            };
+        }
+    }
+    /**
+     * Classify rate-limit responses: 429 always; 403 with Retry-After (the
+     * GitHub secondary-rate-limit signal) throws RateLimitError so callers
+     * retry with backoff instead of failing the audit permanently.
+     */
+    checkRateLimit(res, opLabel) {
+        if (res.status === 429) {
+            this.rateLimit.throttled++;
+            const wait = retryAfterMs(res.headers) ?? 60_000;
+            throw new RateLimitError(`${opLabel} failed: 429 rate limited (retry in ${Math.ceil(wait / 1000)}s)`, wait, 429);
+        }
+        if (res.status === 403 && res.headers.get("retry-after")) {
+            this.rateLimit.throttled++;
+            const wait = retryAfterMs(res.headers) ?? 60_000;
+            throw new RateLimitError(`${opLabel} failed: 403 secondary rate limited (retry in ${Math.ceil(wait / 1000)}s)`, wait, 403);
+        }
     }
     appJwt() {
         return createAppJwt(this.opts.appId, this.opts.privateKeyPem);
@@ -25,20 +116,42 @@ export class GitHubAppClient {
         const cached = this.installationTokens.get(installationId);
         if (cached && cached.expiresAt > Date.now() + 30_000)
             return cached.value;
-        const res = await this.fetchImpl(`${this.baseUrl}/app/installations/${installationId}/access_tokens`, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${this.appJwt()}`,
-                Accept: "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                // GitHub rejects requests without a User-Agent (403).
-                "User-Agent": "drift-app/0.1.0",
-            },
-            body: "{}",
-        });
+        // Circuit breaker: repeated token-request failures (e.g. GitHub outage or
+        // a revoked App key) open the circuit briefly so workers stop hammering
+        // the API and fail fast with a retryable error.
+        if (this.breakerOpenUntil > Date.now()) {
+            throw new Error(`installation token request failed: 503 breaker open (retry in ${Math.ceil((this.breakerOpenUntil - Date.now()) / 1000)}s)`);
+        }
+        let res;
+        try {
+            res = await this.fetchImpl(`${this.baseUrl}/app/installations/${installationId}/access_tokens`, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${this.appJwt()}`,
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    // GitHub rejects requests without a User-Agent (403).
+                    "User-Agent": "drift-app/0.1.0",
+                },
+                body: "{}",
+                signal: AbortSignal.timeout(this.requestTimeoutMs),
+            });
+        }
+        catch (err) {
+            // Network/timeout failures are transient — do not open the breaker on
+            // them (a single outage would trip every installation).
+            throw new Error(`installation token request failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         if (!res.ok) {
+            this.checkRateLimit(res, "installation token request");
+            this.breakerFailures++;
+            if (this.breakerFailures >= this.breakerThreshold) {
+                this.breakerOpenUntil = Date.now() + this.breakerResetMs;
+                this.breakerFailures = 0;
+            }
             throw new Error(`installation token request failed: ${res.status} ${await res.text()}`);
         }
+        this.breakerFailures = 0;
         const data = (await res.json());
         this.installationTokens.set(installationId, {
             value: data.token,
@@ -47,7 +160,7 @@ export class GitHubAppClient {
         return data.token;
     }
     async request(path, token, init = {}) {
-        return this.fetchImpl(`${this.baseUrl}${path}`, {
+        const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
             ...init,
             headers: {
                 Authorization: `Bearer ${token}`,
@@ -56,7 +169,13 @@ export class GitHubAppClient {
                 "User-Agent": "drift-app/0.1.0",
                 ...(init.headers ?? {}),
             },
+            // Bounded per-request timeout: a stalled GitHub connection must never
+            // hold a worker slot or webhook connection indefinitely.
+            ...(init.signal ? {} : { signal: AbortSignal.timeout(this.requestTimeoutMs) }),
         });
+        this.trackRateLimit(res.headers);
+        this.checkRateLimit(res, path.split("?")[0] ?? path);
+        return res;
     }
     // ------------------------------------------------------------ reads
     async getPullRequest(owner, repo, number) {
@@ -65,35 +184,132 @@ export class GitHubAppClient {
         if (!res.ok)
             throw new Error(`getPullRequest failed: ${res.status}`);
         const data = (await res.json());
-        return { headSha: data.head.sha, title: data.title };
+        return {
+            headSha: data.head.sha,
+            baseSha: data.base.sha,
+            commits: typeof data.commits === "number" ? data.commits : -1,
+            changedFiles: typeof data.changed_files === "number" ? data.changed_files : -1,
+            title: data.title ?? "",
+        };
     }
     async getPullCommits(owner, repo, number) {
+        const info = await this.getPullRequest(owner, repo, number);
         const token = await this.getInstallationToken(await this.requireInstallation());
         const commits = [];
-        // Paginate so PRs with more than 100 commits still get fully scanned
-        // (cap at 5 000 commits to stay bounded on pathological PRs).
+        let interrupted = false;
+        // The REST endpoint itself caps at 250 commits; paginate through Link
+        // headers (bounded at 50 pages) and let completeness detection decide.
         let path = `/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`;
         for (let page = 0; path && page < 50; page++) {
             const res = await this.request(path, token);
             if (!res.ok)
                 throw new Error(`getPullCommits failed: ${res.status}`);
             const data = (await res.json());
+            if (!Array.isArray(data) || data.length === 0) {
+                // A legitimately EMPTY pull request has zero commits: an empty first
+                // page with an expected count of 0 is a complete listing. Any other
+                // empty page means the API stopped producing data — interrupted. In
+                // BOTH cases clear `path` so the post-loop cap check cannot turn the
+                // legitimate empty listing into a spurious interruption.
+                path = null;
+                if (commits.length === 0 && info.commits === 0)
+                    break;
+                interrupted = true;
+                break;
+            }
             commits.push(...data.map((c) => ({ sha: c.sha, message: c.commit.message })));
             path = nextPagePath(res.headers.get("link"));
         }
-        return commits;
+        if (path && path.length > 0)
+            interrupted = true;
+        // Completeness proof: the returned list must match the PR metadata count
+        // exactly, contain no duplicate or blank SHAs, and never hit the page cap.
+        const dup = commits.length !== new Set(commits.map((c) => c.sha)).size;
+        const invalidSha = commits.some((c) => typeof c.sha !== "string" || !/^[0-9a-f]{40}$/.test(c.sha));
+        // The Pull Request Commits REST endpoint has a HARD maximum of 250
+        // commits: an expected count above that can never be fully enumerated.
+        const overLimit = info.commits > 250;
+        const countMismatch = !overLimit && commits.length !== info.commits;
+        const complete = !interrupted && !dup && !invalidSha && !overLimit && !countMismatch;
+        let reason;
+        if (complete) {
+            reason = undefined;
+        }
+        else if (overLimit) {
+            reason = "over-endpoint-limit";
+        }
+        else if (interrupted) {
+            reason = "pagination-interrupted";
+        }
+        else if (dup) {
+            reason = "duplicate-sha";
+        }
+        else if (invalidSha) {
+            reason = "invalid-sha";
+        }
+        else {
+            reason = "count-mismatch";
+        }
+        return {
+            commits,
+            expectedCount: info.commits,
+            complete,
+            ...(reason ? { reason } : {}),
+        };
     }
-    /** All file paths under `.drift/objects/` reachable from `ref`. */
-    async getObjectPaths(owner, repo, ref) {
+    async getCompareCommits(owner, repo, baseSha, headSha) {
         const token = await this.getInstallationToken(await this.requireInstallation());
-        const res = await this.request(`/repos/${owner}/${repo}/git/trees/${ref}?recursive=1`, token);
+        const shas = [];
+        let path = `/repos/${owner}/${repo}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}?per_page=100`;
+        for (let page = 0; path && page < 20; page++) {
+            const res = await this.request(path, token);
+            if (!res.ok)
+                throw new Error(`getCompareCommits failed: ${res.status}`);
+            const data = (await res.json());
+            if (!Array.isArray(data.commits))
+                break;
+            shas.push(...data.commits.map((c) => c.sha).filter((s) => typeof s === "string" && s.length > 0));
+            path = nextPagePath(res.headers.get("link"));
+        }
+        return [...new Set(shas)];
+    }
+    async getPullFiles(owner, repo, number) {
+        const token = await this.getInstallationToken(await this.requireInstallation());
+        const files = [];
+        let path = `/repos/${owner}/${repo}/pulls/${number}/files?per_page=100`;
+        let truncated = false;
+        for (let page = 0; path && page < 20; page++) {
+            const res = await this.request(path, token);
+            if (!res.ok)
+                throw new Error(`getPullFiles failed: ${res.status}`);
+            const data = (await res.json());
+            files.push(...data.map((f) => ({
+                filename: f.filename,
+                status: f.status,
+                ...(f.previous_filename ? { previous_filename: f.previous_filename } : {}),
+            })));
+            path = nextPagePath(res.headers.get("link"));
+        }
+        // Reaching the page cap with a next link still present means the response
+        // is INCOMPLETE — the caller must treat the audit as incomplete (a
+        // security policy that never infers "no public changes" from a partial
+        // listing).
+        if (path && path.length > 0)
+            truncated = true;
+        return { files, truncated };
+    }
+    /** File NAMES in a directory at a ref ([] when the dir does not exist). */
+    async listDirectory(owner, repo, path, ref) {
+        const token = await this.getInstallationToken(await this.requireInstallation());
+        const res = await this.request(`/repos/${owner}/${repo}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`, token);
+        if (res.status === 404)
+            return [];
         if (!res.ok)
-            return []; // no tree (e.g. empty repo) — nothing to index
+            throw new Error(`listDirectory ${path} failed: ${res.status}`);
         const data = (await res.json());
-        return (data.tree ?? [])
-            .filter((t) => t.type === "blob" && t.path?.startsWith(".drift/objects/") && t.path.endsWith(".json"))
-            .map((t) => t.path)
-            .sort();
+        if (!Array.isArray(data))
+            return [];
+        return data.map((d) => d.name).filter((n) => typeof n === "string");
     }
     /** Raw UTF-8 content of a file at a ref, or null when absent. */
     async getFileContent(owner, repo, path, ref) {
@@ -122,7 +338,12 @@ export class GitHubAppClient {
             if (!res.ok)
                 throw new Error(`listIssueComments failed: ${res.status}`);
             const data = (await res.json());
-            comments.push(...data.map((c) => ({ id: c.id, body: c.body })));
+            comments.push(...data.map((c) => ({
+                id: c.id,
+                body: c.body,
+                user: c.user,
+                performed_via_github_app: c.performed_via_github_app,
+            })));
             path = nextPagePath(res.headers.get("link"));
         }
         return comments;
@@ -136,6 +357,8 @@ export class GitHubAppClient {
         });
         if (!res.ok)
             throw new Error(`postComment failed: ${res.status} ${await res.text()}`);
+        const data = (await res.json());
+        return typeof data.id === "number" ? data.id : 0;
     }
     /** PATCH an existing comment in place (keeps the thread tidy across synchronize events). */
     async updateComment(owner, repo, commentId, body) {
@@ -161,16 +384,27 @@ export class GitHubAppClient {
         });
         if (!res.ok)
             throw new Error(`createCheckRun failed: ${res.status} ${await res.text()}`);
+        const data = (await res.json());
+        return typeof data.id === "number" ? data.id : 0;
     }
+    /**
+     * Bind the installation to the CURRENT delivery's async context. Every
+     * subsequent await in this call chain (the whole audit) resolves the
+     * installation from the context — never from a field another concurrent
+     * delivery could overwrite. Safe for worker concurrency > 1.
+     */
     setInstallation(id) {
-        this.installationId = id;
+        installationScope.enterWith(id);
     }
-    installationId = null;
+    getAppId() {
+        return this.opts.appId?.trim() || null;
+    }
     async requireInstallation() {
-        if (this.installationId == null) {
+        const id = installationScope.getStore();
+        if (id === undefined) {
             throw new Error("installation id is not set — call setInstallation() from the webhook payload");
         }
-        return this.installationId;
+        return id;
     }
 }
 function encodePath(path) {

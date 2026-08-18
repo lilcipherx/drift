@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "id": "did_c650c1eb97facd084028efb445c6e9ef",
+  "summary": "Add clearRefreshCache for tests",
+  "agent": {
+    "type": "HUMAN",
+    "identifier": "Drift Demo"
+  },
+  "files": [
+    {
+      "path": "src/auth.ts",
+      "mutationType": "ADDED",
+      "summary": "function \"clearRefreshCache\" added (line 18)"
+    }
+  ],
+  "timestamp": 1786879992606,
+  "signingKeyId": "89031c64758b09f8",
+  "signature": "xANz6fX03uaKV00XBD9KZsbZPCu3/exEHLPrpehOw920Z1n1gChQbpW6UawyfE/tPGO/T1wnAupmohe1rpL2Bg=="
+}

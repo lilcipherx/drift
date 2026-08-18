@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Live check for `drift-app start` (ADR-008 / adversarial-review security fix):
+# Live check for `drift-app start` (production queue architecture):
 #   CASE 1 — without GITHUB_WEBHOOK_SECRET it must fail fast with a clear error
 #            and exit 1 (a public /webhook endpoint without HMAC is forgeable).
-#   CASE 2 — with the secret (and a throwaway App key) it must boot, answer
-#            /health, 404 on non-POST /webhook, ack a bad signature as
-#            non-retryable, and shut down gracefully on SIGTERM.
+#   CASE 2 — with the secret (and a throwaway App key) it must boot in durable
+#            queue mode, answer /health and /ready, 404 on non-POST /webhook,
+#            reject a bad signature BEFORE enqueueing (401), accept a VALID
+#            signed delivery with a fast 202 (enqueued, audit runs on the
+#            worker, never in the request thread), and shut down gracefully on
+#            SIGTERM (POSIX).
 # Usage: bash scripts/verify-app-start.sh
 set -u
 
@@ -22,17 +25,18 @@ out="$(env -u GITHUB_WEBHOOK_SECRET GITHUB_APP_ID=1 GITHUB_PRIVATE_KEY=x node "$
 code=$?
 echo "$out"
 echo "exit=$code"
-if [ "$code" -ne 1 ] || ! printf '%s' "$out" | grep -q "GITHUB_WEBHOOK_SECRET is required for drift-app start"; then
+if [ "$code" -ne 1 ] || ! printf '%s' "$out" | grep -q "GITHUB_WEBHOOK_SECRET is required"; then
   echo "FAIL: expected a clear error and exit 1" >&2
   fail=1
 fi
 
 echo
-echo "=== CASE 2: start WITH secret -> /health ==="
+echo "=== CASE 2: start WITH secret -> health/ready/queue ==="
 KEY="$(mktemp)"
 LOG="$(mktemp)"
 node -e "const {generateKeyPairSync}=require('node:crypto');const fs=require('node:fs');fs.writeFileSync(process.argv[1],generateKeyPairSync('rsa',{modulusLength:2048}).privateKey.export({type:'pkcs1',format:'pem'}))" "$KEY"
-GITHUB_WEBHOOK_SECRET=test-secret GITHUB_APP_ID=12345 GITHUB_PRIVATE_KEY="$KEY" PORT=0 node "$DIST" start >"$LOG" 2>&1 &
+DATA_DIR="$(mktemp -d)"
+GITHUB_WEBHOOK_SECRET=test-secret GITHUB_APP_ID=12345 GITHUB_PRIVATE_KEY="$KEY" PORT=0 DRIFT_APP_DATA_DIR="$DATA_DIR" node "$DIST" start >"$LOG" 2>&1 &
 SRV=$!
 PORT=""
 for i in $(seq 1 40); do
@@ -44,7 +48,7 @@ cat "$LOG"
 if [ -z "$PORT" ]; then
   echo "FAIL: server did not report a listening port" >&2
   kill -KILL "$SRV" 2>/dev/null
-  rm -f "$KEY" "$LOG"
+  rm -f "$KEY" "$LOG"; rm -rf "$DATA_DIR"
   exit 1
 fi
 echo "port=$PORT"
@@ -53,13 +57,32 @@ health="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:$PORT/health")"
 echo "GET /health: $health"
 printf '%s' "$health" | grep -q '"status":"ok"' || { echo "FAIL: /health did not answer ok" >&2; fail=1; }
 
+ready="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:$PORT/ready")"
+echo "GET /ready: $ready"
+printf '%s' "$ready" | grep -q '"status":"ready"' || { echo "FAIL: /ready did not answer ready" >&2; fail=1; }
+printf '%s' "$ready" | grep -q '"queueDepth"' || { echo "FAIL: /ready did not report queueDepth" >&2; fail=1; }
+
 notfound="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/webhook")"
 echo "GET /webhook http=$notfound (expect 404)"
 [ "$notfound" = "404" ] || { echo "FAIL: expected 404 for non-POST /webhook" >&2; fail=1; }
 
-bad="$(curl -s -X POST -H 'content-type: application/json' -H 'x-github-event: pull_request' -H 'x-hub-signature-256: sha256=deadbeef' -d '{"action":"opened"}' "http://127.0.0.1:$PORT/webhook")"
+bad="$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-github-event: pull_request' -H 'x-hub-signature-256: sha256=deadbeef' -H 'x-github-delivery: delivery-bad' -d '{"action":"opened"}' "http://127.0.0.1:$PORT/webhook")"
 echo "POST /webhook bad signature: $bad"
-printf '%s' "$bad" | grep -q '"retryable":false' || { echo "FAIL: bad signature must be acked as non-retryable" >&2; fail=1; }
+printf '%s' "$bad" | grep -q '"invalid or missing webhook signature"' || { echo "FAIL: bad signature must be rejected before enqueueing" >&2; fail=1; }
+
+# A VALID signed delivery must be accepted with a fast 202 and enqueued — the
+# audit never runs in the request thread (the worker will fail against the
+# real GitHub API with no GITHUB_API_BASE_URL, which is expected and safe).
+RAW='{"action":"opened","installation":{"id":1},"repository":{"name":"r","owner":{"login":"o"}},"pull_request":{"number":1,"title":"t","head":{"sha":"a","base":{"sha":"b"}}}}'
+SIG="sha256=$(printf '%s' "$RAW" | openssl dgst -sha256 -hmac test-secret -hex | sed 's/^.* //')"
+accepted="$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-github-event: pull_request' -H "x-hub-signature-256: $SIG" -H 'x-github-delivery: delivery-ok-1' -d "$RAW" "http://127.0.0.1:$PORT/webhook")"
+echo "POST /webhook valid delivery: $accepted"
+printf '%s' "$accepted" | grep -q '"accepted":true' || { echo "FAIL: valid signed delivery must be accepted (202 enqueue)" >&2; fail=1; }
+
+# Duplicate delivery id must be deduplicated (idempotency), still 202.
+accepted2="$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-github-event: pull_request' -H "x-hub-signature-256: $SIG" -H 'x-github-delivery: delivery-ok-1' -d "$RAW" "http://127.0.0.1:$PORT/webhook")"
+echo "POST /webhook duplicate delivery: $accepted2"
+printf '%s' "$accepted2" | grep -q '"duplicate":true' || { echo "FAIL: duplicate delivery id must be deduplicated" >&2; fail=1; }
 
 kill -TERM "$SRV"
 wait "$SRV" 2>/dev/null
@@ -86,7 +109,7 @@ else
   echo "port $PORT released after termination"
 fi
 
-rm -f "$KEY" "$LOG"
+rm -f "$KEY" "$LOG"; rm -rf "$DATA_DIR"
 if [ "$fail" -eq 0 ]; then
   echo
   echo "ALL CHECKS PASSED"

@@ -135,7 +135,11 @@ test("drift_realize commits with intent", async () => {
   writeFileSync(join(repo, "src", "util.ts"), "export const n = 1;\nexport const answer = () => 42;\n");
   const result = await client.request("tools/call", {
     name: "drift_realize",
-    arguments: { prompt: "Add answer constant via MCP", model: "deepseek-v4" },
+    arguments: {
+      prompt: "Add answer constant via MCP",
+      summary: "Add answer constant via MCP",
+      model: "deepseek-v4",
+    },
   });
   const text = result.content[0].text;
   const data = JSON.parse(text);
@@ -175,14 +179,15 @@ test("drift_verify with unknown intent returns a JSON error", async () => {
   assert.equal(data.status, "error");
 });
 
-test("drift_blame returns originating prompt", async () => {
+test("drift_blame returns the safe public summary, never the private prompt", async () => {
   const result = await client.request("tools/call", {
     name: "drift_blame",
     arguments: { file: "src/util.ts", functionName: "answer" },
   });
   const data = JSON.parse(result.content[0].text);
   assert.equal(data.status, "ok");
-  assert.equal(data.intent.prompt, "Add answer constant via MCP");
+  assert.equal(data.intent.summary, "Add answer constant via MCP");
+  assert.ok(!("prompt" in data.intent), "MCP blame must not expose the private prompt");
 });
 
 test("drift_log lists intents", async () => {
@@ -205,7 +210,7 @@ test("drift_context hydrates reasoning for a file", async () => {
   assert.ok(data.intents.length >= 1);
 });
 
-test("drift_verify runs recorded verification", async () => {
+test("drift_verify is informational by default and executes only with run:true", async () => {
   // record an intent with a verification command
   writeFileSync(join(repo, "src", "util.ts"), "export const n = 1;\nexport const answer = 42;\nexport const q = 7;\n");
   const realize = await client.request("tools/call", {
@@ -213,11 +218,19 @@ test("drift_verify runs recorded verification", async () => {
     arguments: { prompt: "add q", verifyCmd: 'node -e "process.exit(0)"' },
   });
   const realizeData = JSON.parse(realize.content[0].text);
+  // default: informational — never executes repository-provided code
   const verify = await client.request("tools/call", {
     name: "drift_verify",
     arguments: { intentId: realizeData.intentId },
   });
   const verifyData = JSON.parse(verify.content[0].text);
   assert.equal(verifyData.status, "ok");
-  assert.equal(verifyData.verifyStatus, "pass");
+  assert.equal(verifyData.verifyStatus, "not-executed");
+  assert.equal(verifyData.signature, "valid");
+  // explicit run:true executes (validly signed manifest)
+  const verifyRun = await client.request("tools/call", {
+    name: "drift_verify",
+    arguments: { intentId: realizeData.intentId, run: true },
+  });
+  assert.equal(JSON.parse(verifyRun.content[0].text).verifyStatus, "pass");
 });

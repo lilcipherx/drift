@@ -127,7 +127,11 @@ server.registerTool(
     description:
       "Commit changes with semantic intent tracking. Use instead of `git commit`. Rejects broken syntax before commit (never pollutes history). Prompts are redacted for secrets.",
     inputSchema: {
-      prompt: z.string().describe("What you changed and why (the intent)"),
+      prompt: z.string().describe("What you changed and why (the intent) — stays PRIVATE by default"),
+      summary: z
+        .string()
+        .optional()
+        .describe("Safe PUBLIC summary — appears in git history, manifests, PR comments. Redacted and sanitized. Never derived from the prompt."),
       files: z.array(z.string()).optional().describe("Optional file paths to include (default: all changes)"),
       model: z.string().optional().describe("Model identifier, e.g. claude-3-5-sonnet"),
       agentState: z.string().optional().describe("base64 JSON cognitive state to checkpoint for replay"),
@@ -136,6 +140,7 @@ server.registerTool(
   },
   async (args) => {
     const cliArgs: string[] = ["realize", "-p", String(args.prompt ?? ""), "--agent"];
+    if (args.summary) cliArgs.push("--summary", String(args.summary));
     if (Array.isArray(args.files)) cliArgs.push(...args.files.map(String));
     if (args.model) cliArgs.push("--model", String(args.model));
     if (args.agentState) cliArgs.push("--state", String(args.agentState));
@@ -198,7 +203,7 @@ server.registerTool(
   {
     title: "Drift Blame",
     description:
-      'Ask "why does this function exist?" — returns the originating prompt, model and intent for a line or function.',
+      'Ask "why does this function exist?" — returns the safe public summary, model and intent for a line or function (never the private prompt).',
     inputSchema: {
       file: z.string(),
       line: z.number().int().positive().optional().describe("1-based line number"),
@@ -220,13 +225,18 @@ server.registerTool(
   {
     title: "Drift Verify",
     description:
-      "Re-run the verification command recorded in an intent and report pass/fail.",
+      "Report an intent's recorded verification command and signature state WITHOUT executing it (default). Set run:true to execute, which is allowed only when the manifest is validly signed by the repository key — repository-provided verification strings are code.",
     inputSchema: {
       intentId: z.string(),
+      run: z.boolean().optional().describe("Execute the recorded verification command (requires a validly signed manifest). Default false: informational only."),
+      inheritEnv: z.boolean().optional().describe("DANGEROUS: pass the full process environment (including credentials) to the executed command. Requires run:true. Default false: a sanitized non-secret environment."),
     },
   },
   async (args) => {
-    const out = runCli(["verify", String(args.intentId)]);
+    const cliArgs = ["verify", String(args.intentId)];
+    if (args.run) cliArgs.push("--run");
+    if (args.inheritEnv) cliArgs.push("--inherit-env");
+    const out = runCli(cliArgs);
     if (!out.ok) return text({ status: "error", details: out.error?.message });
     return text(out.data);
   },
@@ -237,7 +247,7 @@ server.registerTool(
   {
     title: "Drift Log",
     description:
-      "List recorded intents (ID, author, model, prompt, files) with optional filters.",
+      "List recorded intents (ID, author, model, public summary, files) with optional filters. The full private prompt is never returned.",
     inputSchema: {
       author: z.string().optional(),
       model: z.string().optional(),
