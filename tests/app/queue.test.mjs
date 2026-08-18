@@ -267,17 +267,22 @@ describe("postgres queue: multi-instance claim safety", { skip: !process.env.DRI
     // Build a source SQLite queue with jobs in every lifecycle state.
     const dir = mkdtempSync(join(tmpdir(), "drift-queue-migrate-"));
     const src = new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 3 });
-    await src.enqueue("mig-pending", "pull_request", "{}", { n: 1 });
+    // NOTE: claim(batchSize) with a batch > 1 would claim ALL eligible jobs,
+    // so each lifecycle state is built with its own batch-1 claim.
     await src.enqueue("mig-done", "pull_request", "{}", { n: 2 });
-    const doneJob = (await src.claim(10, 30_000, "w1")).find((j) => j.deliveryId === "mig-done");
+    const doneJob = (await src.claim(1, 30_000, "w1"))[0];
+    assert.equal(doneJob.deliveryId, "mig-done");
     await src.ack(doneJob.id, "ok");
     await src.enqueue("mig-dead", "pull_request", "{}", { n: 3 });
-    const deadJob = (await src.claim(10, 30_000, "w1")).find((j) => j.deliveryId === "mig-dead");
+    const deadJob = (await src.claim(1, 30_000, "w1"))[0];
+    assert.equal(deadJob.deliveryId, "mig-dead");
     await src.deadLetter(deadJob.id, "permanent");
     // An in_progress job with an EXPIRED lease (crashed worker) must migrate
     // as in_progress and become re-claimable on the target.
     await src.enqueue("mig-inflight", "pull_request", "{}", { n: 4 });
-    await src.claim(10, 1, "w1"); // 1 ms lease
+    const inflight = (await src.claim(1, 1, "w1"))[0]; // 1 ms lease
+    assert.equal(inflight.deliveryId, "mig-inflight");
+    await src.enqueue("mig-pending", "pull_request", "{}", { n: 1 });
     const srcStats = await src.stats();
     assert.deepEqual(
       { pending: srcStats.pending, inProgress: srcStats.inProgress, done: srcStats.done, dead: srcStats.dead },

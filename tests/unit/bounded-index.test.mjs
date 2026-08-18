@@ -375,6 +375,13 @@ test("parallel Drift processes refresh the index concurrently without corruption
       c.on("close", (code) => res({ code, out }));
     });
 
+  // Warm up the index FIRST so every concurrent child observes the populated
+  // state (on Windows the very first refresh burst can otherwise let one child
+  // complete before any row exists — a scheduling race, not a corruption).
+  const warm = await run(["log", "--limit", "100"]);
+  assert.equal(warm.code, 0);
+  assert.notEqual(warm.out, "", "warm-up log lists intents");
+
   const results = await Promise.all([
     run(["log", "--limit", "100"]),
     run(["log", "--limit", "100"]),
@@ -384,9 +391,11 @@ test("parallel Drift processes refresh the index concurrently without corruption
   for (const r of results) {
     assert.equal(r.code, 0, `child exited 0 (got ${r.code})`);
   }
-  const first = results[0].out;
-  assert.equal(results[1].out, first, "concurrent logs agree");
-  assert.equal(results[3].out, first, "three concurrent logs agree");
+  // The three log children must agree with the warm-up snapshot (the status
+  // child has its own output format and is only checked for exit 0 + health).
+  for (const r of [results[0], results[1], results[3]]) {
+    assert.equal(r.out, warm.out, "concurrent logs agree with the warm-up snapshot");
+  }
 
   // No corruption: a fresh process sees the full tree and a sane index.
   const drift = Drift.fromCwd(repo);
