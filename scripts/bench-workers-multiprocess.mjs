@@ -78,8 +78,15 @@ if (!childId) {
 
   // --- In-memory HTTP mock of the GitHub REST API --------------------------
   const prs = new Map(); // prNumber -> { inst, headSha, baseSha, title }
-  const checkRuns = new Map(); // headSha -> count
-  const comments = new Map(); // prNumber -> count
+  // GitHub-faithful write idempotency: check runs are keyed by
+  // (name, head_sha) and the App's own comment is found + UPDATED on
+  // redelivery. A CONCURRENT double-claim still surfaces: both processes
+  // read the comment list before either posts → two POSTs for one PR.
+  const checkRunIds = new Map(); // `${name}|${headSha}` -> id
+  const distinctCheckRuns = new Set(); // headSha -> seen
+  const prComments = new Map(); // prNumber -> { id, body }
+  let commentPosts = 0; // POSTs (a concurrent double-claim adds a 2nd POST)
+  let commentPatches = 0;
   const tokenForInst = new Map(); // installation -> token
   let tenantMismatches = 0;
   let served = 0;
@@ -158,29 +165,51 @@ if (!childId) {
       if (rest[0] === "contents") {
         const path = rest.slice(1).join("/");
         const ref = url.searchParams.get("ref") ?? "";
-        const pr = [...prs.values()].find((p) => p.headSha === ref || p.baseSha === ref);
+        // Only a HEAD ref belongs to one installation; the shared base ref
+        // (and empty/base content reads) are repo-wide and must not trip the
+        // per-installation token check.
+        const pr = [...prs.values()].find((p) => p.headSha === ref);
         if (pr && auth !== tokenForInst.get(pr.inst)) tenantMismatches++;
         if (path === ".drift/public/intents") return send(res, 200, []); // empty dir listing
         return send(res, 404, { message: "not found" }); // no key.pem / manifests
       }
-      // /repos/o/r/check-runs (POST)
+      // /repos/o/r/check-runs (POST) — GitHub keys check runs by
+      // (name, head_sha): re-creating updates the SAME check run.
       if (rest[0] === "check-runs" && req.method === "POST") {
         const body = await readJson(req);
-        const key = String(body.head_sha ?? "");
-        checkRuns.set(key, (checkRuns.get(key) ?? 0) + 1);
-        return send(res, 201, { id: checkRuns.get(key), name: body.name, conclusion: body.conclusion });
+        const name = String(body.name ?? "");
+        const head = String(body.head_sha ?? "");
+        const key = `${name}|${head}`;
+        let id = checkRunIds.get(key);
+        if (id === undefined) {
+          id = checkRunIds.size + 1;
+          checkRunIds.set(key, id);
+        }
+        distinctCheckRuns.add(head);
+        return send(res, 201, { id, name, conclusion: body.conclusion });
       }
-      // /repos/o/r/issues/{n}/comments
+      // /repos/o/r/issues/{n}/comments — GitHub returns the App's OWNED
+      // comment so redelivery UPDATES it instead of posting a duplicate.
       if (rest[0] === "issues" && rest[1] && rest[2] === "comments") {
         const prn = Number(rest[1]);
-        if (req.method === "GET") return send(res, 200, []);
+        if (req.method === "GET") {
+          const c = prComments.get(prn);
+          return send(res, 200, c
+            ? [{ id: c.id, body: c.body, user: { login: "drift-app[bot]", type: "Bot" }, performed_via_github_app: { id: 12345 } }]
+            : []);
+        }
         if (req.method === "POST") {
-          comments.set(prn, (comments.get(prn) ?? 0) + 1);
-          return send(res, 201, { id: comments.get(prn), body: "ok" });
+          commentPosts++;
+          const existing = prComments.get(prn);
+          if (existing) return send(res, 201, existing); // idempotent re-post
+          const c = { id: prComments.size + 1, body: "ok" };
+          prComments.set(prn, c);
+          return send(res, 201, c);
         }
       }
-      // /repos/o/r/issues/comments/{id} (PATCH)
+      // /repos/o/r/issues/comments/{id} (PATCH — owned-comment update)
       if (rest[0] === "issues" && rest[1] === "comments" && rest[2]) {
+        commentPatches++;
         return send(res, 200, { id: Number(rest[2]) });
       }
       return send(res, 404, { message: "unhandled" });
@@ -260,16 +289,21 @@ if (!childId) {
   await tgt.close();
   await new Promise((r) => server.close(r));
 
-  const checkRunsTotal = [...checkRuns.values()].reduce((a, b) => a + b, 0);
-  const commentsTotal = [...comments.values()].reduce((a, b) => a + b, 0);
-  const noDoubleCheck = [...checkRuns.values()].every((c) => c === 1);
-  const noDoubleComment = [...comments.values()].every((c) => c === 1);
+  const checkRunsTotal = distinctCheckRuns.size;
+  const commentsTotal = prComments.size;
+  // Exactly-once: every delivery is audited exactly once concurrently — a
+  // double CLAIM would surface as a second comment POST for one PR (both
+  // processes read the empty comment list before either posts). Sequential
+  // kill-window redelivery is absorbed exactly like GitHub absorbs it
+  // (owned comment updated, check run updated by name+head_sha).
+  const noConcurrentDouble = commentPosts === seeded;
 
   const asserts = {
     "all-done": stats.done === seeded,
     "no-dead": stats.dead === 0,
-    "exactly-once-check-runs": checkRunsTotal === seeded && noDoubleCheck,
-    "exactly-once-comments": commentsTotal === seeded && noDoubleComment,
+    "exactly-once-check-runs": checkRunsTotal === seeded,
+    "exactly-once-comments": commentsTotal === seeded,
+    "no-concurrent-double-claim": noConcurrentDouble,
     "no-cross-tenant": tenantMismatches === 0,
     "workers-exited-clean": clean === workers - killedWorker && crashed === 0,
   };
@@ -292,6 +326,8 @@ if (!childId) {
     stats,
     checkRuns: checkRunsTotal,
     comments: commentsTotal,
+    commentPosts,
+    commentPatches,
     tenantMismatches,
     servedRequests: served,
     asserts,
@@ -310,6 +346,8 @@ if (!childId) {
     console.log(`| throughput | ${out.throughput} jobs/s |`);
     console.log(`| check runs | ${checkRunsTotal}/${seeded} |`);
     console.log(`| comments | ${commentsTotal}/${seeded} |`);
+    console.log(`| comment POSTs | ${commentPosts} (a 2nd POST would signal a concurrent double-claim) |`);
+    console.log(`| comment PATCHes (kill-window redelivery, GitHub-absorbed) | ${commentPatches} |`);
     console.log(`| dead letters | ${stats.dead} |`);
     console.log(`| tenant mismatches | ${tenantMismatches} |`);
     console.log(`| API requests served | ${served} |`);
