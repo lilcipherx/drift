@@ -242,6 +242,9 @@ async function post(port, raw, deliveryId) {
   } catch {
     /* non-json */
   }
+  if (res.status !== 202) {
+    console.error(`[e2e] POST ${deliveryId} -> ${res.status} ${JSON.stringify(data)}`);
+  }
   return { status: res.status, data, intakeMs };
 }async function makeQueue(pgUrl) {
   if (pgUrl) {
@@ -267,7 +270,14 @@ async function runScenario(sc, pgUrl) {
   const { createWebhookServer } = await mod("server.js");
   const { Worker } = await mod("worker.js");
   const mock = new MockGitHub(sc.faults, {});
-  const deps = { github: mock, webhookSecret: SECRET, appId: "12345" };
+  const deps = {
+    github: mock,
+    webhookSecret: SECRET,
+    appId: "12345",
+    log: console.error,
+    // Surface enqueue/readiness failures (the default nullLogger hides them).
+    logger: { error: console.error, warn: console.error, info: () => {}, debug: () => {} },
+  };
 
   // Multi-instance: two SEPARATE queue objects + servers + worker pools share
   // one Postgres database — the production horizontal-scaling topology.
