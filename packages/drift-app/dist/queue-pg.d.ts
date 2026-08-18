@@ -37,7 +37,17 @@ export declare class PostgresQueue implements QueueAdapter {
     private readonly defaultMaxAttempts;
     private closed;
     constructor(opts: PostgresQueueOptions);
-    /** Ensure the schema exists (idempotent; safe to call from every replica). */
+    /**
+     * Ensure the schema exists (idempotent; safe to call from every replica).
+     *
+     * Cold path (table missing): CREATE TABLE IF NOT EXISTS is NOT safe under
+     * concurrency — two sessions creating the same table at once collide on the
+     * pg_type catalog index (`duplicate key value violates unique constraint
+     * "pg_type_typname_nsp_index"`), which is exactly what happens on first boot
+     * when every replica's worker + enqueue path races to initialize. A
+     * session-scoped advisory lock serializes creation fleet-wide; the lock is
+     * released before any queue I/O, so the hot path stays lock-free.
+     */
     private ensureSchema;
     enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult>;
     claim(batchSize: number, leaseMs: number, workerId: string): Promise<QueueJob[]>;

@@ -52,13 +52,46 @@ export function gitIdentity(repoRoot, key) {
     const res = execGit(repoRoot, ["config", "--get", key], true);
     return res.status === 0 ? res.stdout.trim() : "";
 }
+/**
+ * Run a git MUTATION with a bounded retry on index.lock contention. Another
+ * git/Drift process may hold the index for a few hundred ms (e.g. a parallel
+ * `drift realize` or an IDE's git integration); failing immediately would turn
+ * a transient collision into a spurious error. Only lock-shaped failures are
+ * retried — any other error surfaces immediately with the actionable message.
+ */
+export function execGitLockRetry(repoRoot, args, retries = 8, delayMs = 150) {
+    let last = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const res = spawnSync("git", args, {
+            cwd: repoRoot,
+            encoding: "utf8",
+            maxBuffer: 64 * 1024 * 1024,
+            windowsHide: true,
+        });
+        const norm = { status: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+        last = norm;
+        if (norm.status === 0)
+            return norm;
+        const err = `${res.stderr ?? ""} ${res.stdout ?? ""}`.toLowerCase();
+        const lockContention = err.includes("index.lock") || err.includes("unable to create") || err.includes("another git process");
+        if (lockContention && attempt < retries) {
+            // Synchronous sleep: realize is a single-threaded CLI flow and the
+            // retry window is short (8 × 150 ms ≈ 1.2 s worst case).
+            const end = Date.now() + delayMs;
+            while (Date.now() < end) { /* spin */ }
+            continue;
+        }
+        break;
+    }
+    throw new DriftError(`git ${args.join(" ")} failed: ${(last?.stderr || last?.stdout || "").trim()}`);
+}
 /** Stage all changes except Drift's own metadata (`.drift/`). */
 export function stageAll(repoRoot, files) {
     if (files && files.length > 0) {
-        execGit(repoRoot, ["add", "--", ...files]);
+        execGitLockRetry(repoRoot, ["add", "--", ...files]);
         return;
     }
-    execGit(repoRoot, ["add", "-A", "--", ".", ":(exclude).drift"]);
+    execGitLockRetry(repoRoot, ["add", "-A", "--", ".", ":(exclude).drift"]);
 }
 // ---------------------------------------------------------------------------
 // Index snapshot / restore — Drift must never destroy the user's staged state
@@ -189,7 +222,7 @@ export function readFileAt(repoRoot, path, ref) {
     return res.stdout;
 }
 export function commit(repoRoot, message) {
-    const res = execGit(repoRoot, ["commit", "-m", message]);
+    execGitLockRetry(repoRoot, ["commit", "-m", message]);
     const sha = currentHead(repoRoot);
     if (!sha)
         throw new DriftError("git commit reported success but HEAD is empty");

@@ -15,6 +15,14 @@ export declare function findRepoRoot(cwd: string, envRepo?: string): string | nu
 export declare function currentHead(repoRoot: string): string | null;
 export declare function commitExists(repoRoot: string, sha: string): boolean;
 export declare function gitIdentity(repoRoot: string, key: "user.name" | "user.email"): string;
+/**
+ * Run a git MUTATION with a bounded retry on index.lock contention. Another
+ * git/Drift process may hold the index for a few hundred ms (e.g. a parallel
+ * `drift realize` or an IDE's git integration); failing immediately would turn
+ * a transient collision into a spurious error. Only lock-shaped failures are
+ * retried — any other error surfaces immediately with the actionable message.
+ */
+export declare function execGitLockRetry(repoRoot: string, args: string[], retries?: number, delayMs?: number): GitResult;
 /** Stage all changes except Drift's own metadata (`.drift/`). */
 export declare function stageAll(repoRoot: string, files?: string[]): void;
 /**

@@ -38,6 +38,12 @@ Usage:
   drift export [--out file] [--include-private-prompt] [--allow-repository-output]
   drift verify-intent <intent-id>  Check an intent's Ed25519 signature
   drift key import --file <path>   Import the repository private signing key (read-only clone)
+  drift keyring init               Bootstrap the multi-signer keyring (anchor = key.pem)
+  drift keyring add --file <pem> [--reason <text>]
+                                   Add a trusted maintainer key (authorized by an active key)
+  drift keyring revoke <fp> [--reason <text>]   Revoke a key (compromised key: stop trust immediately)
+  drift keyring remove <fp> [--reason <text>]   Remove a revoked/retired key from the active set
+  drift keyring list               Show all keys + the append-only audit history
 
 Options:
   --json       machine-readable output

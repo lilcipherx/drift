@@ -10,7 +10,7 @@ import { computeDelta, detectLanguage, isBinary, parseSymbols, ParseError, textD
 import { canonicalJson, decryptAesGcm, deriveMasterKey, encryptAesGcm, generateKeyPair, isEncrypted, newIntentId, sha256Hex, signPayload, verifyPayload, } from "./crypto.js";
 import { CONFIG_TEMPLATE, loadConfig } from "./config.js";
 import { DriftError, EXIT, NotInitializedError } from "./errors.js";
-import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitExists, currentHead, discardIndexSnapshot, execGit, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, restoreIndexSnapshot, stageAll, stagedNameStatus, } from "./git.js";
+import { blameLine, blameLines, captureIndexSnapshot, checkout, commit, commitExists, currentHead, discardIndexSnapshot, execGit, execGitLockRetry, findRepoRoot, gitIdentity, gitLogMessages, readFileAt, restoreIndexSnapshot, stageAll, stagedNameStatus, } from "./git.js";
 import { IntentStore, PUBLIC_MANIFEST_INDEX_VERSION, } from "./store.js";
 import { compilePatterns, redact } from "./redact.js";
 import { buildPublicSummary, genericPublicSummary, MANIFEST_MAX_BYTES, PUBLIC_FILES_MAX, PUBLIC_INTENTS_DIR, PublicStore, signingKeyIdFor, } from "./public.js";
@@ -1035,7 +1035,7 @@ export class Drift {
         })
             .map((c) => rel(c.abs));
         if (toStage.length > 0)
-            execGit(this.repoRoot, ["add", "--", ...toStage]);
+            execGitLockRetry(this.repoRoot, ["add", "--", ...toStage]);
         return toStage;
     }
     // -------------------------------------------------------------------- log
