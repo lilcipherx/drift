@@ -50,6 +50,9 @@ CREATE INDEX IF NOT EXISTS idx_webhook_jobs_claim ON webhook_jobs(status, next_a
 CREATE INDEX IF NOT EXISTS idx_webhook_jobs_created ON webhook_jobs(created_at);
 `;
 
+/** Advisory-lock key serializing concurrent schema creation across the fleet. */
+const SCHEMA_LOCK_KEY = 0x6472696674; // "drift"
+
 const VALID_STATUS: JobStatus[] = ["pending", "in_progress", "done", "dead"];
 
 function rowToJob(row: Record<string, unknown>): QueueJob {
@@ -119,10 +122,31 @@ export class PostgresQueue implements QueueAdapter {
     // is synchronous; connecting eagerly would force an async boot path).
   }
 
-  /** Ensure the schema exists (idempotent; safe to call from every replica). */
+  /**
+   * Ensure the schema exists (idempotent; safe to call from every replica).
+   *
+   * Cold path (table missing): CREATE TABLE IF NOT EXISTS is NOT safe under
+   * concurrency — two sessions creating the same table at once collide on the
+   * pg_type catalog index (`duplicate key value violates unique constraint
+   * "pg_type_typname_nsp_index"`), which is exactly what happens on first boot
+   * when every replica's worker + enqueue path races to initialize. A
+   * session-scoped advisory lock serializes creation fleet-wide; the lock is
+   * released before any queue I/O, so the hot path stays lock-free.
+   */
   private async ensureSchema(client: PoolClient): Promise<void> {
-    await client.query("SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'webhook_jobs'");
-    await client.query(SCHEMA);
+    const exists = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_catalog.pg_tables
+         WHERE schemaname = 'public' AND tablename = 'webhook_jobs'
+       ) AS exists`,
+    );
+    if (exists.rows[0]?.exists) return;
+    await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_LOCK_KEY]);
+    try {
+      await client.query(SCHEMA);
+    } finally {
+      await client.query("SELECT pg_advisory_unlock($1)", [SCHEMA_LOCK_KEY]);
+    }
   }
 
   async enqueue(deliveryId: string, event: string, rawBody: string, payload: unknown, signature?: string): Promise<EnqueueResult> {
