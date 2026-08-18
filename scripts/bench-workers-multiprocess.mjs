@@ -87,7 +87,10 @@ if (!childId) {
   const prComments = new Map(); // prNumber -> { id, body }
   let commentPosts = 0; // POSTs (a concurrent double-claim adds a 2nd POST)
   let commentPatches = 0;
-  const tokenForInst = new Map(); // installation -> token
+  // Each token exchange issues a UNIQUE token; map token -> installation so
+  // every worker's token stays valid. A cross-tenant client swap (using the
+  // token of installation A on installation B's repo) fails the check.
+  const instForToken = new Map(); // token -> installation
   let tenantMismatches = 0;
   let served = 0;
 
@@ -112,7 +115,7 @@ if (!childId) {
     if (parts[0] === "app" && parts[1] === "installations" && parts[3] === "access_tokens") {
       const inst = Number(parts[2]);
       const token = `tok-${inst}-${Math.random().toString(36).slice(2, 10)}`;
-      tokenForInst.set(inst, token);
+      instForToken.set(token, inst);
       send(res, 201, { token, expires_at: new Date(Date.now() + 3_600_000).toISOString() });
       return;
     }
@@ -123,7 +126,7 @@ if (!childId) {
       if (rest[0] === "pulls" && rest[1] && !rest[2]) {
         const pr = prs.get(Number(rest[1]));
         if (!pr) return send(res, 404, { message: "not found" });
-        if (auth !== tokenForInst.get(pr.inst)) tenantMismatches++;
+        if (instForToken.get(auth) !== pr.inst) tenantMismatches++;
         return send(res, 200, {
           number: Number(rest[1]),
           title: pr.title,
@@ -137,7 +140,7 @@ if (!childId) {
       if (rest[0] === "pulls" && rest[1] && rest[2] === "commits") {
         const pr = prs.get(Number(rest[1]));
         if (!pr) return send(res, 404, { message: "not found" });
-        if (auth !== tokenForInst.get(pr.inst)) tenantMismatches++;
+        if (instForToken.get(auth) !== pr.inst) tenantMismatches++;
         return send(res, 200, [
           {
             sha: pr.headSha,
@@ -151,7 +154,7 @@ if (!childId) {
       if (rest[0] === "pulls" && rest[1] && rest[2] === "files") {
         const pr = prs.get(Number(rest[1]));
         if (!pr) return send(res, 404, { message: "not found" });
-        if (auth !== tokenForInst.get(pr.inst)) tenantMismatches++;
+        if (instForToken.get(auth) !== pr.inst) tenantMismatches++;
         return send(res, 200, [{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0 }]);
       }
       // /repos/o/r/compare/{base}...{head}
