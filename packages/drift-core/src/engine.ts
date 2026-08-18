@@ -53,6 +53,7 @@ import {
   currentHead,
   discardIndexSnapshot,
   execGit,
+  execGitLockRetry,
   findRepoRoot,
   gitIdentity,
   gitLogMessages,
@@ -1398,7 +1399,7 @@ export class Drift {
         return true;
       })
       .map((c) => rel(c.abs));
-    if (toStage.length > 0) execGit(this.repoRoot, ["add", "--", ...toStage]);
+    if (toStage.length > 0) execGitLockRetry(this.repoRoot, ["add", "--", ...toStage]);
     return toStage;
   }
 

@@ -97,6 +97,12 @@ test("concurrent `drift realize` processes: no corruption, consistent end state"
     spawnRealize("Add feature C with tests", "Add feature C"),
   ]);
 
+  // Exit codes first: if the hosted runner ever makes BOTH realize processes
+  // fail, this assertion surfaces each child's stderr instead of hiding it.
+  assert.ok(
+    r1.code === 0 || r2.code === 0,
+    `at least one realize must succeed (got ${r1.code}, ${r2.code}):\n-- r1.err --\n${r1.err}\n-- r2.err --\n${r2.err}`,
+  );
   // Git must be coherent afterwards, no matter which process won.
   const fsck = spawnSync("git", ["fsck", "--strict"], { cwd: repo, encoding: "utf8" });
   assert.equal(fsck.status, 0, `git fsck failed: ${fsck.stderr}`);
@@ -105,10 +111,6 @@ test("concurrent `drift realize` processes: no corruption, consistent end state"
   assert.equal(log.status, 0, `log failed: ${log.stderr}`);
   const parsed = JSON.parse(log.stdout);
   assert.ok(parsed.intents.length >= 1, "at least one intent recorded");
-  assert.ok(
-    r1.code === 0 || r2.code === 0,
-    `at least one realize must succeed (got ${r1.code}, ${r2.code}): ${r1.err} ${r2.err}`,
-  );
   // Either both landed or one won cleanly — but never a split/broken state.
   const status = run(repo, ["status", "--json"]);
   assert.equal(status.status, 0, `status failed: ${status.stderr}`);

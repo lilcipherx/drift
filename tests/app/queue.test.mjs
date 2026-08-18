@@ -312,11 +312,13 @@ describe("postgres queue: multi-instance claim safety", { skip: !process.env.DRI
       { pending: 1, inProgress: 1, done: 1, dead: 1 },
       "migrated counts must match the source exactly",
     );
-    // The expired-lease job is re-claimable on Postgres (crash recovery).
+    // Both the pending job and the expired-lease in-flight job are claimable
+    // on Postgres; the expired-lease job proves crash recovery across adapters.
     const reclaimed = await tgt.claim(10, 30_000, "new-instance");
-    assert.equal(reclaimed.length, 1);
-    assert.equal(reclaimed[0].deliveryId, "mig-inflight");
-    await tgt.ack(reclaimed[0].id, "recovered");
+    assert.equal(reclaimed.length, 2, "pending + expired-lease jobs both claimable");
+    const reclaimedInflight = reclaimed.find((j) => j.deliveryId === "mig-inflight");
+    assert.ok(reclaimedInflight, "expired-lease in-flight job is re-claimable (crash recovery)");
+    await tgt.ack(reclaimedInflight.id, "recovered");
     // The done/dead rows are untouched; dedupe still works after migration.
     const dup = await tgt.enqueue("mig-done", "pull_request", "{}", { n: 2 });
     assert.equal(dup.duplicate, true);
