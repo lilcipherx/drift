@@ -134,12 +134,14 @@ for (const kind of kinds) {
       const q = await run(kind);
       await q.enqueue("d-retry", "pull_request", "{}", payload);
       const [job] = await q.claim(10, 30_000, "w1");
-      // attempt 1 fails
-      assert.equal(await q.nack(job.id, "transient boom", 5), "retrying");
+      // attempt 1 fails (backoff 250 ms — a larger margin than connection
+      // setup latency, so the not-yet-claimable assertion is deterministic
+      // even on a cold/busy CI runner)
+      assert.equal(await q.nack(job.id, "transient boom", 250), "retrying");
       assert.equal(job.attempts + 1, 1);
       // not claimable before next_attempt_at
       assert.equal((await q.claim(10, 30_000, "w1")).length, 0);
-      await new Promise((r) => setTimeout(r, 15));
+      await new Promise((r) => setTimeout(r, 320));
       const [job2] = await q.claim(10, 30_000, "w1");
       assert.equal(job2.id, job.id);
       // attempt 2 fails → 3 max attempts → attempt 3 = dead
