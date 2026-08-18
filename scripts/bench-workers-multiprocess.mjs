@@ -27,11 +27,14 @@
  */
 
 import { createServer } from "node:http";
-import { generateKeyPairSync } from "node:crypto";
+import { createHmac, generateKeyPairSync } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { Pool } from "pg";
+
+const WEBHOOK_SECRET = "bench-secret";
+const hmac = (rawBody) => `sha256=${createHmac("sha256", WEBHOOK_SECRET).update(rawBody, "utf8").digest("hex")}`;
 
 const args = process.argv.slice(2);
 const pick = (flag) => {
@@ -202,7 +205,11 @@ if (!childId) {
       repository: { name: "repo", owner: { login: "owner" } },
       pull_request: { number: prNumber, title: `PR ${i}`, head: { sha: headSha }, base: { sha: "0".repeat(40) } },
     };
-    await seed.enqueue(`mp-${i}`, "pull_request", JSON.stringify(payload), payload);
+    const rawBody = JSON.stringify(payload);
+    // Signed exactly like the intake server: the worker re-verifies this HMAC
+    // before auditing (fail-closed), so an unsigned seed would be rejected at
+    // the gate and the benchmark would measure nothing.
+    await seed.enqueue(`mp-${i}`, "pull_request", rawBody, payload, hmac(rawBody));
   }
   await seed.close();
   const seeded = jobs;
@@ -355,7 +362,7 @@ if (faultCount > 0) {
 }
 const worker = new Worker({
   queue,
-  deps: { github, webhookSecret: "bench-secret", appId: "12345" },
+  deps: { github, webhookSecret: WEBHOOK_SECRET, appId: "12345" },
   concurrency: 4,
   pollIntervalMs: 25,
   leaseMs: 15_000,
