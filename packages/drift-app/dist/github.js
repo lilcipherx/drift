@@ -5,7 +5,18 @@
  * The interface `GitHubClientLike` is what the webhook handler depends on, so
  * tests can inject a fake with zero network access.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createAppJwt } from "./jwt.js";
+/**
+ * Per-delivery installation scope. The worker processes deliveries for MANY
+ * installations concurrently on one shared client; a single mutable
+ * `installationId` field would let one delivery's setInstallation overwrite
+ * another's between awaits, swapping the installation token used for a repo
+ * (a cross-tenant token leak). AsyncLocalStorage binds the installation to
+ * the delivery's OWN async chain, so interleaved jobs never observe each
+ * other's scope.
+ */
+const installationScope = new AsyncLocalStorage();
 /** Thrown for GitHub rate-limit responses (429 or secondary 403 with
  *  Retry-After). The handler treats these as transient (retryable). */
 export class RateLimitError extends Error {
@@ -376,18 +387,24 @@ export class GitHubAppClient {
         const data = (await res.json());
         return typeof data.id === "number" ? data.id : 0;
     }
+    /**
+     * Bind the installation to the CURRENT delivery's async context. Every
+     * subsequent await in this call chain (the whole audit) resolves the
+     * installation from the context — never from a field another concurrent
+     * delivery could overwrite. Safe for worker concurrency > 1.
+     */
     setInstallation(id) {
-        this.installationId = id;
+        installationScope.enterWith(id);
     }
     getAppId() {
         return this.opts.appId?.trim() || null;
     }
-    installationId = null;
     async requireInstallation() {
-        if (this.installationId == null) {
+        const id = installationScope.getStore();
+        if (id === undefined) {
             throw new Error("installation id is not set — call setInstallation() from the webhook payload");
         }
-        return this.installationId;
+        return id;
     }
 }
 function encodePath(path) {

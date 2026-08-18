@@ -311,16 +311,29 @@ test("tenant isolation: concurrent jobs from different installations never cross
   const didOf = (i) => `did_${i.toString(16).padStart(32, "0")}`;
   // One PR per delivery: prNumber → { installation, headSha, intentId }.
   const prs = new Map();
+  // The mock mirrors the REAL GitHubAppClient scoping (AsyncLocalStorage per
+  // delivery): setInstallation binds the CURRENT async chain, so interleaved
+  // concurrent deliveries keep their own installation even across awaits.
+  const { AsyncLocalStorage } = await import("node:async_hooks");
+  const scope = new AsyncLocalStorage();
   const github = {
     currentInstallation: null,
     setInstallation(id) {
       this.currentInstallation = id;
+      scope.enterWith(id);
     },
     getAppId: () => "12345",
     async getPullRequest(_o, _r, prNumber) {
+      // Artificial interleave: yield BEFORE reading the installation so
+      // concurrent deliveries of OTHER installations get scheduled in
+      // between. With a shared mutable installation field (the old client)
+      // this reliably mismatches; AsyncLocalStorage keeps each delivery's
+      // own scope.
+      await new Promise((r) => setTimeout(r, 2 + Math.random() * 6));
       const p = prs.get(prNumber);
-      seenPairs.push(`${this.currentInstallation}:${prNumber}`);
-      if (this.currentInstallation !== p.inst) mismatches++;
+      const inst = scope.getStore();
+      seenPairs.push(`${inst}:${prNumber}`);
+      if (inst !== p.inst) mismatches++;
       return { headSha: p.headSha, baseSha: "0".repeat(40), commits: 1, changedFiles: 1, title: "t" };
     },
     async getPullCommits(_o, _r, prNumber) {

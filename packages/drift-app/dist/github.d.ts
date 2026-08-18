@@ -160,9 +160,14 @@ export declare class GitHubAppClient implements GitHubClientLike {
     /** PATCH an existing comment in place (keeps the thread tidy across synchronize events). */
     updateComment(owner: string, repo: string, commentId: number, body: string): Promise<void>;
     createCheckRun(owner: string, repo: string, input: CheckRunInput): Promise<number>;
+    /**
+     * Bind the installation to the CURRENT delivery's async context. Every
+     * subsequent await in this call chain (the whole audit) resolves the
+     * installation from the context — never from a field another concurrent
+     * delivery could overwrite. Safe for worker concurrency > 1.
+     */
     setInstallation(id: number): void;
     getAppId(): string | null;
-    private installationId;
     private requireInstallation;
 }
 //# sourceMappingURL=github.d.ts.map
