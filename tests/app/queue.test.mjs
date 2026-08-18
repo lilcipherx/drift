@@ -78,6 +78,21 @@ for (const kind of kinds) {
       q.close();
     });
 
+    test("enqueue records the tenant (installation id) on the job for DB-level isolation", async () => {
+      if (kind === "postgres") await freshPg();
+      const q = await run(kind);
+      await q.enqueue("t-1", "pull_request", "{}", { action: "synchronize", installation: { id: 42 } });
+      await q.enqueue("t-2", "pull_request", "{}", { action: "synchronize", installation: { id: 7 } });
+      await q.enqueue("t-3", "pull_request", "{}", { action: "synchronize" }); // no installation
+      const jobs = await q.claim(10, 30_000, "w1");
+      const byDelivery = new Map(jobs.map((j) => [j.deliveryId, j]));
+      assert.equal(byDelivery.get("t-1").tenantId, "42");
+      assert.equal(byDelivery.get("t-2").tenantId, "7");
+      assert.equal(byDelivery.get("t-3").tenantId, "");
+      for (const j of jobs) await q.ack(j.id, "ok");
+      q.close();
+    });
+
     test("claim → ack removes the job from depth and marks it done", async () => {
       if (kind === "postgres") await freshPg();
       const q = await run(kind);
@@ -333,4 +348,173 @@ describe("postgres queue: multi-instance claim safety", { skip: !process.env.DRI
       }
     }
   });
+
+  test("migration is crash-safe: an interrupted partial copy converges on re-run (no dupes, no loss)", async () => {
+    const { SqliteQueue } = await mod("queue.js");
+    const { PostgresQueue } = await mod("queue-pg.js");
+    const url = process.env.DRIFT_TEST_PG_URL;
+    await freshPg();
+
+    // A source queue with N jobs spanning all lifecycle states.
+    const dir = mkdtempSync(join(tmpdir(), "drift-queue-crash-"));
+    const src = new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 3 });
+    const N = 60;
+    for (let i = 0; i < N; i++) {
+      await src.enqueue(`crash-${i}`, "pull_request", "{}", { n: i, installation: { id: (i % 3) + 1 } });
+    }
+    // Move a third of them through claim → ack/dead to mix states.
+    const batch = await src.claim(20, 30_000, "w1");
+    for (const [idx, j] of batch.entries()) {
+      if (idx % 2 === 0) await src.ack(j.id, "ok");
+      else await src.deadLetter(j.id, "permanent");
+    }
+    src.close();
+
+    // Simulate a migration process KILLED midway: copy only the first half of
+    // the rows to Postgres directly (the crash left a partial table).
+    const { DatabaseSync } = await import("node:sqlite");
+    const read = new DatabaseSync(join(dir, "queue.db"), { readOnly: true });
+    const rows = read.prepare("SELECT * FROM webhook_jobs ORDER BY id").all();
+    read.close();
+    const cols = Object.keys(rows[0]);
+    const half = rows.slice(0, Math.floor(rows.length / 2));
+    const pool = new (await import("pg")).Pool({ connectionString: url });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS webhook_jobs (
+        id BIGSERIAL PRIMARY KEY,
+        delivery_id TEXT NOT NULL UNIQUE,
+        event TEXT NOT NULL, raw_body TEXT NOT NULL, signature TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 8,
+        next_attempt_at BIGINT NOT NULL DEFAULT 0, lease_until BIGINT NOT NULL DEFAULT 0,
+        lease_owner TEXT NOT NULL DEFAULT '', last_error TEXT, last_result TEXT,
+        created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, tenant_id TEXT NOT NULL DEFAULT ''
+      );
+    `);
+    for (const r of half) {
+      await pool.query(
+        `INSERT INTO webhook_jobs (${cols.join(", ")}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(", ")}) ON CONFLICT (delivery_id) DO NOTHING`,
+        cols.map((c) => r[c]),
+      );
+    }
+    await pool.end();
+
+    // Re-run the real migration over the partial table: it must fill the
+    // missing rows, keep the copied ones (idempotent), and converge to the
+    // source counts exactly.
+    const script = resolve(process.cwd(), "scripts", "migrate-queue-sqlite-to-pg.mjs");
+    const res = spawnSync(process.execPath, [script, "--sqlite", join(dir, "queue.db"), "--pg", url], {
+      encoding: "utf8",
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    assert.equal(res.status, 0, `resume migration failed: ${res.stderr}`);
+    const res2 = spawnSync(process.execPath, [script, "--sqlite", join(dir, "queue.db"), "--pg", url], {
+      encoding: "utf8",
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    assert.equal(res2.status, 0, `re-run after resume failed: ${res2.stderr}`);
+
+    const tgt = new PostgresQueue({ url, maxAttempts: 3 });
+    const tgtStats = await tgt.stats();
+    const srcStats = new SqliteQueue({ path: join(dir, "queue.db"), maxAttempts: 3 });
+    const s = await srcStats.stats();
+    srcStats.close();
+    assert.equal(tgtStats.total, s.total, "target total equals source total (no dupes, no loss)");
+    assert.equal(tgtStats.pending, s.pending);
+    assert.equal(tgtStats.inProgress, s.inProgress);
+    assert.equal(tgtStats.done, s.done);
+    assert.equal(tgtStats.dead, s.dead);
+    tgt.close();
+    for (let i = 0; i < 5; i++) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+  });
+
+  test("postgres queue: per-tenant DB queries never cross tenants; tenant index exists", async () => {
+    const { PostgresQueue } = await mod("queue-pg.js");
+    const { Pool } = await import("pg");
+    const url = process.env.DRIFT_TEST_PG_URL;
+    await freshPg();
+    const q = new PostgresQueue({ url, maxAttempts: 3 });
+    for (let i = 0; i < 30; i++) {
+      await q.enqueue(`pt-${i}`, "pull_request", "{}", { action: "synchronize", installation: { id: (i % 2) + 1 } });
+    }
+    const pool = new Pool({ connectionString: url });
+    const tenant1 = await pool.query("SELECT COUNT(*) AS n FROM webhook_jobs WHERE tenant_id = '1'");
+    const tenant2 = await pool.query("SELECT COUNT(*) AS n FROM webhook_jobs WHERE tenant_id = '2'");
+    assert.equal(Number(tenant1.rows[0].n), 15);
+    assert.equal(Number(tenant2.rows[0].n), 15);
+    const index = await pool.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'webhook_jobs' AND indexname = 'idx_webhook_jobs_tenant'`,
+    );
+    assert.equal(index.rows.length, 1, "tenant index must exist");
+    const unique = await pool.query(
+      `SELECT COUNT(*) AS n FROM pg_indexes WHERE tablename = 'webhook_jobs' AND indexdef ILIKE '%delivery_id%'`,
+    );
+    assert.ok(Number(unique.rows[0].n) >= 1, "UNIQUE(delivery_id) constraint must exist");
+    await pool.end();
+    q.close();
+  });
+});
+
+test("sqlite queue: an old-schema DB (no tenant_id) opens and upgrades in place", async () => {
+  const { SqliteQueue } = await mod("queue.js");
+  const dir = mkdtempSync(join(tmpdir(), "drift-queue-upgrade-"));
+  const path = join(dir, "queue.db");
+  // Create a DB with the PRE-tenant_id schema (as shipped before the column).
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(path);
+  db.exec(`
+    CREATE TABLE webhook_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      delivery_id TEXT NOT NULL UNIQUE,
+      event TEXT NOT NULL,
+      raw_body TEXT NOT NULL,
+      signature TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 8,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      lease_until INTEGER NOT NULL DEFAULT 0,
+      lease_owner TEXT NOT NULL DEFAULT '',
+      last_error TEXT,
+      last_result TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO webhook_jobs (delivery_id, event, raw_body, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+    "legacy-1",
+    "pull_request",
+    "{}",
+    "{}",
+    Date.now(),
+    Date.now(),
+  );
+  db.close();
+
+  // Opening with the current adapter must add the column and keep the row.
+  const q = new SqliteQueue({ path, maxAttempts: 3 });
+  const stats = await q.stats();
+  assert.equal(stats.total, 1, "legacy row survives the upgrade");
+  const jobs = await q.claim(10, 30_000, "w1");
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].deliveryId, "legacy-1");
+  assert.equal(jobs[0].tenantId, "", "legacy rows default to empty tenant");
+  await q.ack(jobs[0].id, "ok");
+  q.close();
+  for (let i = 0; i < 5; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      break;
+    } catch {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
 });

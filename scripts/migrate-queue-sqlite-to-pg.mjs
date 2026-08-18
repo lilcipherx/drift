@@ -59,6 +59,7 @@ const COLS = [
   "last_result",
   "created_at",
   "updated_at",
+  "tenant_id",
 ];
 
 async function main() {
@@ -96,10 +97,12 @@ async function main() {
         last_error TEXT,
         last_result TEXT,
         created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL
+        updated_at BIGINT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT ''
       );
       CREATE INDEX IF NOT EXISTS idx_webhook_jobs_claim ON webhook_jobs(status, next_attempt_at);
       CREATE INDEX IF NOT EXISTS idx_webhook_jobs_created ON webhook_jobs(created_at);
+      CREATE INDEX IF NOT EXISTS idx_webhook_jobs_tenant ON webhook_jobs(tenant_id, status);
     `);
 
     let copied = 0;

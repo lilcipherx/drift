@@ -26,6 +26,10 @@ export interface QueueJob {
     id: number;
     /** GitHub webhook delivery GUID — the idempotency key. */
     deliveryId: string;
+    /** Tenant (GitHub installation id) owning this job, when known. Enables
+     *  per-tenant ops (metrics, dead-letter review) and DB-level isolation
+     *  queries; the worker still scopes its GitHub client per installation. */
+    tenantId: string;
     /** X-GitHub-Event value (e.g. "pull_request"). */
     event: string;
     /** Bounded raw body (the server already enforced the size cap). */
@@ -99,6 +103,8 @@ export interface QueueAdapter {
  * FAILURES so far (0 → [0, base); 1 → [0, base*2); ...).
  */
 export declare function backoffMs(attempts: number, baseMs?: number, maxMs?: number): number;
+/** Derive the tenant (GitHub installation id) from a webhook payload. */
+export declare function extractTenantId(payload: unknown): string;
 export declare function boundedError(message: string): string;
 export interface SqliteQueueOptions {
     /** Path of the queue database file. */

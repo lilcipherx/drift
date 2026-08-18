@@ -17,6 +17,9 @@ export interface SummaryInput {
      *  key state (malformed bootstrap / malformed replacement / malformed base
      *  root) renders its own blocking warning — never a neutral bootstrap. */
     keyChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
+    /** Multi-signer keyring change (append-only trust set). Blocking states
+     *  render their own warning — never silent. */
+    keyringChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
     /** Public-provenance integrity violations (append-only rules). */
     audit?: ProvenanceAudit;
 }

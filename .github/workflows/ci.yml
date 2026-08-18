@@ -314,6 +314,9 @@ jobs:
       - name: Worker soak over Postgres (multi-worker, retries, 0 dead letters)
         run: node scripts/soak-app.mjs --jobs 5000 --pg "$DRIFT_TEST_PG_URL" --json
 
+      - name: Multi-process worker benchmark (real processes, exactly-once, crash + tenant isolation)
+        run: node scripts/bench-workers-multiprocess.mjs --pg "$DRIFT_TEST_PG_URL" --workers 5 --jobs 2000 --tenants 8 --kill --faults 40 --json
+
   # Performance evidence (PRD §6/§7): large-repo CLI benchmark + App intake
   # load + worker soak. Runs ONLY on trusted protected-branch pushes to the
   # self-hosted ARM64 runner (never on PRs/forks). Generates fresh artifacts

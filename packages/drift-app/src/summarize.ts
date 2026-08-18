@@ -6,7 +6,7 @@
 
 import { sanitizePublicText } from "@drift/core";
 import type { IntentView } from "./intents.js";
-import { SUMMARY_MARKER, TRUST_ROOT_WARNING, type ProvenanceAudit } from "./trust.js";
+import { KEYRING_WARNING, SUMMARY_MARKER, TRUST_ROOT_WARNING, type ProvenanceAudit } from "./trust.js";
 
 export { SUMMARY_MARKER };
 
@@ -22,6 +22,9 @@ export interface SummaryInput {
    *  key state (malformed bootstrap / malformed replacement / malformed base
    *  root) renders its own blocking warning — never a neutral bootstrap. */
   keyChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
+  /** Multi-signer keyring change (append-only trust set). Blocking states
+   *  render their own warning — never silent. */
+  keyringChange?: "replaced" | "removed" | "malformed-bootstrap" | "malformed-replacement" | "base-malformed";
   /** Public-provenance integrity violations (append-only rules). */
   audit?: ProvenanceAudit;
 }
@@ -73,6 +76,20 @@ export function summarizeIntents(input: SummaryInput): string {
     lines.push("");
   } else if (input.keyChange === "base-malformed") {
     lines.push("## ⚠ Drift trust root is malformed on the base branch\n\n`.drift/public/key.pem` on the base branch is not a valid Drift public key — no trust root can be established, so this PR's provenance is unverifiable and blocked.");
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  }
+  // Keyring (multi-signer trust set): a replaced/removed/malformed history is
+  // a blocking trust failure and must be visible in the comment, never silent.
+  if (
+    input.keyringChange === "replaced" ||
+    input.keyringChange === "removed" ||
+    input.keyringChange === "malformed-bootstrap" ||
+    input.keyringChange === "malformed-replacement" ||
+    input.keyringChange === "base-malformed"
+  ) {
+    lines.push(KEYRING_WARNING);
     lines.push("");
     lines.push("---");
     lines.push("");

@@ -24,7 +24,7 @@
  * synchronous and safe to call during server boot.
  */
 import { Pool } from "pg";
-import { backoffMs, boundedError } from "./queue.js";
+import { backoffMs, boundedError, extractTenantId } from "./queue.js";
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS webhook_jobs (
   id              BIGSERIAL PRIMARY KEY,
@@ -42,10 +42,18 @@ CREATE TABLE IF NOT EXISTS webhook_jobs (
   last_error      TEXT,
   last_result     TEXT,
   created_at      BIGINT NOT NULL,
-  updated_at      BIGINT NOT NULL
+  updated_at      BIGINT NOT NULL,
+  tenant_id       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_jobs_claim ON webhook_jobs(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_jobs_created ON webhook_jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_jobs_tenant ON webhook_jobs(tenant_id, status);
+`;
+/** In-place upgrade for tables created before `tenant_id` existed (the
+ *  `CREATE TABLE IF NOT EXISTS` is a no-op for an existing table). */
+const TENANT_UPGRADE = `
+ALTER TABLE webhook_jobs ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_webhook_jobs_tenant ON webhook_jobs(tenant_id, status);
 `;
 /** Advisory-lock key serializing concurrent schema creation across the fleet. */
 const SCHEMA_LOCK_KEY = 0x6472696674; // "drift"
@@ -55,6 +63,7 @@ function rowToJob(row) {
     return {
         id: Number(row.id),
         deliveryId: String(row.delivery_id ?? ""),
+        tenantId: String(row.tenant_id ?? ""),
         event: String(row.event ?? ""),
         rawBody: String(row.raw_body ?? ""),
         signature: String(row.signature ?? ""),
@@ -121,8 +130,11 @@ export class PostgresQueue {
          SELECT 1 FROM pg_catalog.pg_tables
          WHERE schemaname = 'public' AND tablename = 'webhook_jobs'
        ) AS exists`);
-        if (exists.rows[0]?.exists)
+        if (exists.rows[0]?.exists) {
+            // Existing table from before tenant_id existed: upgrade in place.
+            await client.query(TENANT_UPGRADE);
             return;
+        }
         await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_LOCK_KEY]);
         try {
             await client.query(SCHEMA);
@@ -141,9 +153,9 @@ export class PostgresQueue {
             await this.ensureSchema(client);
             const res = await client.query(`INSERT INTO webhook_jobs
            (delivery_id, event, raw_body, signature, payload_json, status, max_attempts,
-            next_attempt_at, lease_until, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0, 0, $7, $7)
-         ON CONFLICT (delivery_id) DO NOTHING`, [deliveryId, event, rawBody, signature ?? "", JSON.stringify(payload), this.defaultMaxAttempts, now]);
+            next_attempt_at, lease_until, created_at, updated_at, tenant_id)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0, 0, $7, $7, $8)
+         ON CONFLICT (delivery_id) DO NOTHING`, [deliveryId, event, rawBody, signature ?? "", JSON.stringify(payload), this.defaultMaxAttempts, now, extractTenantId(payload)]);
             if ((res.rowCount ?? 0) > 0)
                 return { accepted: true, duplicate: false, alreadyProcessed: false };
             const existing = await client.query("SELECT status FROM webhook_jobs WHERE delivery_id = $1", [deliveryId]);

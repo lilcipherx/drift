@@ -247,6 +247,14 @@ export async function handleWebhook(event: WebhookEvent, deps: WebhookDeps): Pro
             keyChange === "base-malformed"
               ? keyChange
               : undefined,
+          keyringChange:
+            keyringChange === "replaced" ||
+            keyringChange === "removed" ||
+            keyringChange === "malformed-bootstrap" ||
+            keyringChange === "malformed-replacement" ||
+            keyringChange === "base-malformed"
+              ? keyringChange
+              : undefined,
           audit,
         });
         if (deps.readOnly) {

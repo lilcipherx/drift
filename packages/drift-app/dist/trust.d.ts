@@ -20,6 +20,7 @@ export declare const SUMMARY_MARKER = "<!-- drift:app-summary:v2 -->";
 export declare const ACTION_MARKER = "<!-- drift:action-summary:v2 -->";
 export declare const LEGACY_SUMMARY_MARKERS: string[];
 export declare const TRUST_ROOT_WARNING = "## \u26A0 Drift trust-root change detected\n\nThis pull request modifies `.drift/public/key.pem`.\n\nNew provenance cannot be trusted automatically until the key rotation is reviewed through the documented rotation process.";
+export declare const KEYRING_WARNING = "## \u26A0 Drift trust-set (keyring) change detected\n\nThis pull request modifies `.drift/public/keyring.json` \u2014 the multi-signer trust set. The keyring is append-only: only a strict audit-log extension (add/revoke/remove signed by an active key) is legitimate. Deleting, editing, or replacing the trust history fails this audit and blocks provenance until a maintainer restores it.";
 /**
  * Trust-root relationship between the base branch and the PR head. This is
  * the SHARED @drift/core evaluator (the Action mirrors it): strict PEM

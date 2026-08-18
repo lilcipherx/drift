@@ -33,6 +33,10 @@ export interface QueueJob {
   id: number;
   /** GitHub webhook delivery GUID — the idempotency key. */
   deliveryId: string;
+  /** Tenant (GitHub installation id) owning this job, when known. Enables
+   *  per-tenant ops (metrics, dead-letter review) and DB-level isolation
+   *  queries; the worker still scopes its GitHub client per installation. */
+  tenantId: string;
   /** X-GitHub-Event value (e.g. "pull_request"). */
   event: string;
   /** Bounded raw body (the server already enforced the size cap). */
@@ -133,11 +137,37 @@ CREATE TABLE IF NOT EXISTS webhook_jobs (
   last_error    TEXT,
   last_result   TEXT,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  tenant_id     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_jobs_claim ON webhook_jobs(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_jobs_created ON webhook_jobs(created_at);
 `;
+
+/** Tenant index — created by the constructor AFTER the tenant_id column is
+ *  guaranteed to exist (new tables have it; old tables get ALTERed). */
+const TENANT_INDEX = "CREATE INDEX IF NOT EXISTS idx_webhook_jobs_tenant ON webhook_jobs(tenant_id, status)";
+
+/** Derive the tenant (GitHub installation id) from a webhook payload. */
+export function extractTenantId(payload: unknown): string {
+  const p = payload as { installation?: { id?: number | string } } | null | undefined;
+  const id = p?.installation?.id;
+  if (id === undefined || id === null) return "";
+  return String(id);
+}
+
+/**
+ * In-place schema upgrade for queue DBs created before `tenant_id` existed:
+ * older files have the table without the column and `CREATE TABLE IF NOT
+ * EXISTS` is a no-op, so add the column + index explicitly. Idempotent.
+ */
+function upgradeSchema(db: DatabaseSync): void {
+  const cols = db.prepare("PRAGMA table_info(webhook_jobs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "tenant_id")) {
+    db.exec("ALTER TABLE webhook_jobs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''");
+  }
+  db.exec(TENANT_INDEX);
+}
 
 const VALID_STATUS: JobStatus[] = ["pending", "in_progress", "done", "dead"];
 
@@ -146,6 +176,7 @@ function rowToJob(row: Record<string, unknown>): QueueJob {
   return {
     id: Number(row.id),
     deliveryId: String(row.delivery_id ?? ""),
+    tenantId: String(row.tenant_id ?? ""),
     event: String(row.event ?? ""),
     rawBody: String(row.raw_body ?? ""),
     signature: String(row.signature ?? ""),
@@ -210,6 +241,11 @@ export class SqliteQueue implements QueueAdapter {
     if (!cols.some((c) => c.name === "signature")) {
       this.db.exec("ALTER TABLE webhook_jobs ADD COLUMN signature TEXT NOT NULL DEFAULT ''");
     }
+    if (!cols.some((c) => c.name === "tenant_id")) {
+      this.db.exec("ALTER TABLE webhook_jobs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''");
+    }
+    // Tenant index AFTER the column exists (old tables were just upgraded).
+    this.db.exec(TENANT_INDEX);
     this.defaultMaxAttempts = clampPositiveInt(opts.maxAttempts, 8);
   }
 
@@ -225,8 +261,8 @@ export class SqliteQueue implements QueueAdapter {
       .prepare(
         `INSERT OR IGNORE INTO webhook_jobs
            (delivery_id, event, raw_body, signature, payload_json, status, max_attempts,
-            next_attempt_at, lease_until, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, 0, 0, ?, ?)`,
+            next_attempt_at, lease_until, created_at, updated_at, tenant_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?)`,
       )
       .run(
         deliveryId,
@@ -237,6 +273,7 @@ export class SqliteQueue implements QueueAdapter {
         this.defaultMaxAttempts,
         now,
         now,
+        extractTenantId(payload),
       );
     if (info.changes > 0) return { accepted: true, duplicate: false, alreadyProcessed: false };
     const existing = this.db.prepare("SELECT status FROM webhook_jobs WHERE delivery_id = ?").get(deliveryId) as
@@ -421,6 +458,7 @@ export class MemoryQueue implements QueueAdapter {
     const job: QueueJob = {
       id,
       deliveryId,
+      tenantId: extractTenantId(payload),
       event,
       rawBody,
       signature: signature ?? "",

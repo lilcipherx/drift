@@ -105,6 +105,36 @@ SQLite queue volume: one row per delivery (~2 KB payload). 1M deliveries ≈
 2 GB **before retention**; a daily TTL sweep keeps steady-state storage ~100 MB
 per node. Worst-case burst (1M deliveries in an hour) is still only ~2 GB.
 
+### Multi-process worker model (production topology)
+
+The production adapter is a **real shared queue**: any number of worker
+PROCESSES (across hosts) claim from one Postgres database with
+`SELECT … FOR UPDATE SKIP LOCKED` — verified by the multi-process benchmark
+(`scripts/bench-workers-multiprocess.mjs`, run in the CI `queue-postgres` job):
+
+| Claim | Evidence |
+|---|---|
+| N real worker processes, one shared Postgres DB | 5 processes × 2,000 jobs; every delivery processed exactly once (1 Check Run + 1 comment each, no double-write) |
+| Worker SIGKILL mid-flight | leases expire → survivors re-claim; exactly-once holds across the kill |
+| Transient API faults (--faults) | retried with backoff; 0 dead letters at 40 injected 500s |
+| Tenant isolation at the API boundary | per-installation tokens; the mock fails any cross-tenant call (0 mismatches across 8 tenants) |
+| DB-level isolation | `tenant_id` column + `(tenant_id, status)` index; per-tenant queries verified |
+
+Worker sizing: at modeled peak (≈116 audits/s, ~1 s per audit), **≈120–350
+concurrent audits** ⇒ 5–15 worker processes × concurrency 8–16, or fewer with
+faster audits. The benchmark's 5-process fleet sustains ~2,000 audits in well
+under a minute over the mock API (see `benchmarks/results/bench-workers-multiprocess.json`).
+
+### Postgres production requirements (1M envelope)
+
+| Resource | Requirement | Derivation |
+|---|---|---|
+| `max_connections` | ≥ 60 (10 replicas × 5 + 10 workers × 4 + headroom) | Each replica/worker pool uses 4–10 connections; model 5/process. |
+| Storage | 2 GB steady state per 100 MB/day intake at 2 KB/job; retain done rows 7–30 d | TTL sweep (`purgeDone`) bounds growth; the row count is delivery-id bound, not user bound. |
+| Writes | ~116 inserts/s peak (≤ 2,000 inserts/s single-node measured) | Intake load test: 1,452 jobs/s p99 37 ms (see SLOS.md). |
+| Reads/claims | ~120 claim+update/s peak | SKIP LOCKED claims are index-ordered on `(status, next_attempt_at)`; tenant index serves per-tenant ops. |
+| High availability | managed Postgres with PITR; the queue is rebuilt-from-redelivery-safe (deliveries are idempotent) | See OPERATIONS_RUNBOOK §5/§6 (migration, backup/restore). |
+
 ---
 
 ## 4. Intake capacity (measured)
@@ -194,15 +224,21 @@ benchmarks/results/.
 
 ## 9. Explicit non-claims
 
-- The model does **not** claim that 1M users have been tested. It claims a
-  documented, assumption-stated envelope whose binding constraints are
-  measured (CLI) or bounded by arithmetic (intake, GitHub rate limits).
+- The model does **not** claim that 1M users have been load-tested end to end.
+  It claims a documented, assumption-stated envelope whose binding
+  constraints are measured (CLI, intake, queue, multi-process workers) or
+  bounded by arithmetic (GitHub rate limits). The multi-process worker
+  benchmark runs real worker processes against a real shared Postgres in CI
+  (2,000 jobs / 5 processes / 8 tenants — see the `queue-postgres` job).
 - The 100k-manifest CLI column is executed with 2,000 commits introducing
   100,000 manifests (multi-manifest commits); a 1:1 100k-commit profile adds
   the measured git-log term (~3.3 s at 100k commits) to association scans.
-- Horizontal scaling beyond one node requires the shared-queue production
-  adapter (`PostgresQueue`); the local SQLite adapter is single-node by
-  design. Verified against a real Postgres in CI (`queue-postgres` job).
+- Horizontal scaling uses the shared-queue production adapter
+  (`PostgresQueue`, `DRIFT_APP_QUEUE=postgres`); the local SQLite adapter is
+  single-node by design. Verified against a real Postgres 16 in CI
+  (`queue-postgres` job): full suite + e2e + soak + multi-process benchmark.
 - Multi-signer keyring **is** implemented (`docs/MULTI_SIGNER.md`);
   single-signer operation remains supported as the legacy default for
-  single-maintainer repositories.
+  single-maintainer repositories. The App trust audit fails any PR that
+  replaces, removes, or forges the keyring history (only a signed
+  append-only extension is legitimate).

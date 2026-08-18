@@ -26,7 +26,7 @@ const { createAppJwt, decodeJwt } = await mod("jwt.js");
 const { createWebhookServer, assertWebhookAuthConfigured } = await mod("server.js");
 const { deriveProvenanceConclusion, evaluateKeyChange, evaluateKeyringChangeState, isDriftOwnedComment } = await mod("trust.js");
 const { signatureStateFor, auditProvenanceIntegrity, parseLoadedManifest } = await mod("intents.js");
-const { generateKeyPair, newIntentId, PublicStore, signingKeyIdFor } = await import("@drift/core");
+const { generateKeyPair, newIntentId, PublicStore, signingKeyIdFor, createKeyring } = await import("@drift/core");
 
 // ------------------------------------------------------------- unit: trailers
 test("extractIntentIds: parses Drift-Intent trailers across commits, dedupes, ignores invalid ids", () => {
@@ -1259,6 +1259,67 @@ test("handler: malformed BASE trust root fails even when the head key is valid (
   assert.equal(result.conclusion, "failure", JSON.stringify(result));
   assert.equal(github.calls.checks[0].conclusion, "failure");
 });
+
+test("handler: a malicious PR that REPLACES keyring.json with an attacker keyring fails the check (never green)", async () => {
+  // Legit base: the repo's anchor bootstrapped the keyring.
+  const anchorPriv = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const baseKeyring = createKeyring(PUBLIC_KEY_PEM, anchorPriv);
+  assert.equal(baseKeyring.ok, true);
+  // Malicious head: the attacker deletes the repo's trust history and commits
+  // a FRESH keyring bootstrapped with their own key. It validates in
+  // isolation (self-consistent bootstrap) but does NOT extend the base audit
+  // log → the trust audit must fail the PR.
+  const { privateKey: attackerKey, publicKey: attackerPub } = generateKeyPairSync("ed25519");
+  const attackerPriv = attackerKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const attackerPem = attackerPub.export({ type: "spki", format: "pem" }).toString();
+  const evil = createKeyring(attackerPem, attackerPriv);
+  assert.equal(evil.ok, true);
+  const github = new FakeGitHub([{ sha: "s", message: "rotate keys" }], {}, [], {
+    publicKeyPem: attackerPem, // the attacker's key is now the repo key too
+    basePublicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: { ".drift/public/keyring.json": JSON.stringify(baseKeyring.keyring) },
+  });
+  github.manifests[".drift/public/keyring.json"] = JSON.stringify(evil.keyring);
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "failure", JSON.stringify(result));
+  assert.equal(github.calls.checks[0].conclusion, "failure", "replaced trust history must produce a failing Check Run");
+  assert.ok((result.commentBody ?? "").toLowerCase().includes("keyring"), "warning comment must mention the keyring");
+});
+
+test("handler: a malicious PR that appends a forged key to keyring.json (bad audit signature) fails the check", async () => {
+  const anchorPriv = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const baseKeyring = createKeyring(PUBLIC_KEY_PEM, anchorPriv);
+  assert.equal(baseKeyring.ok, true);
+  // Forged extension: append an "add" audit entry with a garbage signature
+  // and a key the anchor never authorized. The head file is malformed under
+  // strict validation → malformed-replacement → failing check.
+  const forged = JSON.parse(JSON.stringify(baseKeyring.keyring));
+  forged.audit.push({
+    seq: 2,
+    action: "add",
+    fingerprint: "deadbeefdeadbeef",
+    by: "0000000000000000",
+    at: Date.now(),
+    reason: null,
+    payload: "forged",
+    signature: "AAAA",
+  });
+  forged.keys.push({ fingerprint: "deadbeefdeadbeef", pem: attackerPemForTest(), status: "active" });
+  const github = new FakeGitHub([{ sha: "s", message: "add maintainer" }], {}, [], {
+    publicKeyPem: PUBLIC_KEY_PEM,
+    basePublicKeyPem: PUBLIC_KEY_PEM,
+    baseManifests: { ".drift/public/keyring.json": JSON.stringify(baseKeyring.keyring) },
+  });
+  github.manifests[".drift/public/keyring.json"] = JSON.stringify(forged);
+  const result = await handleWebhook(eventFor(PAYLOAD), devDeps(github));
+  assert.equal(result.conclusion, "failure", JSON.stringify(result));
+  assert.equal(github.calls.checks[0].conclusion, "failure", "an unsigned/forged keyring extension must fail the Check Run");
+});
+
+function attackerPemForTest() {
+  const { publicKey } = generateKeyPairSync("ed25519");
+  return publicKey.export({ type: "spki", format: "pem" }).toString();
+}
 
 test("handler: a failed Check Run is never hidden by a successful comment (transient → retryable)", async () => {
   const github = makeGitHub();

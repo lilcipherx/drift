@@ -4,7 +4,7 @@
  * and must never appear in a PR comment or check-run summary.
  */
 import { sanitizePublicText } from "@drift/core";
-import { SUMMARY_MARKER, TRUST_ROOT_WARNING } from "./trust.js";
+import { KEYRING_WARNING, SUMMARY_MARKER, TRUST_ROOT_WARNING } from "./trust.js";
 export { SUMMARY_MARKER };
 /** Hard caps so a pathological PR can never produce a huge comment. */
 const MAX_INTENTS = 10;
@@ -52,6 +52,18 @@ export function summarizeIntents(input) {
     }
     else if (input.keyChange === "base-malformed") {
         lines.push("## ⚠ Drift trust root is malformed on the base branch\n\n`.drift/public/key.pem` on the base branch is not a valid Drift public key — no trust root can be established, so this PR's provenance is unverifiable and blocked.");
+        lines.push("");
+        lines.push("---");
+        lines.push("");
+    }
+    // Keyring (multi-signer trust set): a replaced/removed/malformed history is
+    // a blocking trust failure and must be visible in the comment, never silent.
+    if (input.keyringChange === "replaced" ||
+        input.keyringChange === "removed" ||
+        input.keyringChange === "malformed-bootstrap" ||
+        input.keyringChange === "malformed-replacement" ||
+        input.keyringChange === "base-malformed") {
+        lines.push(KEYRING_WARNING);
         lines.push("");
         lines.push("---");
         lines.push("");
