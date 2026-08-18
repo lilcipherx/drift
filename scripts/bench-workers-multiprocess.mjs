@@ -161,7 +161,7 @@ if (!childId) {
       if (rest[0] === "compare" && rest[1]) {
         const head = url.pathname.split("...")[1] ?? "";
         const pr = [...prs.values()].find((p) => p.headSha === head);
-        if (pr && auth !== tokenForInst.get(pr.inst)) tenantMismatches++;
+        if (pr && instForToken.get(auth) !== pr.inst) tenantMismatches++;
         return send(res, 200, { total_commits: 1, commits: [{ sha: head }] });
       }
       // /repos/o/r/contents/{...}?ref=
@@ -172,7 +172,7 @@ if (!childId) {
         // (and empty/base content reads) are repo-wide and must not trip the
         // per-installation token check.
         const pr = [...prs.values()].find((p) => p.headSha === ref);
-        if (pr && auth !== tokenForInst.get(pr.inst)) tenantMismatches++;
+        if (pr && instForToken.get(auth) !== pr.inst) tenantMismatches++;
         if (path === ".drift/public/intents") return send(res, 200, []); // empty dir listing
         return send(res, 404, { message: "not found" }); // no key.pem / manifests
       }
