@@ -342,13 +342,13 @@ async function runScenario(sc, pgUrl) {
   // Redelivery AFTER completion (GitHub retries an already-processed event).
   let redeliveredDeduped = 0;
   if (sc.redeliverAfterDone) {
-    const stats = await waitDrain(queue, N);
+    const stats = await waitDrain(queues[0], N);
     for (let i = 0; i < N; i++) {
       const deliveryId = `delivery-${sc.name}-${i}`;
       const prNumber = 1000 + i;
       const headSha = shaOf(i);
       const raw = payload(deliveryId, prNumber, headSha, i);
-      const res = await post(srv.port, raw, deliveryId);
+      const res = await post(srvs[i % srvs.length].port, raw, deliveryId);
       if (res.data?.duplicate === true && res.data?.alreadyProcessed === true) redeliveredDeduped++;
     }
   }
